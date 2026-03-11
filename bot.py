@@ -1,13 +1,14 @@
 import os
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL = "gemini-2.0-flash"
 
 chat_sessions = {}
 
@@ -21,34 +22,40 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
     if user_id not in chat_sessions:
-        chat_sessions[user_id] = model.start_chat(history=[])
+        chat_sessions[user_id] = []
 
-    chat = chat_sessions[user_id]
+    chat_sessions[user_id].append(
+        types.Content(role="user", parts=[types.Part(text=user_text)])
+    )
 
     try:
-        response = chat.send_message(user_text)
-        await update.message.reply_text(response.text)
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=chat_sessions[user_id]
+        )
+        reply = response.text
+        chat_sessions[user_id].append(
+            types.Content(role="model", parts=[types.Part(text=reply)])
+        )
+        await update.message.reply_text(reply)
     except Exception as e:
         await update.message.reply_text(f"Помилка: {str(e)}")
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔍 Аналізую зображення...")
-
     try:
-        # Завантажуємо фото
         photo = update.message.photo[-1]
         file = await ctx.bot.get_file(photo.file_id)
         img_bytes = await file.download_as_bytearray()
-
-        # Текст від користувача (якщо є підпис до фото)
         caption = update.message.caption or "Що зображено на цьому фото? Опиши детально українською мовою."
 
-        # Відправляємо в Gemini
-        response = model.generate_content([
-            {"mime_type": "image/jpeg", "data": bytes(img_bytes)},
-            caption
-        ])
-
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=[
+                types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=bytes(img_bytes))),
+                types.Part(text=caption)
+            ]
+        )
         await msg.edit_text(response.text)
     except Exception as e:
         await msg.edit_text(f"Помилка при аналізі зображення: {str(e)}")
