@@ -26,6 +26,7 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY)
 # Лічильник запитів OpenRouter
 or_requests = {"count": 0, "date": date.today()}
 OR_DAILY_LIMIT = 190  # трохи менше 200 для запасу
+# Логіка: OpenRouter (190/день) → Groq (14400/день) → наступного дня знову OpenRouter
 
 def get_text_provider():
     global or_requests
