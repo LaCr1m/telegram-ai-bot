@@ -2,7 +2,6 @@ import os
 import httpx
 import base64
 import tempfile
-import whisper
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -12,17 +11,11 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 TEXT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 VISION_MODEL = "openrouter/free"
+WHISPER_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 SYSTEM_PROMPT = {"role": "system", "content": "Ти корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Будь точним, корисним і дружнім."}
 
 chat_histories = {}
-whisper_model = None
-
-def get_whisper():
-    global whisper_model
-    if whisper_model is None:
-        whisper_model = whisper.load_model("base")
-    return whisper_model
 
 async def call_openrouter(messages, model):
     headers = {
@@ -34,6 +27,15 @@ async def call_openrouter(messages, model):
         r = await client.post(API_URL, headers=headers, json=body)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
+
+async def transcribe_voice(audio_bytes: bytes) -> str:
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+    files = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
+    data = {"model": "openai/whisper-large-v3", "language": "uk"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(WHISPER_URL, headers=headers, files=files, data=data)
+        r.raise_for_status()
+        return r.json().get("text", "").strip()
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -85,15 +87,9 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         voice = update.message.voice
         file = await ctx.bot.get_file(voice.file_id)
+        audio_bytes = await file.download_as_bytearray()
 
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            await file.download_to_drive(tmp.name)
-            tmp_path = tmp.name
-
-        model = get_whisper()
-        result = model.transcribe(tmp_path, language="uk")
-        text = result["text"].strip()
-        os.unlink(tmp_path)
+        text = await transcribe_voice(bytes(audio_bytes))
 
         if not text:
             await msg.edit_text("Не вдалось розпізнати мову 😔")
