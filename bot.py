@@ -34,7 +34,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
     if user_id not in chat_histories:
-        chat_histories[user_id] = []
+    chat_histories[user_id] = [
+        {"role": "system", "content": "Ти корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Будь точним, корисним і дружнім."}
+    ]
 
     chat_histories[user_id].append({"role": "user", "content": user_text})
 
