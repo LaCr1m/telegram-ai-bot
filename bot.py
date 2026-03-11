@@ -1,17 +1,17 @@
 import os
 import httpx
 import base64
-import tempfile
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
+GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 TEXT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 VISION_MODEL = "openrouter/free"
-WHISPER_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 SYSTEM_PROMPT = {"role": "system", "content": "Ти корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Будь точним, корисним і дружнім."}
 
@@ -29,13 +29,13 @@ async def call_openrouter(messages, model):
         return r.json()["choices"][0]["message"]["content"]
 
 async def transcribe_voice(audio_bytes: bytes) -> str:
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     files = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
-    data = {"model": "openai/whisper-large-v3", "language": "uk"}
+    data = {"model": "whisper-large-v3", "language": "uk", "response_format": "text"}
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(WHISPER_URL, headers=headers, files=files, data=data)
+        r = await client.post(GROQ_WHISPER_URL, headers=headers, files=files, data=data)
         r.raise_for_status()
-        return r.json().get("text", "").strip()
+        return r.text.strip()
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
