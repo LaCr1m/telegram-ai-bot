@@ -11,7 +11,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 TEXT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
-VISION_MODEL = "openrouter/free"
+VISION_MODEL = "qwen/qwen2.5-vl-72b-instruct:free"
 
 SYSTEM_PROMPT = {"role": "system", "content": "Ти корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Будь точним, корисним і дружнім."}
 
