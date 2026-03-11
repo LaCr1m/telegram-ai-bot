@@ -1,6 +1,8 @@
 import os
 import httpx
 import base64
+import tempfile
+import whisper
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -14,6 +16,13 @@ VISION_MODEL = "openrouter/free"
 SYSTEM_PROMPT = {"role": "system", "content": "Ти корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Будь точним, корисним і дружнім."}
 
 chat_histories = {}
+whisper_model = None
+
+def get_whisper():
+    global whisper_model
+    if whisper_model is None:
+        whisper_model = whisper.load_model("base")
+    return whisper_model
 
 async def call_openrouter(messages, model):
     headers = {
@@ -28,7 +37,7 @@ async def call_openrouter(messages, model):
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n\nНапиши або надішли фото 😊"
+        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n• Розуміти голосові повідомлення 🎤\n\nНапиши, надішли фото або голосове 😊"
     )
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -71,6 +80,39 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"Помилка при аналізі зображення: {str(e)}")
 
+async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🎤 Розпізнаю голосове повідомлення...")
+    try:
+        voice = update.message.voice
+        file = await ctx.bot.get_file(voice.file_id)
+
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            await file.download_to_drive(tmp.name)
+            tmp_path = tmp.name
+
+        model = get_whisper()
+        result = model.transcribe(tmp_path, language="uk")
+        text = result["text"].strip()
+        os.unlink(tmp_path)
+
+        if not text:
+            await msg.edit_text("Не вдалось розпізнати мову 😔")
+            return
+
+        await msg.edit_text(f"🎤 Ти сказав: _{text}_\n\n⏳ Обробляю...", parse_mode="Markdown")
+
+        user_id = update.message.from_user.id
+        if user_id not in chat_histories:
+            chat_histories[user_id] = [SYSTEM_PROMPT]
+
+        chat_histories[user_id].append({"role": "user", "content": text})
+        reply = await call_openrouter(chat_histories[user_id], TEXT_MODEL)
+        chat_histories[user_id].append({"role": "assistant", "content": reply})
+
+        await msg.edit_text(f"🎤 Ти сказав: _{text}_\n\n{reply}", parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"Помилка при обробці голосового: {str(e)}")
+
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id in chat_histories:
@@ -82,6 +124,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущено!")
     app.run_polling()
