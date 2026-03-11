@@ -11,6 +11,8 @@ API_URL = "https://openrouter.ai/api/v1/chat/completions"
 TEXT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 VISION_MODEL = "openrouter/free"
 
+SYSTEM_PROMPT = {"role": "system", "content": "Ти корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Будь точним, корисним і дружнім."}
+
 chat_histories = {}
 
 async def call_openrouter(messages, model):
@@ -26,7 +28,7 @@ async def call_openrouter(messages, model):
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання\n• Аналізувати зображення 🖼️\n\nНапиши або надішли фото 😊"
+        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n\nНапиши або надішли фото 😊"
     )
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -34,9 +36,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
     if user_id not in chat_histories:
-    chat_histories[user_id] = [
-        {"role": "system", "content": "Ти корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Будь точним, корисним і дружнім."}
-    ]
+        chat_histories[user_id] = [SYSTEM_PROMPT]
 
     chat_histories[user_id].append({"role": "user", "content": user_text})
 
@@ -56,13 +56,16 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         img_b64 = base64.b64encode(img_bytes).decode("utf-8")
         caption = update.message.caption or "Що зображено на цьому фото? Опиши детально українською мовою."
 
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                {"type": "text", "text": caption}
-            ]
-        }]
+        messages = [
+            SYSTEM_PROMPT,
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    {"type": "text", "text": caption}
+                ]
+            }
+        ]
         reply = await call_openrouter(messages, VISION_MODEL)
         await msg.edit_text(reply)
     except Exception as e:
