@@ -21,7 +21,7 @@ OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 VISION_MODEL = "openrouter/auto"
 
-SYSTEM_PROMPT = {"role": "system", "content": "Ти розумний і корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Використовуй грамотну, природну українську мову без суржику. Будь точним, лаконічним і дружнім. Структуруй відповіді — використовуй абзаци, списки де доречно. Якщо питання незрозуміле — перепитай. Ніколи не вигадуй факти."}
+SYSTEM_PROMPT = {"role": "system", "content": "Ти розумний і корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Використовуй грамотну, природну українську мову без суржику. Будь точним, лаконічним і дружнім. Структуруй відповіді — використовуй абзаци, списки де доречно. Якщо питання незрозуміле — перепитай. Ніколи не вигадуй факти. В групових чатах відповідай тільки коли тебе згадують через @."}
 
 chat_histories = {}
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
@@ -100,7 +100,7 @@ async def send_reminder(bot, chat_id, text):
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n• Розуміти голосові повідомлення 🎤\n• Шукати в інтернеті 🌐\n• Читати PDF та документи 📄\n• Нагадування 🔔\n\nКоманди:\n/remind 30m текст — нагадування\n/search запит — пошук\n/status — статус\n/reset — очистити історію"
+        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n• Розуміти голосові повідомлення 🎤\n• Шукати в інтернеті 🌐\n• Читати PDF та документи 📄\n• Нагадування 🔔\n• Працювати в групових чатах 👥\n\nКоманди:\n/remind 30m текст — нагадування\n/search запит — пошук\n/status — статус\n/reset — очистити історію\n\nВ групі — згадай мене через @"
     )
 
 async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -111,18 +111,20 @@ async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     time_arg = ctx.args[0]
     reminder_text = " ".join(ctx.args[1:])
     now = datetime.now()
-    delay = None
 
     try:
         if time_arg.endswith("m"):
             delay = int(time_arg[:-1]) * 60
+            when = f"через {time_arg[:-1]} хвилин"
         elif time_arg.endswith("h"):
             delay = int(time_arg[:-1]) * 3600
+            when = f"через {time_arg[:-1]} годин"
         elif ":" in time_arg:
             t = datetime.strptime(time_arg, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
             if t < now:
                 t += timedelta(days=1)
             delay = int((t - now).total_seconds())
+            when = f"о {time_arg}"
         else:
             await update.message.reply_text("❌ Формат невірний. Використай: 30m, 2h або 14:30")
             return
@@ -138,14 +140,6 @@ async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_reminder(bot, chat_id, reminder_text)
 
     asyncio.create_task(delayed())
-
-    if time_arg.endswith("m"):
-        when = f"через {time_arg[:-1]} хвилин"
-    elif time_arg.endswith("h"):
-        when = f"через {time_arg[:-1]} годин"
-    else:
-        when = f"о {time_arg}"
-
     await update.message.reply_text(f"✅ Нагадаю {when}: {reminder_text}")
 
 async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -160,7 +154,14 @@ async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
+    chat_type = update.message.chat.type
     user_text = update.message.text
+    bot_username = ctx.bot.username
+
+    if chat_type in ["group", "supergroup"]:
+        if f"@{bot_username}" not in user_text:
+            return
+        user_text = user_text.replace(f"@{bot_username}", "").strip()
 
     if user_id not in chat_histories:
         chat_histories[user_id] = [SYSTEM_PROMPT]
@@ -234,7 +235,6 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("❌ Не вдалось витягти текст з PDF.")
             return
 
-        # Обрізаємо до 4000 символів щоб не перевищити ліміт токенів
         text_preview = text[:4000] + ("..." if len(text) > 4000 else "")
         caption = update.message.caption or "Стисло підсумуй цей документ українською мовою."
 
