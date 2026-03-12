@@ -2,8 +2,10 @@ import os
 import httpx
 import base64
 import asyncio
+import io
 from datetime import date, datetime, timedelta
 from tavily import TavilyClient
+from PyPDF2 import PdfReader
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -83,19 +85,27 @@ def search_web(query: str) -> str:
     except Exception as e:
         return f"Помилка пошуку: {str(e)}"
 
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return text.strip()
+    except Exception as e:
+        return f"Помилка читання PDF: {str(e)}"
+
 async def send_reminder(bot, chat_id, text):
     await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n• Розуміти голосові повідомлення 🎤\n• Шукати в інтернеті 🌐\n• Нагадування 🔔\n\nКоманди:\n/remind 30m текст — через 30 хвилин\n/remind 2h текст — через 2 години\n/remind 10:30 текст — о конкретному часі\n/search запит — пошук\n/status — статус\n/reset — очистити історію"
+        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n• Розуміти голосові повідомлення 🎤\n• Шукати в інтернеті 🌐\n• Читати PDF та документи 📄\n• Нагадування 🔔\n\nКоманди:\n/remind 30m текст — нагадування\n/search запит — пошук\n/status — статус\n/reset — очистити історію"
     )
 
 async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or len(ctx.args) < 2:
-        await update.message.reply_text(
-            "Використання:\n/remind 30m Зателефонувати\n/remind 2h Нарада\n/remind 14:30 Обід"
-        )
+        await update.message.reply_text("Використання:\n/remind 30m Зателефонувати\n/remind 2h Нарада\n/remind 14:30 Обід")
         return
 
     time_arg = ctx.args[0]
@@ -109,17 +119,15 @@ async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif time_arg.endswith("h"):
             delay = int(time_arg[:-1]) * 3600
         elif ":" in time_arg:
-            t = datetime.strptime(time_arg, "%H:%M").replace(
-                year=now.year, month=now.month, day=now.day
-            )
+            t = datetime.strptime(time_arg, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
             if t < now:
                 t += timedelta(days=1)
-            delay = (t - now).seconds
+            delay = int((t - now).total_seconds())
         else:
-            await update.message.reply_text("❌ Формат часу невірний. Використай: 30m, 2h або 14:30")
+            await update.message.reply_text("❌ Формат невірний. Використай: 30m, 2h або 14:30")
             return
     except ValueError:
-        await update.message.reply_text("❌ Формат часу невірний. Використай: 30m, 2h або 14:30")
+        await update.message.reply_text("❌ Формат невірний. Використай: 30m, 2h або 14:30")
         return
 
     chat_id = update.effective_chat.id
@@ -210,6 +218,39 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"Помилка при аналізі зображення: {str(e)}")
 
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc.file_name.lower().endswith(".pdf"):
+        await update.message.reply_text("📄 Наразі підтримуються тільки PDF файли.")
+        return
+
+    msg = await update.message.reply_text("📄 Читаю PDF...")
+    try:
+        file = await ctx.bot.get_file(doc.file_id)
+        pdf_bytes = await file.download_as_bytearray()
+        text = extract_pdf_text(bytes(pdf_bytes))
+
+        if not text:
+            await msg.edit_text("❌ Не вдалось витягти текст з PDF.")
+            return
+
+        # Обрізаємо до 4000 символів щоб не перевищити ліміт токенів
+        text_preview = text[:4000] + ("..." if len(text) > 4000 else "")
+        caption = update.message.caption or "Стисло підсумуй цей документ українською мовою."
+
+        user_id = update.message.from_user.id
+        if user_id not in chat_histories:
+            chat_histories[user_id] = [SYSTEM_PROMPT]
+
+        prompt = f"{caption}\n\nВміст документу:\n{text_preview}"
+        chat_histories[user_id].append({"role": "user", "content": prompt})
+
+        reply = await call_ai(chat_histories[user_id])
+        chat_histories[user_id].append({"role": "assistant", "content": reply})
+        await msg.edit_text(f"📄 *{doc.file_name}*\n\n{reply}", parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"Помилка при обробці PDF: {str(e)}")
+
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🎤 Розпізнаю голосове повідомлення...")
     try:
@@ -250,6 +291,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("remind", handle_remind))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущено!")
     app.run_polling()
