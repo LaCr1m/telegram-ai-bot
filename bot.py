@@ -117,7 +117,8 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             {"role": "user", "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"}
         ])
         encoded_prompt = urllib.parse.quote(translation)
-        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+        import random
+        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed={random.randint(1,99999)}"
 
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.get(image_url)
