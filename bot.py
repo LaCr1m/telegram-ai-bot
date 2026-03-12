@@ -264,7 +264,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         from urllib.parse import quote
         import time
         seed = int(time.time())
-        url = POLLINATIONS_URL + quote(translation) + f"?width=1024&height=1024&nologo=true&seed={seed}"
+        url = POLLINATIONS_URL + quote(translation) + f"?width=1024&height=1024&model=turbo&nologo=true&seed={seed}"
 
         img_bytes = None
         async with httpx.AsyncClient(timeout=120) as client:
