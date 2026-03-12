@@ -171,12 +171,19 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
 async def generate_image(prompt: str) -> bytes:
     url     = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(url, headers=headers, json={"prompt": prompt, "num_steps": 8})
-        r.raise_for_status()
-    if "image" in r.headers.get("content-type", ""):
-        return r.content
-    return base64.b64decode(r.json().get("result", {}).get("image", ""))
+    last_error = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=180) as client:
+                r = await client.post(url, headers=headers, json={"prompt": prompt, "num_steps": 8})
+                r.raise_for_status()
+            if "image" in r.headers.get("content-type", ""):
+                return r.content
+            return base64.b64decode(r.json().get("result", {}).get("image", ""))
+        except Exception as e:
+            last_error = e
+            await asyncio.sleep(5)
+    raise last_error
 
 
 # ════════════════════════════════════════════════════════════════════════════
