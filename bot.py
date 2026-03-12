@@ -262,13 +262,24 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         }])
 
         from urllib.parse import quote
-        url = POLLINATIONS_URL + quote(translation) + "?width=1024&height=1024&nologo=true"
+        import time
+        seed = int(time.time())
+        url = POLLINATIONS_URL + quote(translation) + f"?width=1024&height=1024&nologo=true&seed={seed}"
 
+        img_bytes = None
         async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.get(url)
-            r.raise_for_status()
+            for attempt in range(3):
+                r = await client.get(url)
+                if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
+                    img_bytes = r.content
+                    break
+                await asyncio.sleep(3)
 
-        await update.message.reply_photo(photo=r.content, caption=f"🎨 {prompt}")
+        if not img_bytes:
+            await msg.edit_text("❌ Сервіс генерації тимчасово недоступний. Спробуй ще раз через хвилину.")
+            return
+
+        await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
     except Exception as e:
         await msg.edit_text(f"Помилка генерації: {e}")
