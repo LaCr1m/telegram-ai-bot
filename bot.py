@@ -95,13 +95,39 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     except Exception as e:
         return f"Помилка читання PDF: {str(e)}"
 
+async def generate_image(prompt: str) -> bytes:
+    encoded = httpx.URL(prompt).path
+    url = f"https://image.pollinations.ai/prompt/{httpx.QueryParams({'prompt': prompt})}"
+    # Простіший спосіб формування URL
+    import urllib.parse
+    encoded_prompt = urllib.parse.quote(prompt)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(image_url)
+        r.raise_for_status()
+        return r.content
+
 async def send_reminder(bot, chat_id, text):
     await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n• Розуміти голосові повідомлення 🎤\n• Шукати в інтернеті 🌐\n• Читати PDF та документи 📄\n• Нагадування 🔔\n• Працювати в групових чатах 👥\n\nКоманди:\n/remind 30m текст — нагадування\n/search запит — пошук\n/status — статус\n/reset — очистити історію\n\nВ групі — згадай мене через @"
+        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n• Генерувати зображення 🎨\n• Розуміти голосові повідомлення 🎤\n• Шукати в інтернеті 🌐\n• Читати PDF та документи 📄\n• Нагадування 🔔\n• Працювати в групових чатах 👥\n\nКоманди:\n/image опис — генерація зображення\n/remind 30m текст — нагадування\n/search запит — пошук\n/status — статус\n/reset — очистити історію"
     )
+
+async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(ctx.args)
+    if not prompt:
+        await update.message.reply_text("Напиши що намалювати: /image захід сонця над морем")
+        return
+
+    msg = await update.message.reply_text("🎨 Генерую зображення...")
+    try:
+        img_bytes = await generate_image(prompt)
+        await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
+        await msg.delete()
+    except Exception as e:
+        await msg.edit_text(f"Помилка генерації: {str(e)}")
 
 async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or len(ctx.args) < 2:
@@ -289,6 +315,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("search", handle_search))
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("remind", handle_remind))
+    app.add_handler(CommandHandler("image", handle_image))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
