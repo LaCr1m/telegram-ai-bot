@@ -17,7 +17,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL = "llama-3.3-70b-versatile"
-VISION_MODEL = "mistralai/mistral-small-3.1-24b-instruct:free"
+VISION_MODEL = "openrouter/auto"
 
 SYSTEM_PROMPT = {"role": "system", "content": "Ти корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Будь точним, корисним і дружнім."}
 
