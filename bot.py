@@ -398,12 +398,40 @@ def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[b
     return False, user_text
 
 
+SEARCH_KEYWORDS = [
+    "пошукай", "знайди", "загугли", "що відбувається", "останні новини",
+    "яка погода", "який курс", "поточн", "зараз", "сьогодні", "актуальн",
+    "search", "find", "google", "look up"
+]
+
+def needs_search(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in SEARCH_KEYWORDS)
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addressed, user_text = _is_bot_addressed(update, ctx)
     if not addressed:
         return
 
     user_id = update.message.from_user.id
+
+    # Автоматичний пошук якщо користувач просить
+    if needs_search(user_text):
+        msg = await update.message.reply_text("🌐 Шукаю в інтернеті...")
+        results = search_web(user_text)
+        search_messages = [
+            SYSTEM_PROMPT,
+            {"role": "user", "content": f"Запит користувача: '{user_text}'\n\nРезультати пошуку:\n{results}\n\nДай корисну відповідь українською на основі цих результатів."}
+        ]
+        try:
+            reply = await call_ai(search_messages)
+            append_and_trim(user_id, "user", user_text)
+            append_and_trim(user_id, "assistant", reply)
+            await msg.edit_text(reply)
+        except Exception as e:
+            await msg.edit_text(f"Помилка: {e}")
+        return
+
     append_and_trim(user_id, "user", user_text)
 
     try:
