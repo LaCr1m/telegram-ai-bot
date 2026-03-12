@@ -22,7 +22,7 @@ CF_ACCOUNT_ID      = os.environ.get("CF_ACCOUNT_ID")
 OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL         = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free"
 GROQ_MODEL       = "llama-3.3-70b-versatile"
 VISION_MODEL     = "openrouter/auto"
 CF_IMAGE_URL     = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
@@ -82,26 +82,6 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r'`(.*?)`', r'\1', text)           # `код` → код
     return text
 
-async def fix_grammar(text: str) -> str:
-    """Виправляє граматичні помилки у тексті через Groq (швидко і безкоштовно)."""
-    try:
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        body = {
-            "model": GROQ_MODEL,
-            "messages": [{
-                "role": "user",
-                "content": (
-                    "Виправ граматичні та орфографічні помилки в цьому українському тексті. "
-                    "Поверни ТІЛЬКИ виправлений текст, без пояснень, без коментарів:\n\n" + text
-                )
-            }]
-        }
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(GROQ_URL, headers=headers, json=body)
-            r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception:
-        return text  # якщо щось пішло не так — повертаємо оригінал
 
 
     t = text.lower()
@@ -515,7 +495,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     append_and_trim(user_id, "user", user_text)
     try:
         reply = await call_ai(chat_histories[user_id])
-        reply = await fix_grammar(reply)
         append_and_trim(user_id, "assistant", reply)
         await update.message.reply_text(clean_markdown(reply))
     except Exception as e:
@@ -628,7 +607,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         append_and_trim(user_id, "user", text)
         reply = await call_ai(chat_histories[user_id])
-        reply = await fix_grammar(reply)
         append_and_trim(user_id, "assistant", reply)
         await msg.edit_text(f"🎤 Ти сказав: {text}\n\n{clean_markdown(reply)}")
     except Exception as e:
