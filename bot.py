@@ -23,6 +23,7 @@ GROQ_API_KEY       = os.environ.get("GROQ_API_KEY")
 TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY")
 CF_API_TOKEN       = os.environ.get("CF_API_TOKEN")
 CF_ACCOUNT_ID      = os.environ.get("CF_ACCOUNT_ID")
+NEWS_API_KEY       = os.environ.get("NEWS_API_KEY")
 
 # ── URL та моделі ────────────────────────────────────────────────────────────
 OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
@@ -38,6 +39,7 @@ CF_IMAGE_URL              = "https://api.cloudflare.com/client/v4/accounts/{acco
 MAX_HISTORY_MESSAGES = 20
 REMINDERS_FILE       = "reminders.json"
 MEMORY_FILE          = "memory.json"
+TASKS_FILE           = "tasks.json"
 
 # ── Системний промпт ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = {
@@ -88,7 +90,7 @@ PERSONALITIES = {
     }
 }
 
-# ── Ключові слова (локальна перевірка без AI) ─────────────────────────────────
+# ── Ключові слова ─────────────────────────────────────────────────────────────
 IMAGE_KEYWORDS = [
     "створи фото", "згенеруй фото", "намалюй", "згенеруй зображення",
     "створи зображення", "зроби фото", "зроби картинку", "створи картинку",
@@ -100,9 +102,36 @@ REMIND_KEYWORDS = [
     "нагадування", "постав нагадування", "нагадай мені"
 ]
 SEARCH_KEYWORDS = [
-    "пошукай", "знайди", "загугли", "що відбувається", "останні новини",
-    "яка погода", "який курс", "поточн", "зараз відбувається",
-    "search", "find", "look up", "актуальні новини"
+    "пошукай", "знайди в інтернеті", "загугли", "що відбувається",
+    "останні новини", "актуальні новини", "яка погода", "який курс",
+    "search", "look up"
+]
+TRANSLATE_KEYWORDS = [
+    "перекладай", "переклади", "перекласти", "translate", "як буде",
+    "як сказати", "як перекласти"
+]
+SUMMARIZE_KEYWORDS = [
+    "підсумуй", "скороти", "стисло", "коротко перекажи", "що в статті",
+    "summarize", "зроби підсумок", "перескажи коротко"
+]
+GENERATE_KEYWORDS = [
+    "напиши резюме", "створи резюме", "напиши лист", "створи лист",
+    "напиши пост", "створи пост", "напиши оголошення", "створи оголошення",
+    "напиши текст для", "згенеруй текст"
+]
+RECIPE_KEYWORDS = [
+    "що приготувати", "що зробити з", "рецепт з", "рецепти з",
+    "є такі продукти", "є такі інгредієнти", "що можна приготувати",
+    "що приготувати з", "є дома"
+]
+NEWS_KEYWORDS = [
+    "новини про", "новини щодо", "що нового про", "останні новини про",
+    "news about", "що відбувається з", "новини на тему"
+]
+TASK_KEYWORDS = [
+    "додай задачу", "додай до списку", "запам'ятай задачу", "нова задача",
+    "видали задачу", "видалити задачу", "покажи задачі", "мої задачі",
+    "список задач", "виконано", "задачу виконано"
 ]
 
 # ── Стан ─────────────────────────────────────────────────────────────────────
@@ -141,29 +170,6 @@ def update_user_memory(user_id: int, data: dict) -> None:
     memory[uid].update(data)
     save_memory(memory)
 
-async def detect_gender_from_voice(audio_bytes: bytes) -> str | None:
-    """Визначає стать за голосом через Groq Whisper + аналіз AI. Повертає 'male', 'female' або None."""
-    try:
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-        files   = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
-        data    = {"model": "whisper-large-v3", "language": "uk", "response_format": "verbose_json"}
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(GROQ_WHISPER_URL, headers=headers, files=files, data=data)
-            r.raise_for_status()
-        transcript_text = r.json().get("text", "")
-        if not transcript_text:
-            return None
-        result = await call_ai([{"role": "user", "content": (
-            f"На основі тексту голосового повідомлення спробуй визначити стать мовця.\n"
-            f"Текст: '{transcript_text}'\n"
-            "Звертай увагу на граматичні форми (казав/казала, зробив/зробила тощо).\n"
-            "Відповідай ТІЛЬКИ одним словом: 'male', 'female' або 'unknown'."
-        )}])
-        gender = result.strip().lower()
-        return gender if gender in ("male", "female") else None
-    except Exception:
-        return None
-
 async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> None:
     try:
         result = await call_ai([{"role": "user", "content": (
@@ -185,11 +191,9 @@ async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> N
         pass
 
 def get_gender(user_id: int) -> str | None:
-    """Повертає 'male', 'female' або None якщо невідомо."""
     return get_user_memory(user_id).get("gender")
 
 def gender_suffix(user_id: int) -> str:
-    """Повертає підказку для AI щодо граматичного роду."""
     g = get_gender(user_id)
     if g == "male":
         return " Звертайся до користувача як до чоловіка (він, йому, казав, зробив тощо)."
@@ -204,39 +208,134 @@ def get_system_prompt(user_id: int) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Список задач
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_tasks() -> dict:
+    if not os.path.exists(TASKS_FILE):
+        return {}
+    try:
+        with open(TASKS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_tasks(tasks: dict) -> None:
+    with open(TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+
+def get_user_tasks(user_id: int) -> list:
+    return load_tasks().get(str(user_id), [])
+
+def set_user_tasks(user_id: int, tasks: list) -> None:
+    all_tasks = load_tasks()
+    all_tasks[str(user_id)] = tasks
+    save_tasks(all_tasks)
+
+async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    args    = ctx.args
+
+    if not args:
+        # Показати список
+        tasks = get_user_tasks(user_id)
+        if not tasks:
+            await update.message.reply_text("📋 Список задач порожній.\n\nДодати: /tasks add Назва задачі")
+            return
+        lines = ["📋 Твої задачі:\n"]
+        for i, t in enumerate(tasks, 1):
+            done = "✅" if t.get("done") else "⬜"
+            lines.append(f"{done} {i}. {t['text']}")
+        lines.append("\n/tasks add текст — додати\n/tasks done N — виконано\n/tasks del N — видалити\n/tasks clear — очистити")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    cmd = args[0].lower()
+
+    if cmd == "add":
+        text = " ".join(args[1:])
+        if not text:
+            await update.message.reply_text("Вкажи текст задачі: /tasks add Купити молоко")
+            return
+        tasks = get_user_tasks(user_id)
+        tasks.append({"text": text, "done": False})
+        set_user_tasks(user_id, tasks)
+        await update.message.reply_text(f"✅ Задачу додано: {text}")
+
+    elif cmd == "done":
+        if len(args) < 2 or not args[1].isdigit():
+            await update.message.reply_text("Вкажи номер: /tasks done 1")
+            return
+        n     = int(args[1]) - 1
+        tasks = get_user_tasks(user_id)
+        if 0 <= n < len(tasks):
+            tasks[n]["done"] = True
+            set_user_tasks(user_id, tasks)
+            await update.message.reply_text(f"✅ Виконано: {tasks[n]['text']}")
+        else:
+            await update.message.reply_text("❌ Невірний номер задачі.")
+
+    elif cmd == "del":
+        if len(args) < 2 or not args[1].isdigit():
+            await update.message.reply_text("Вкажи номер: /tasks del 1")
+            return
+        n     = int(args[1]) - 1
+        tasks = get_user_tasks(user_id)
+        if 0 <= n < len(tasks):
+            removed = tasks.pop(n)
+            set_user_tasks(user_id, tasks)
+            await update.message.reply_text(f"🗑️ Видалено: {removed['text']}")
+        else:
+            await update.message.reply_text("❌ Невірний номер задачі.")
+
+    elif cmd == "clear":
+        set_user_tasks(user_id, [])
+        await update.message.reply_text("🗑️ Список задач очищено.")
+
+    else:
+        await update.message.reply_text("❓ Невідома команда. Використай: add / done / del / clear")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Утиліти
 # ════════════════════════════════════════════════════════════════════════════
 
 def detect_intent_local(text: str) -> str | None:
-    """Швидка локальна перевірка без AI. Повертає намір або None."""
     t = text.lower()
-    if any(kw in t for kw in IMAGE_KEYWORDS):
-        return "image"
-    if any(kw in t for kw in REMIND_KEYWORDS):
-        return "reminder"
-    if any(kw in t for kw in SEARCH_KEYWORDS):
-        return "search"
+    if any(kw in t for kw in IMAGE_KEYWORDS):    return "image"
+    if any(kw in t for kw in REMIND_KEYWORDS):   return "reminder"
+    if any(kw in t for kw in NEWS_KEYWORDS):     return "news"
+    if any(kw in t for kw in TRANSLATE_KEYWORDS):return "translate"
+    if any(kw in t for kw in RECIPE_KEYWORDS):   return "recipe"
+    if any(kw in t for kw in GENERATE_KEYWORDS): return "generate"
+    if any(kw in t for kw in TASK_KEYWORDS):     return "task"
+    if any(kw in t for kw in SUMMARIZE_KEYWORDS):return "summarize"
+    if any(kw in t for kw in SEARCH_KEYWORDS):   return "search"
+    # Посилання — одразу підсумовуємо
+    if re.search(r'https?://\S+', text):         return "summarize"
     return None
 
 async def detect_intent_ai(text: str) -> str:
-    """AI-визначення наміру — викликається тільки якщо локальна перевірка не спрацювала."""
     result = await call_ai([{"role": "user", "content": (
         f"Визнач намір цього повідомлення: '{text}'\n"
         "Відповідай ТІЛЬКИ одним словом:\n"
-        "- 'image' — намалювати/згенерувати зображення\n"
-        "- 'reminder' — нагадати щось через певний час\n"
-        "- 'search' — знайти актуальну інформацію в інтернеті\n"
+        "- 'image' — згенерувати зображення\n"
+        "- 'reminder' — нагадати через час\n"
+        "- 'news' — новини за темою\n"
+        "- 'search' — знайти актуальну інформацію\n"
+        "- 'translate' — перекласти текст\n"
+        "- 'summarize' — підсумувати текст або статтю\n"
+        "- 'generate' — написати резюме/лист/пост\n"
+        "- 'recipe' — рецепт за інгредієнтами\n"
+        "- 'task' — додати/видалити/переглянути задачі\n"
         "- 'chat' — все інше\n"
         "Відповідь — ТІЛЬКИ одне слово."
     )}])
     return result.strip().lower().strip("'\"")
 
 async def detect_intent(text: str) -> str:
-    """Спочатку локальна перевірка, потім AI якщо потрібно."""
     local = detect_intent_local(text)
-    if local:
-        return local
-    return await detect_intent_ai(text)
+    return local if local else await detect_intent_ai(text)
 
 def clean_markdown(text: str) -> str:
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
@@ -414,6 +513,19 @@ async def search_web(query: str) -> str:
     except Exception as e:
         return f"Помилка пошуку: {e}"
 
+async def fetch_url_text(url: str) -> str:
+    """Завантажує текст сторінки за посиланням."""
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+        # Прибираємо HTML теги
+        text = re.sub(r'<[^>]+>', ' ', r.text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text[:6000]
+    except Exception as e:
+        return f"Помилка завантаження: {e}"
+
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -450,6 +562,162 @@ def extract_word_text(docx_bytes: bytes) -> str:
         return output.strip() or "Документ порожній."
     except Exception as e:
         return f"Помилка читання Word: {e}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Нові функції: переклад, підсумок, генерація, рецепт
+# ════════════════════════════════════════════════════════════════════════════
+
+async def do_translate(text: str) -> str:
+    reply = await call_ai([{"role": "user", "content": (
+        f"Визнач мову цього тексту і перекладай його. Якщо текст українською — перекладай на англійську. "
+        f"Якщо іншою мовою — перекладай на українську. "
+        f"Якщо у запиті вказана конкретна мова (наприклад 'переклади на іспанську') — використай її.\n\n"
+        f"Текст: {text}\n\n"
+        "Формат відповіді:\n🌐 Оригінал (мова): ...\n✅ Переклад: ..."
+    )}])
+    return reply
+
+async def do_summarize(text: str) -> str:
+    # Перевіряємо чи є посилання
+    url_match = re.search(r'https?://\S+', text)
+    if url_match:
+        url      = url_match.group()
+        msg_text = text.replace(url, "").strip()
+        content  = await fetch_url_text(url)
+        if content.startswith("Помилка"):
+            return f"❌ Не вдалось завантажити статтю: {content}"
+        prompt = (
+            f"Підсумуй цю статтю українською мовою.\n"
+            f"{'Додатковий запит: ' + msg_text if msg_text else ''}\n\n"
+            f"Стаття ({url}):\n{content}\n\n"
+            "Формат: 📌 Головна думка (1-2 речення)\n🔹 Ключові тези (3-5 пунктів)"
+        )
+    else:
+        prompt = (
+            f"Зроби стислий підсумок цього тексту українською мовою.\n\n"
+            f"Текст: {text}\n\n"
+            "Формат: 📌 Головна думка\n🔹 Ключові тези"
+        )
+    return await call_ai([{"role": "user", "content": prompt}])
+
+async def do_generate(text: str) -> str:
+    reply = await call_ai([
+        SYSTEM_PROMPT,
+        {"role": "user", "content": (
+            f"Виконай це завдання з генерації тексту: {text}\n\n"
+            "Пиши грамотно, структуровано, українською мовою. "
+            "Якщо це резюме — додай всі стандартні розділи. "
+            "Якщо лист — дотримуйся ділового або особистого стилю залежно від запиту. "
+            "Якщо пост — зроби його живим і залучальним."
+        )}
+    ])
+    return reply
+
+async def do_recipe(text: str) -> str:
+    reply = await call_ai([{"role": "user", "content": (
+        f"Користувач має такі інгредієнти або продукти: {text}\n\n"
+        "Запропонуй 2-3 рецепти які можна приготувати. "
+        "Для кожного рецепту вкажи: назву, час приготування, короткий список кроків. "
+        "Відповідай українською мовою. Будь практичним і конкретним."
+    )}])
+    return reply
+
+async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
+    """Обробка задач через природну мову."""
+    parsed = await call_ai([{"role": "user", "content": (
+        f"З цього повідомлення визнач дію зі списком задач: '{text}'\n"
+        "Відповідай ТІЛЬКИ у форматі JSON:\n"
+        "{\"action\": \"add|done|del|list\", \"text\": \"текст задачі або null\", \"number\": null або номер}\n"
+        "Нічого більше не пиши."
+    )}])
+    try:
+        data   = json.loads(parsed.strip().replace("```json", "").replace("```", ""))
+        action = data.get("action")
+        tasks  = get_user_tasks(user_id)
+
+        if action == "add":
+            task_text = data.get("text", "")
+            if task_text:
+                tasks.append({"text": task_text, "done": False})
+                set_user_tasks(user_id, tasks)
+                await update.message.reply_text(f"✅ Задачу додано: {task_text}")
+        elif action == "done":
+            n = (data.get("number") or 1) - 1
+            if 0 <= n < len(tasks):
+                tasks[n]["done"] = True
+                set_user_tasks(user_id, tasks)
+                await update.message.reply_text(f"✅ Виконано: {tasks[n]['text']}")
+        elif action == "del":
+            n = (data.get("number") or 1) - 1
+            if 0 <= n < len(tasks):
+                removed = tasks.pop(n)
+                set_user_tasks(user_id, tasks)
+                await update.message.reply_text(f"🗑️ Видалено: {removed['text']}")
+        elif action == "list":
+            if not tasks:
+                await update.message.reply_text("📋 Список задач порожній.")
+                return
+            lines = ["📋 Твої задачі:\n"]
+            for i, t in enumerate(tasks, 1):
+                lines.append(f"{'✅' if t.get('done') else '⬜'} {i}. {t['text']}")
+            await update.message.reply_text("\n".join(lines))
+    except Exception:
+        await update.message.reply_text("❌ Не вдалось обробити задачу. Спробуй /tasks")
+
+
+async def do_news(query: str) -> str:
+    """Отримує новини за темою через NewsAPI і підсумовує їх."""
+    if not NEWS_API_KEY:
+        return "❌ NEWS_API_KEY не налаштовано."
+    try:
+        # Перекладаємо запит на англійську для кращих результатів
+        query_en = await call_ai([{"role": "user", "content":
+            f"Translate this news topic to English, return ONLY translation: {query}"}])
+        url    = "https://newsapi.org/v2/everything"
+        params = {
+            "q":        query_en.strip(),
+            "language": "uk",
+            "sortBy":   "publishedAt",
+            "pageSize": 5,
+            "apiKey":   NEWS_API_KEY,
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+        articles = r.json().get("articles", [])
+
+        # Якщо українських немає — беремо англійські
+        if not articles:
+            params["language"] = "en"
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+            articles = r.json().get("articles", [])
+
+        if not articles:
+            return f"📰 Новин за темою «{query}» не знайдено."
+
+        lines = [f"📰 Новини за темою: {query}\n"]
+        sources_text = ""
+        for i, a in enumerate(articles[:5], 1):
+            title       = a.get("title", "Без назви")
+            source      = a.get("source", {}).get("name", "")
+            published   = a.get("publishedAt", "")[:10]
+            description = a.get("description") or ""
+            url_a       = a.get("url", "")
+            sources_text += f"{title}. {description}\n"
+            lines.append(f"{i}. {title}\n   📅 {published} | {source}\n   🔗 {url_a}\n")
+
+        # AI підсумок
+        summary = await call_ai([{"role": "user", "content": (
+            f"Ось заголовки новин за темою '{query}':\n{sources_text}\n\n"
+            "Зроби короткий підсумок (2-3 речення) що відбувається. Відповідай українською."
+        )}])
+        lines.insert(1, f"💡 {summary}\n")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Помилка отримання новин: {e}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -508,6 +776,33 @@ async def restore_reminders(bot) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Визначення статі за голосом
+# ════════════════════════════════════════════════════════════════════════════
+
+async def detect_gender_from_voice(audio_bytes: bytes) -> str | None:
+    try:
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        files   = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
+        data    = {"model": "whisper-large-v3", "language": "uk", "response_format": "verbose_json"}
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(GROQ_WHISPER_URL, headers=headers, files=files, data=data)
+            r.raise_for_status()
+        transcript_text = r.json().get("text", "")
+        if not transcript_text:
+            return None
+        result = await call_ai([{"role": "user", "content": (
+            f"На основі тексту голосового повідомлення визнач стать мовця.\n"
+            f"Текст: '{transcript_text}'\n"
+            "Звертай увагу на граматичні форми (казав/казала, зробив/зробила тощо).\n"
+            "Відповідай ТІЛЬКИ одним словом: 'male', 'female' або 'unknown'."
+        )}])
+        gender = result.strip().lower()
+        return gender if gender in ("male", "female") else None
+    except Exception:
+        return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Спільна логіка
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -523,7 +818,7 @@ async def do_generate_image(update: Update, text: str, msg):
     try:
         translation = await call_ai([{
             "role": "user",
-            "content": f"Translate this image description to English, return ONLY the translation: {prompt}"
+            "content": f"Translate to English, return ONLY translation: {prompt}"
         }])
         img_bytes = await generate_image(translation)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
@@ -535,8 +830,7 @@ async def do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str)
     now_str = datetime.now().strftime("%H:%M")
     parsed  = await call_ai([{"role": "user", "content": (
         f"Поточний час: {now_str}. Витягни час нагадування і текст: '{text}'. "
-        "Відповідай ТІЛЬКИ у форматі JSON: {\"delay_minutes\": 5, \"text\": \"текст\"} "
-        "де delay_minutes — через скільки хвилин нагадати. Нічого більше."
+        "Відповідай ТІЛЬКИ у форматі JSON: {\"delay_minutes\": 5, \"text\": \"текст\"} Нічого більше."
     )}])
     data        = json.loads(parsed.strip().replace("```json", "").replace("```", ""))
     delay_min   = int(data["delay_minutes"])
@@ -555,14 +849,18 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Привіт! Я J.A.R.V.I.S. 🤖\n\n"
         "Можу:\n"
         "• Відповідати на запитання 💬\n"
+        "• Перекладати тексти 🌐\n"
+        "• Підсумовувати статті за посиланням 📰\n"
+        "• Генерувати резюме, листи, пости ✍️\n"
+        "• Рецепти за інгредієнтами 🍳\n"
+        "• Список задач 📋\n"
         "• Аналізувати зображення та відео 🎬\n"
         "• Генерувати зображення 🎨\n"
-        "• Розуміти голосові повідомлення 🎤\n"
-        "• Шукати в інтернеті 🌐\n"
+        "• Голосові повідомлення 🎤\n"
+        "• Шукати в інтернеті 🔍\n"
         "• Читати PDF, Excel, Word 📄\n"
-        "• Нагадування 🔔\n"
-        "• Працювати в групових чатах 👥\n\n"
-        "Просто пиши або говори — я розумію природну мову!\n"
+        "• Нагадування 🔔\n\n"
+        "Просто пиши — я розумію природну мову!\n"
         "/help — всі команди"
     )
 
@@ -571,14 +869,74 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📋 Команди:\n"
         "/image опис — генерація зображення\n"
         "/remind 30m текст — нагадування\n"
+        "/news тема — новини за темою\n"
         "/search запит — пошук в інтернеті\n"
-        "/mode — змінити особистість бота\n"
+        "/translate текст — переклад\n"
+        "/summarize посилання або текст — підсумок\n"
+        "/generate резюме/лист/пост — генерація тексту\n"
+        "/recipe інгредієнти — рецепти\n"
+        "/tasks — список задач\n"
+        "/mode — змінити стиль бота\n"
         "/memory — що бот пам'ятає про тебе\n"
-        "/forget — очистити пам'ять про себе\n"
+        "/forget — очистити пам'ять\n"
         "/status — статус бота\n"
         "/reset — очистити історію чату\n"
-        "/help — ця довідка"
+        "/help — ця довідка\n\n"
+        "💡 Або просто пиши природною мовою:\n"
+        "«переклади це на англійську»\n"
+        "«що приготувати з картоплі і яєць»\n"
+        "«напиши пост про мій бізнес»"
     )
+
+async def news_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(ctx.args)
+    if not query:
+        await update.message.reply_text("Використання: /news тема\nНаприклад: /news штучний інтелект")
+        return
+    msg    = await update.message.reply_text(f"📰 Шукаю новини про «{query}»...")
+    result = await do_news(query)
+    await msg.edit_text(clean_markdown(result), disable_web_page_preview=True)
+
+async def translate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text("Використання: /translate текст\nАбо просто: переклади [текст]")
+        return
+    msg    = await update.message.reply_text("🌐 Перекладаю...")
+    result = await do_translate(text)
+    await msg.edit_text(clean_markdown(result))
+
+async def summarize_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text("Використання: /summarize https://... або /summarize текст")
+        return
+    msg    = await update.message.reply_text("📰 Опрацьовую...")
+    result = await do_summarize(text)
+    await msg.edit_text(clean_markdown(result))
+
+async def generate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text(
+            "Використання:\n"
+            "/generate резюме для розробника Python\n"
+            "/generate лист подяки клієнту\n"
+            "/generate пост про новий продукт"
+        )
+        return
+    msg    = await update.message.reply_text("✍️ Генерую текст...")
+    result = await do_generate(text)
+    await msg.edit_text(clean_markdown(result))
+
+async def recipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text("Використання: /recipe картопля яйця цибуля")
+        return
+    msg    = await update.message.reply_text("🍳 Шукаю рецепти...")
+    result = await do_recipe(text)
+    await msg.edit_text(clean_markdown(result))
 
 async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -607,6 +965,9 @@ async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["🧠 Що я пам'ятаю:\n"]
     if mem.get("name"):
         lines.append(f"👤 Ім'я: {mem['name']}")
+    if mem.get("gender"):
+        g = "чоловік" if mem["gender"] == "male" else "жінка"
+        lines.append(f"👤 Стать: {g}")
     if mem.get("facts"):
         lines.append("\n📌 Факти:")
         lines += [f"  • {f}" for f in mem["facts"]]
@@ -626,8 +987,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🎨 Генерую зображення...")
     try:
         translation = await call_ai([{
-            "role": "user",
-            "content": f"Translate to English, return ONLY translation: {prompt}"
+            "role": "user", "content": f"Translate to English, return ONLY translation: {prompt}"
         }])
         img_bytes = await generate_image(translation)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
@@ -719,8 +1079,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not addressed:
         return
     user_id = update.message.from_user.id
-
-    intent = await detect_intent(user_text)
+    intent  = await detect_intent(user_text)
 
     if intent == "image":
         msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
@@ -733,6 +1092,40 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Нагадаю через {delay_min} хв: {remind_text}")
         except Exception as e:
             await update.message.reply_text(f"Не вдалось встановити нагадування: {e}")
+        return
+
+    if intent == "translate":
+        msg    = await update.message.reply_text("🌐 Перекладаю...")
+        result = await do_translate(user_text)
+        await msg.edit_text(clean_markdown(result))
+        return
+
+    if intent == "summarize":
+        msg    = await update.message.reply_text("📰 Опрацьовую...")
+        result = await do_summarize(user_text)
+        await msg.edit_text(clean_markdown(result))
+        return
+
+    if intent == "generate":
+        msg    = await update.message.reply_text("✍️ Генерую текст...")
+        result = await do_generate(user_text)
+        await msg.edit_text(clean_markdown(result))
+        return
+
+    if intent == "recipe":
+        msg    = await update.message.reply_text("🍳 Шукаю рецепти...")
+        result = await do_recipe(user_text)
+        await msg.edit_text(clean_markdown(result))
+        return
+
+    if intent == "task":
+        await do_task_nlp(update, user_id, user_text)
+        return
+
+    if intent == "news":
+        msg    = await update.message.reply_text("📰 Шукаю новини...")
+        result = await do_news(user_text)
+        await msg.edit_text(clean_markdown(result), disable_web_page_preview=True)
         return
 
     if intent == "search":
@@ -799,13 +1192,13 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or "Стисло підсумуй цей документ українською."
 
     if fname.endswith(".pdf"):
-        msg, text = await update.message.reply_text("📄 Читаю PDF..."), None
+        msg  = await update.message.reply_text("📄 Читаю PDF...")
         text = extract_pdf_text(bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray()))
     elif fname.endswith((".xlsx", ".xls")):
-        msg, text = await update.message.reply_text("📊 Читаю Excel..."), None
+        msg  = await update.message.reply_text("📊 Читаю Excel...")
         text = extract_excel_text(bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray()))
     elif fname.endswith((".docx", ".doc")):
-        msg, text = await update.message.reply_text("📝 Читаю Word..."), None
+        msg  = await update.message.reply_text("📝 Читаю Word...")
         text = extract_word_text(bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray()))
     else:
         await update.message.reply_text("📄 Підтримуються: PDF, Excel (.xlsx), Word (.docx)")
@@ -840,7 +1233,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             gender = await detect_gender_from_voice(audio_bytes)
             if gender:
                 update_user_memory(user_id, {"gender": gender})
-                # Оновлюємо системний промпт з новою інформацією
                 if user_id in chat_histories and chat_histories[user_id]:
                     chat_histories[user_id][0] = get_system_prompt(user_id)
 
@@ -856,6 +1248,22 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text(f"🎤 Ти сказав: {text}\n\n✅ Нагадаю через {delay_min} хв: {remind_text}")
             except Exception as e:
                 await msg.edit_text(f"Не вдалось встановити нагадування: {e}")
+            return
+        if intent == "translate":
+            result = await do_translate(text)
+            await msg.edit_text(f"🎤 Ти сказав: {text}\n\n{clean_markdown(result)}")
+            return
+        if intent == "recipe":
+            result = await do_recipe(text)
+            await msg.edit_text(f"🎤 Ти сказав: {text}\n\n{clean_markdown(result)}")
+            return
+        if intent == "news":
+            result = await do_news(text)
+            await msg.edit_text(clean_markdown(result), disable_web_page_preview=True)
+            return
+        if intent == "task":
+            await msg.edit_text(f"🎤 Ти сказав: {text}\n\n⏳ Обробляю задачу...")
+            await do_task_nlp(update, user_id, text)
             return
 
         append_and_trim(user_id, "user", text)
@@ -884,16 +1292,22 @@ if __name__ == "__main__":
         .post_init(post_init)
         .build()
     )
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("help",    help_cmd))
-    app.add_handler(CommandHandler("mode",    mode_cmd))
-    app.add_handler(CommandHandler("memory",  memory_cmd))
-    app.add_handler(CommandHandler("forget",  forget_cmd))
-    app.add_handler(CommandHandler("reset",   reset))
-    app.add_handler(CommandHandler("search",  handle_search))
-    app.add_handler(CommandHandler("status",  handle_status))
-    app.add_handler(CommandHandler("remind",  handle_remind))
-    app.add_handler(CommandHandler("image",   handle_image))
+    app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("help",      help_cmd))
+    app.add_handler(CommandHandler("mode",      mode_cmd))
+    app.add_handler(CommandHandler("memory",    memory_cmd))
+    app.add_handler(CommandHandler("forget",    forget_cmd))
+    app.add_handler(CommandHandler("reset",     reset))
+    app.add_handler(CommandHandler("search",    handle_search))
+    app.add_handler(CommandHandler("status",    handle_status))
+    app.add_handler(CommandHandler("remind",    handle_remind))
+    app.add_handler(CommandHandler("image",     handle_image))
+    app.add_handler(CommandHandler("news",      news_cmd))
+    app.add_handler(CommandHandler("translate", translate_cmd))
+    app.add_handler(CommandHandler("summarize", summarize_cmd))
+    app.add_handler(CommandHandler("generate",  generate_cmd))
+    app.add_handler(CommandHandler("recipe",    recipe_cmd))
+    app.add_handler(CommandHandler("tasks",     handle_tasks_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
