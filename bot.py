@@ -10,7 +10,10 @@ from tavily import TavilyClient
 import subprocess
 import openpyxl
 from docx import Document as DocxDocument
-from pypdf import PdfReader
+try:
+    from pypdf import PdfReader
+except ImportError:
+    from PyPDF2 import PdfReader
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -1090,10 +1093,20 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.message.from_user.id
 
-    if await handle_session_message(update, user_id, user_text):
-        return
+    # Дозволяємо вийти з сесії командою "стоп" або "вийти"
+    if user_text.lower().strip() in ("стоп", "вийти", "stop", "exit", "вихід"):
+        if user_id in user_sessions:
+            user_sessions.pop(user_id, None)
+            await update.message.reply_text("✅ Сесію завершено.")
+            return
 
+    # Перевіряємо намір ДО сесії — якщо це явний намір (не chat), виходимо з сесії
     intent = await detect_intent(user_text)
+    if intent != "chat" and user_id in user_sessions:
+        user_sessions.pop(user_id, None)
+
+    if intent == "chat" and await handle_session_message(update, user_id, user_text):
+        return
 
     if intent == "reminder":
         try:
