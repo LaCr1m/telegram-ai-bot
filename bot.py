@@ -345,6 +345,17 @@ async def do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str)
 # Обробники команд
 # ════════════════════════════════════════════════════════════════════════════
 
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📋 Команди:\n"
+        "/image опис — генерація зображення\n"
+        "/remind 30m текст — нагадування\n"
+        "/search запит — пошук в інтернеті\n"
+        "/status — статус бота\n"
+        "/reset — очистити історію чату\n"
+        "/help — ця довідка"
+    )
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привіт! Я J.A.R.V.I.S. 🤖\n\n"
@@ -354,15 +365,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Генерувати зображення 🎨\n"
         "• Розуміти голосові повідомлення 🎤\n"
         "• Шукати в інтернеті 🌐\n"
-        "• Читати PDF та документи 📄\n"
+        "• Читати PDF, Excel, Word 📄\n"
         "• Нагадування 🔔\n"
         "• Працювати в групових чатах 👥\n\n"
-        "Команди:\n"
-        "/image опис — генерація зображення\n"
-        "/remind 30m текст — нагадування\n"
-        "/search запит — пошук\n"
-        "/status — статус\n"
-        "/reset — очистити історію"
+        "Просто пиши або говори — я розумію природну мову!\n"
+        "Напиши /help щоб побачити всі команди."
     )
 
 async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -612,6 +619,7 @@ if __name__ == "__main__":
         .build()
     )
     app.add_handler(CommandHandler("start",  start))
+    app.add_handler(CommandHandler("help",   help_cmd))
     app.add_handler(CommandHandler("reset",  reset))
     app.add_handler(CommandHandler("search", handle_search))
     app.add_handler(CommandHandler("status", handle_status))
