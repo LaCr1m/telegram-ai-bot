@@ -7,7 +7,7 @@ import io
 import json
 from datetime import date, datetime, timedelta
 from tavily import TavilyClient
-from PyPDF2 import PdfReader
+import subprocess
 import openpyxl
 from docx import Document as DocxDocument
 from telegram import Update
@@ -44,8 +44,66 @@ SYSTEM_PROMPT = {
     )
 }
 
-MAX_HISTORY_MESSAGES = 20
-REMINDERS_FILE       = "reminders.json"
+STORY_GENRES = {
+    "fantasy":   {"name": "Фентезі",       "emoji": "🧙"},
+    "horror":    {"name": "Жахи",          "emoji": "👻"},
+    "romance":   {"name": "Романтика",     "emoji": "💕"},
+    "scifi":     {"name": "Наукова фантастика", "emoji": "🚀"},
+    "adventure": {"name": "Пригоди",       "emoji": "⚔️"},
+    "mystery":   {"name": "Детектив",      "emoji": "🔍"},
+    "comedy":    {"name": "Комедія",       "emoji": "😂"},
+}
+
+# Активні сесії рольових ігор / історій
+user_sessions: dict[int, dict] = {}  # {user_id: {"mode": "story"|"rpg", "genre": ..., "context": [...]}}
+    "normal": {
+        "name": "Звичайний",
+        "emoji": "🤖",
+        "prompt": (
+            "Ти розумний і корисний AI асистент на ім'я J.A.R.V.I.S. "
+            "Завжди відповідай виключно українською мовою. "
+            "Використовуй грамотну, природну українську мову без суржику. "
+            "Будь точним, лаконічним і дружнім. Структуруй відповіді. "
+            "Ніколи не вигадуй факти."
+        )
+    },
+    "funny": {
+        "name": "Жартівливий",
+        "emoji": "😄",
+        "prompt": (
+            "Ти веселий і дотепний AI асистент на ім'я J.A.R.V.I.S. "
+            "Завжди відповідай виключно українською мовою. "
+            "Додавай гумор, жарти, каламбури та смішні порівняння у відповіді. "
+            "Будь невимушеним і розважальним, але все одно корисним. "
+            "Іноді використовуй смайли та emoji. Ніколи не вигадуй факти."
+        )
+    },
+    "serious": {
+        "name": "Серйозний",
+        "emoji": "🎯",
+        "prompt": (
+            "Ти суворий і точний AI асистент на ім'я J.A.R.V.I.S. "
+            "Завжди відповідай виключно українською мовою. "
+            "Відповідай лаконічно, без зайвих слів. Тільки факти і суть. "
+            "Без жартів, без зайвих емоцій. Структурована і точна інформація. "
+            "Ніколи не вигадуй факти."
+        )
+    },
+    "business": {
+        "name": "Діловий",
+        "emoji": "💼",
+        "prompt": (
+            "Ти професійний бізнес-асистент на ім'я J.A.R.V.I.S. "
+            "Завжди відповідай виключно українською мовою. "
+            "Використовуй діловий стиль мовлення. Давай чіткі, структуровані відповіді. "
+            "Орієнтуйся на практичну цінність і результат. "
+            "Використовуй бізнес-термінологію де доречно. Ніколи не вигадуй факти."
+        )
+    }
+}
+
+# Поточна особистість для кожного користувача
+user_personalities: dict[int, str] = {}
 
 # ── Ключові слова ─────────────────────────────────────────────────────────────
 REMIND_KEYWORDS = [
@@ -75,15 +133,19 @@ OR_DAILY_LIMIT = 190
 # ════════════════════════════════════════════════════════════════════════════
 
 async def detect_intent(text: str) -> str:
-    """Визначає намір через AI. Повертає: 'image', 'reminder', 'search', 'chat'"""
+    """Визначає намір. Повертає: 'image','reminder','search','convert','horoscope','fact','joke','chat'"""
     result = await call_ai([{"role": "user", "content": (
         f"Визнач намір цього повідомлення: '{text}'\n"
         "Відповідай ТІЛЬКИ одним словом:\n"
-        "- 'image' якщо просять намалювати/згенерувати/створити зображення/фото/картинку\n"
-        "- 'reminder' якщо просять нагадати щось через певний час\n"
-        "- 'search' якщо просять знайти/пошукати актуальну інформацію в інтернеті\n"
-        "- 'chat' для всього іншого\n"
-        "Відповідь має бути ТІЛЬКИ одне слово без пояснень."
+        "- 'image' — намалювати/згенерувати/створити зображення\n"
+        "- 'reminder' — нагадати щось через певний час\n"
+        "- 'search' — знайти/пошукати актуальну інформацію\n"
+        "- 'convert' — конвертувати валюту або одиниці виміру\n"
+        "- 'horoscope' — гороскоп для знаку зодіаку\n"
+        "- 'fact' — цікавий факт дня\n"
+        "- 'joke' — жарт або анекдот\n"
+        "- 'chat' — все інше\n"
+        "Відповідь — ТІЛЬКИ одне слово."
     )}])
     return result.strip().lower().strip("'\"")
 
@@ -103,14 +165,14 @@ def clean_markdown(text: str) -> str:
 
 def get_history(user_id: int) -> list:
     if user_id not in chat_histories:
-        chat_histories[user_id] = [SYSTEM_PROMPT]
+        chat_histories[user_id] = [get_system_prompt(user_id)]
     return chat_histories[user_id]
 
 def append_and_trim(user_id: int, role: str, content) -> None:
     history = get_history(user_id)
     history.append({"role": role, "content": content})
     if len(history) > MAX_HISTORY_MESSAGES + 1:
-        chat_histories[user_id] = [SYSTEM_PROMPT] + history[-MAX_HISTORY_MESSAGES:]
+        chat_histories[user_id] = [get_system_prompt(user_id)] + history[-MAX_HISTORY_MESSAGES:]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -197,7 +259,268 @@ async def generate_image(prompt: str) -> bytes:
 # Утиліти: пошук і PDF
 # ════════════════════════════════════════════════════════════════════════════
 
-def search_web(query: str) -> str:
+ZODIAC_SIGNS = {
+    " овен": "aries", "телець": "taurus", "близнюки": "gemini",
+    "рак": "cancer", "лев": "leo", "діва": "virgo",
+    "терези": "libra", "скорпіон": "scorpio", "стрілець": "sagittarius",
+    "козеріг": "capricorn", "водолій": "aquarius", "риби": "pisces"
+}
+
+# Активні ігрові сесії
+# user_sessions вже є, додаємо типи: "quiz", "riddle", "20q"
+
+QUIZ_CATEGORIES = {
+    "history":  "📜 Історія",
+    "science":  "🔬 Наука",
+    "geography":"🌍 Географія",
+    "movies":   "🎬 Кіно",
+    "sport":    "⚽ Спорт",
+    "ukraine":  "🇺🇦 Україна",
+    "mix":      "🎲 Мікс",
+}
+
+async def start_quiz(user_id: int, category: str) -> str:
+    cat_name = QUIZ_CATEGORIES.get(category, "Мікс")
+    question_data = await call_ai([{"role": "user", "content": (
+        f"Створи питання для вікторини на тему '{cat_name}'. "
+        "Відповідай ТІЛЬКИ у форматі JSON:\n"
+        "{\"question\": \"питання\", \"options\": [\"A) варіант\", \"B) варіант\", \"C) варіант\", \"D) варіант\"], "
+        "\"answer\": \"A\", \"explanation\": \"пояснення\"}\n"
+        "Нічого більше не пиши."
+    )}])
+    question_data = question_data.strip().replace("```json","").replace("```","")
+    data = json.loads(question_data)
+    user_sessions[user_id] = {
+        "mode":     "quiz",
+        "category": category,
+        "score":    0,
+        "total":    0,
+        "current":  data,
+        "context":  []
+    }
+    opts = "\n".join(data["options"])
+    return f"🎯 Вікторина: {cat_name}\n\n❓ {data['question']}\n\n{opts}"
+
+async def check_quiz_answer(user_id: int, user_text: str) -> str:
+    session  = user_sessions[user_id]
+    current  = session["current"]
+    answer   = user_text.strip().upper()[:1]
+    correct  = current["answer"].upper()
+    session["total"] += 1
+
+    if answer == correct:
+        session["score"] += 1
+        result = f"✅ Правильно! {current['explanation']}\n\n🏆 Рахунок: {session['score']}/{session['total']}"
+    else:
+        result = f"❌ Неправильно! Правильна відповідь: {correct}\n{current['explanation']}\n\n🏆 Рахунок: {session['score']}/{session['total']}"
+
+    # Наступне питання
+    next_data = await call_ai([{"role": "user", "content": (
+        f"Створи НОВЕ питання для вікторини на тему '{QUIZ_CATEGORIES.get(session['category'])}'. "
+        "Відповідай ТІЛЬКИ у форматі JSON:\n"
+        "{\"question\": \"питання\", \"options\": [\"A) варіант\", \"B) варіант\", \"C) варіант\", \"D) варіант\"], "
+        "\"answer\": \"A\", \"explanation\": \"пояснення\"}\nНічого більше."
+    )}])
+    next_data = next_data.strip().replace("```json","").replace("```","")
+    session["current"] = json.loads(next_data)
+    opts = "\n".join(session["current"]["options"])
+    return f"{result}\n\n➡️ Наступне питання:\n❓ {session['current']['question']}\n\n{opts}"
+
+async def start_riddle(user_id: int) -> str:
+    data = await call_ai([{"role": "user", "content": (
+        "Придумай цікаву загадку українською мовою. "
+        "Відповідай ТІЛЬКИ у форматі JSON:\n"
+        "{\"riddle\": \"текст загадки\", \"answer\": \"відповідь\", \"hint\": \"підказка\"}\n"
+        "Нічого більше не пиши."
+    )}])
+    data = data.strip().replace("```json","").replace("```","")
+    parsed = json.loads(data)
+    user_sessions[user_id] = {
+        "mode":    "riddle",
+        "current": parsed,
+        "hints":   0,
+        "context": []
+    }
+    return f"🧩 Загадка:\n\n{parsed['riddle']}\n\n💡 Напиши відповідь або 'підказка'"
+
+async def check_riddle(user_id: int, user_text: str) -> str:
+    session = user_sessions[user_id]
+    current = session["current"]
+    text    = user_text.lower().strip()
+
+    if "підказка" in text:
+        session["hints"] += 1
+        return f"💡 Підказка: {current['hint']}\n\nСпробуй ще раз!"
+
+    # Перевірка через AI чи відповідь правильна
+    check = await call_ai([{"role": "user", "content": (
+        f"Загадка: '{current['riddle']}'\n"
+        f"Правильна відповідь: '{current['answer']}'\n"
+        f"Відповідь користувача: '{user_text}'\n"
+        "Чи правильна відповідь? Відповідай ТІЛЬКИ 'yes' або 'no'."
+    )}])
+
+    if "yes" in check.lower():
+        hints_penalty = f" (-{session['hints']} підказки)" if session["hints"] else ""
+        user_sessions.pop(user_id, None)
+        return (
+            f"🎉 Правильно! Відповідь: {current['answer']}{hints_penalty}\n\n"
+            f"Ще загадку? /riddle"
+        )
+    else:
+        return f"❌ Не зовсім... Спробуй ще або напиши 'підказка'"
+
+async def start_20q(user_id: int) -> str:
+    user_sessions[user_id] = {
+        "mode":      "20q",
+        "questions": 0,
+        "history":   [],
+        "context":   []
+    }
+    system = (
+        "Ми граємо у гру '20 питань'. Задумай будь-який предмет, тварину або відому особу. "
+        "НЕ розкривай що задумав. Гравець задаватиме питання на які можна відповісти "
+        "тільки 'Так', 'Ні' або 'Частково'. Після 20 питань гравець має вгадати. "
+        "Відповідай українською."
+    )
+    reply = await call_ai([
+        {"role": "system", "content": system},
+        {"role": "user", "content": "Задумав щось. Починаємо!"}
+    ])
+    user_sessions[user_id]["history"].append({"role": "assistant", "content": reply})
+    return f"🤔 Гра '20 питань'\n\nЯ задумав щось... Задавай питання!\nВідповіді: Так / Ні / Частково\n\n{reply}"
+
+async def handle_20q(user_id: int, user_text: str) -> str:
+    session = user_sessions[user_id]
+    session["questions"] += 1
+    q_num = session["questions"]
+
+    system = (
+        "Ми граємо у '20 питань'. Ти задумав предмет/тварину/особу. "
+        "Відповідай на питання тільки 'Так', 'Ні' або 'Частково'. "
+        "Якщо гравець вгадав — підтверди і привітай. "
+        "Відповідай українською."
+    )
+    session["history"].append({"role": "user", "content": f"Питання {q_num}/20: {user_text}"})
+    messages = [{"role": "system", "content": system}] + session["history"][-10:]
+    reply    = await call_ai(messages)
+    session["history"].append({"role": "assistant", "content": reply})
+
+    suffix = f"\n\n❓ Питань залишилось: {20 - q_num}"
+    if q_num >= 20:
+        user_sessions.pop(user_id, None)
+        suffix = "\n\n🏁 Питання вичерпано! /20q — зіграти ще"
+
+    return f"{reply}{suffix}"
+    sign_en = ZODIAC_SIGNS.get(sign.lower())
+    if not sign_en:
+        signs = ", ".join(ZODIAC_SIGNS.keys())
+        return f"❌ Невідомий знак зодіаку. Доступні: {signs}"
+    today = datetime.now().strftime("%d.%m.%Y")
+    reply = await call_ai([{"role": "user", "content": (
+        f"Склади детальний гороскоп на сьогодні ({today}) для знаку {sign} ({sign_en}). "
+        f"Включи: загальний настрій, кохання, робота/фінанси, здоров'я, порада дня. "
+        f"Зроби його захоплюючим і позитивним. Відповідай українською."
+    )}])
+    return f"⭐ Гороскоп для {sign.capitalize()} на {today}\n\n{reply}"
+
+async def get_fact() -> str:
+    today = datetime.now().strftime("%d %B %Y")
+    reply = await call_ai([{"role": "user", "content": (
+        f"Розкажи один цікавий та маловідомий факт на сьогодні ({today}). "
+        f"Факт має бути захоплюючим, перевіреним і пізнавальним. "
+        f"Формат: коротка назва факту (1 рядок) + детальне пояснення (3-4 речення). "
+        f"Відповідай українською."
+    )}])
+    return f"🧠 Факт дня\n\n{reply}"
+
+async def get_joke() -> str:
+    reply = await call_ai([{"role": "user", "content": (
+        "Розкажи один смішний та оригінальний жарт українською мовою. "
+        "Жарт має бути доречним, без образ. Можна анекдот або каламбур. "
+        "Формат: питання/завязка — потім відповідь/кульмінація."
+    )}])
+    return f"😂 Жарт дня\n\n{reply}"
+    """Витягує аудіо з відео через ffmpeg."""
+    with open("/tmp/input_video.mp4", "wb") as f:
+        f.write(video_bytes)
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", "/tmp/input_video.mp4",
+        "-vn", "-ar", "16000", "-ac", "1", "-f", "ogg", "/tmp/output_audio.ogg",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    await proc.communicate()
+    with open("/tmp/output_audio.ogg", "rb") as f:
+        return f.read()
+
+async def extract_video_frames(video_bytes: bytes, max_frames: int = 3) -> list[bytes]:
+    """Витягує кілька ключових кадрів з відео через ffmpeg."""
+    with open("/tmp/input_video.mp4", "wb") as f:
+        f.write(video_bytes)
+    frames = []
+    # Витягуємо кадри рівномірно
+    for i, t in enumerate(["00:00:01", "00:00:05", "00:00:10"][:max_frames]):
+        out_path = f"/tmp/frame_{i}.jpg"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-ss", t, "-i", "/tmp/input_video.mp4",
+            "-frames:v", "1", "-q:v", "2", out_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+        if os.path.exists(out_path):
+            with open(out_path, "rb") as f:
+                frames.append(f.read())
+    return frames
+
+async def analyze_video(video_bytes: bytes, caption: str) -> str:
+    """Повний аналіз відео: транскрипція аудіо + аналіз кадрів."""
+    results = []
+
+    # 1. Транскрибуємо аудіо
+    try:
+        audio_bytes = await extract_video_audio(video_bytes)
+        transcript  = await transcribe_voice(audio_bytes)
+        if transcript:
+            results.append(f"🎤 Аудіо у відео:\n{transcript}")
+    except Exception:
+        pass
+
+    # 2. Аналізуємо кадри
+    try:
+        frames = await extract_video_frames(video_bytes)
+        if frames:
+            frame_descriptions = []
+            for i, frame in enumerate(frames):
+                b64 = base64.b64encode(frame).decode()
+                desc = await call_vision([
+                    SYSTEM_PROMPT,
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        {"type": "text", "text": f"Опиши що бачиш на кадрі {i+1} з відео. Коротко, 1-2 речення."}
+                    ]}
+                ])
+                frame_descriptions.append(f"Кадр {i+1}: {desc}")
+            results.append("🎬 Візуальний вміст:\n" + "\n".join(frame_descriptions))
+    except Exception:
+        pass
+
+    if not results:
+        return "❌ Не вдалось проаналізувати відео."
+
+    # 3. Загальний підсумок
+    combined = "\n\n".join(results)
+    summary  = await call_ai([
+        SYSTEM_PROMPT,
+        {"role": "user", "content": (
+            f"На основі цих даних про відео дай відповідь на запит користувача.\n"
+            f"Запит: {caption}\n\n"
+            f"Дані про відео:\n{combined}\n\n"
+            "Відповідай українською."
+        )}
+    ])
+    return f"{combined}\n\n📝 Підсумок:\n{summary}"
     try:
         results = tavily.search(query=query, max_results=3)
         output  = ""
@@ -345,12 +668,226 @@ async def do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str)
 # Обробники команд
 # ════════════════════════════════════════════════════════════════════════════
 
+async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    mem = get_user_memory(user_id)
+    if not mem:
+        await update.message.reply_text("🧠 Я поки нічого не пам'ятаю про тебе.")
+        return
+    lines = ["🧠 Що я пам'ятаю про тебе:\n"]
+    if mem.get("name"):
+        lines.append(f"👤 Ім'я: {mem['name']}")
+    if mem.get("facts"):
+        lines.append("\n📌 Факти:")
+        for fact in mem["facts"]:
+            lines.append(f"  • {fact}")
+    await update.message.reply_text("\n".join(lines))
+
+async def forget_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    memory = load_memory()
+    memory.pop(str(user_id), None)
+    save_memory(memory)
+    await update.message.reply_text("🗑️ Пам'ять очищено.")
+
+async def convert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /convert 100 usd uah  — валюта
+    /convert 5 km mi      — одиниці
+    /convert 100 c f      — температура
+    """
+    if not ctx.args or len(ctx.args) < 3:
+        await update.message.reply_text(
+            "Використання:\n"
+            "/convert 100 USD UAH — валюта\n"
+            "/convert 5 km mi — відстань\n"
+            "/convert 70 kg lb — вага\n"
+            "/convert 100 C F — температура\n\n"
+            "Або просто напиши: *скільки 100 доларів в гривнях?*"
+        )
+        return
+    try:
+        amount   = float(ctx.args[0].replace(",", "."))
+        from_u   = ctx.args[1]
+        to_u     = ctx.args[2]
+    except ValueError:
+        await update.message.reply_text("❌ Невірний формат числа.")
+        return
+
+    # Визначаємо чи це валюта чи одиниці
+    currencies = {
+        "usd","eur","uah","gbp","pln","czk","chf",
+        "jpy","cad","aud","rub","try","cny","sek","nok"
+    }
+    if from_u.lower() in currencies or to_u.lower() in currencies:
+        result = await convert_currency(amount, from_u, to_u)
+    else:
+        result = convert_units(amount, from_u, to_u)
+
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+async def horoscope_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        signs = "\n".join(f"• /horoscope {s}" for s in ZODIAC_SIGNS)
+        await update.message.reply_text(f"⭐ Вкажи знак зодіаку:\n{signs}")
+        return
+    sign  = " ".join(ctx.args).lower()
+    msg   = await update.message.reply_text("⭐ Складаю гороскоп...")
+    result = await get_horoscope(sign)
+    await msg.edit_text(clean_markdown(result))
+
+async def fact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg    = await update.message.reply_text("🧠 Шукаю цікавий факт...")
+    result = await get_fact()
+    await msg.edit_text(clean_markdown(result))
+
+async def joke_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg    = await update.message.reply_text("😂 Придумую жарт...")
+    result = await get_joke()
+    await msg.edit_text(clean_markdown(result))
+
+async def story_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+
+    if ctx.args and ctx.args[0].lower() == "stop":
+        user_sessions.pop(user_id, None)
+        await update.message.reply_text("📖 Історію завершено!")
+        return
+
+    genre_key = ctx.args[0].lower() if ctx.args else None
+    if not genre_key or genre_key not in STORY_GENRES:
+        lines = ["📖 Оберіть жанр для спільної історії:\n"]
+        for key, g in STORY_GENRES.items():
+            lines.append(f"{g['emoji']} /story {key} — {g['name']}")
+        lines.append("\n/story stop — завершити")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    genre = STORY_GENRES[genre_key]
+    user_sessions[user_id] = {
+        "mode":    "story",
+        "genre":   genre_key,
+        "context": []
+    }
+
+    prompt = (
+        f"Ми граємо у спільну інтерактивну історію у жанрі {genre['name']}. "
+        f"Ти — оповідач. Почни захоплюючу історію (3-4 речення) і в кінці запропонуй "
+        f"користувачу 3 варіанти що робити далі (пронумеровані). "
+        f"Відповідай виключно українською мовою."
+    )
+    reply = await call_ai([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": "Починай!"}
+    ])
+    user_sessions[user_id]["context"].append({"role": "assistant", "content": reply})
+    await update.message.reply_text(f"{genre['emoji']} *{genre['name']}*\n\n{clean_markdown(reply)}")
+
+
+async def rpg_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+
+    if ctx.args and ctx.args[0].lower() == "stop":
+        user_sessions.pop(user_id, None)
+        await update.message.reply_text("⚔️ Гру завершено!")
+        return
+
+    genre_key = ctx.args[0].lower() if ctx.args else "fantasy"
+    if genre_key not in STORY_GENRES:
+        genre_key = "fantasy"
+
+    genre = STORY_GENRES[genre_key]
+    user_sessions[user_id] = {
+        "mode":    "rpg",
+        "genre":   genre_key,
+        "context": []
+    }
+
+    prompt = (
+        f"Ти — майстер рольової гри у жанрі {genre['name']}. "
+        f"Опиши світ і попроси користувача створити персонажа: "
+        f"ім'я, клас/роль і одну особливість. "
+        f"Будь деталізованим і захоплюючим. Відповідай виключно українською."
+    )
+    reply = await call_ai([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": "Починай гру!"}
+    ])
+    user_sessions[user_id]["context"].append({"role": "assistant", "content": reply})
+    await update.message.reply_text(f"{genre['emoji']} *RPG: {genre['name']}*\n\n{clean_markdown(reply)}")
+
+
+async def handle_session_message(update: Update, user_id: int, user_text: str) -> bool:
+    """Обробляє повідомлення якщо є активна сесія. Повертає True якщо оброблено."""
+    session = user_sessions.get(user_id)
+    if not session:
+        return False
+
+    mode    = session["mode"]
+    genre   = STORY_GENRES[session["genre"]]
+    context = session["context"]
+
+    if mode == "story":
+        system = (
+            f"Ми граємо у спільну інтерактивну історію у жанрі {genre['name']}. "
+            f"Ти — оповідач. Продовжуй історію на основі вибору користувача (3-4 речення). "
+            f"В кінці завжди пропонуй 3 варіанти дій. Відповідай українською."
+        )
+    else:
+        system = (
+            f"Ти — майстер рольової гри у жанрі {genre['name']}. "
+            f"Реагуй на дії гравця, описуй наслідки, розвивай сюжет. "
+            f"Час від часу додавай кидки кубиків 🎲 (d20) для важливих дій. "
+            f"Відповідай українською."
+        )
+
+    context.append({"role": "user", "content": user_text})
+    messages = [{"role": "system", "content": system}] + context[-10:]  # останні 10 повідомлень
+
+    reply = await call_ai(messages)
+    context.append({"role": "assistant", "content": reply})
+    await update.message.reply_text(clean_markdown(reply))
+    return True
+
+
+async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    current = user_personalities.get(user_id, "normal")
+
+    if ctx.args:
+        mode = ctx.args[0].lower()
+        if mode not in PERSONALITIES:
+            modes = ", ".join(PERSONALITIES.keys())
+            await update.message.reply_text(f"❌ Невідомий режим. Доступні: {modes}")
+            return
+        user_personalities[user_id] = mode
+        update_user_memory(user_id, {"mode": mode})
+        # Скидаємо історію з новим промптом
+        chat_histories[user_id] = [get_system_prompt(user_id)]
+        p = PERSONALITIES[mode]
+        await update.message.reply_text(f"{p['emoji']} Режим змінено на: {p['name']}")
+    else:
+        lines = ["🎭 Оберіть режим:\n"]
+        for key, p in PERSONALITIES.items():
+            marker = " ✅" if key == current else ""
+            lines.append(f"{p['emoji']} /mode {key} — {p['name']}{marker}")
+        await update.message.reply_text("\n".join(lines))
+
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 Команди:\n"
         "/image опис — генерація зображення\n"
         "/remind 30m текст — нагадування\n"
         "/search запит — пошук в інтернеті\n"
+        "/convert 100 USD UAH — конвертер\n"
+        "/horoscope лев — гороскоп\n"
+        "/fact — цікавий факт дня\n"
+        "/joke — жарт дня\n"
+        "/story — спільна інтерактивна історія\n"
+        "/rpg — рольова гра\n"
+        "/mode — змінити особистість бота\n"
+        "/memory — що бот пам'ятає про тебе\n"
+        "/forget — очистити пам'ять про себе\n"
         "/status — статус бота\n"
         "/reset — очистити історію чату\n"
         "/help — ця довідка"
@@ -361,7 +898,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Привіт! Я J.A.R.V.I.S. 🤖\n\n"
         "Можу:\n"
         "• Відповідати на запитання 💬\n"
-        "• Аналізувати зображення 🖼️\n"
+        "• Аналізувати зображення та відео 🎬\n"
         "• Генерувати зображення 🎨\n"
         "• Розуміти голосові повідомлення 🎤\n"
         "• Шукати в інтернеті 🌐\n"
@@ -476,6 +1013,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.message.from_user.id
 
+    # Якщо є активна сесія — передаємо туди
+    if await handle_session_message(update, user_id, user_text):
+        return
+
     intent = await detect_intent(user_text)
 
     if intent == "reminder":
@@ -489,6 +1030,53 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if intent == "image":
         msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
         await do_generate_image(update, user_text, msg)
+        return
+
+    if intent == "horoscope":
+        # Витягуємо знак зодіаку з тексту
+        sign = next((s for s in ZODIAC_SIGNS if s in user_text.lower()), None)
+        if not sign:
+            await update.message.reply_text("⭐ Вкажи свій знак зодіаку, наприклад: *гороскоп для Лева*")
+            return
+        msg = await update.message.reply_text("⭐ Складаю гороскоп...")
+        result = await get_horoscope(sign)
+        await msg.edit_text(clean_markdown(result))
+        return
+
+    if intent == "fact":
+        msg = await update.message.reply_text("🧠 Шукаю цікавий факт...")
+        await msg.edit_text(clean_markdown(await get_fact()))
+        return
+
+    if intent == "joke":
+        msg = await update.message.reply_text("😂 Придумую жарт...")
+        await msg.edit_text(clean_markdown(await get_joke()))
+        return
+
+    if intent == "convert":
+        try:
+            parsed = await call_ai([{"role": "user", "content": (
+                f"З цього тексту витягни дані для конвертації: '{user_text}'\n"
+                "Відповідай ТІЛЬКИ у форматі JSON: "
+                "{\"amount\": 100, \"from\": \"USD\", \"to\": \"UAH\"}\n"
+                "Нічого більше не пиши."
+            )}])
+            parsed   = parsed.strip().replace("```json","").replace("```","")
+            data     = json.loads(parsed)
+            amount   = float(data["amount"])
+            from_u   = data["from"]
+            to_u     = data["to"]
+            currencies = {
+                "usd","eur","uah","gbp","pln","czk","chf",
+                "jpy","cad","aud","rub","try","cny","sek","nok"
+            }
+            if from_u.lower() in currencies or to_u.lower() in currencies:
+                result = await convert_currency(amount, from_u, to_u)
+            else:
+                result = convert_units(amount, from_u, to_u)
+            await update.message.reply_text(result, parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Не вдалось конвертувати: {e}")
         return
 
     if intent == "search":
@@ -512,6 +1100,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
         await update.message.reply_text(clean_markdown(reply))
+        asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
 
@@ -533,6 +1122,23 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(clean_markdown(reply))
     except Exception as e:
         await msg.edit_text(f"Помилка при аналізі зображення: {e}")
+
+async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🎬 Аналізую відео (аудіо + кадри)...")
+    try:
+        video   = update.message.video or update.message.video_note
+        caption = update.message.caption or "Що відбувається у цьому відео? Опиши детально."
+
+        if video.file_size > 20 * 1024 * 1024:  # 20MB ліміт
+            await msg.edit_text("❌ Відео занадто велике. Максимум 20MB.")
+            return
+
+        file        = await ctx.bot.get_file(video.file_id)
+        video_bytes = bytes(await file.download_as_bytearray())
+        result      = await analyze_video(video_bytes, caption)
+        await msg.edit_text(clean_markdown(result))
+    except Exception as e:
+        await msg.edit_text(f"Помилка при аналізі відео: {e}")
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc      = update.message.document
@@ -610,6 +1216,11 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app):
     await restore_reminders(app.bot)
+    # Відновлюємо режими користувачів після рестарту
+    memory = load_memory()
+    for uid, data in memory.items():
+        if data.get("mode"):
+            user_personalities[int(uid)] = data["mode"]
 
 if __name__ == "__main__":
     app = (
@@ -618,15 +1229,25 @@ if __name__ == "__main__":
         .post_init(post_init)
         .build()
     )
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("help",   help_cmd))
-    app.add_handler(CommandHandler("reset",  reset))
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("help",       help_cmd))
+    app.add_handler(CommandHandler("mode",       mode_cmd))
+    app.add_handler(CommandHandler("memory",     memory_cmd))
+    app.add_handler(CommandHandler("forget",     forget_cmd))
+    app.add_handler(CommandHandler("convert",    convert_cmd))
+    app.add_handler(CommandHandler("story",      story_cmd))
+    app.add_handler(CommandHandler("rpg",        rpg_cmd))
+    app.add_handler(CommandHandler("horoscope",  horoscope_cmd))
+    app.add_handler(CommandHandler("fact",       fact_cmd))
+    app.add_handler(CommandHandler("joke",       joke_cmd))
+    app.add_handler(CommandHandler("reset",      reset))
     app.add_handler(CommandHandler("search", handle_search))
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CommandHandler("remind", handle_remind))
     app.add_handler(CommandHandler("image",  handle_image))
     app.add_handler(MessageHandler(filters.PHOTO,        handle_photo))
     app.add_handler(MessageHandler(filters.VOICE,        handle_voice))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
     app.add_handler(MessageHandler(filters.Document.PDF | filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") | filters.Document.MimeType("application/vnd.openxmlformats-officedocument.wordprocessingml.document") | filters.Document.MimeType("application/msword") | filters.Document.MimeType("application/vnd.ms-excel"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущено!")
