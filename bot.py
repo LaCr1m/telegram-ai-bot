@@ -21,7 +21,7 @@ GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 VISION_MODEL = "openrouter/auto"
-HF_IMAGE_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+HF_IMAGE_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
 
 SYSTEM_PROMPT = {"role": "system", "content": "Ти розумний і корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Використовуй грамотну, природну українську мову без суржику. Будь точним, лаконічним і дружнім. Структуруй відповіді — використовуй абзаци, списки де доречно. Якщо питання незрозуміле — перепитай. Ніколи не вигадуй факти. В групових чатах відповідай тільки коли тебе згадують через @."}
 
