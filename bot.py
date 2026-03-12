@@ -72,14 +72,19 @@ OR_DAILY_LIMIT = 190
 # Утиліти: визначення намірів
 # ════════════════════════════════════════════════════════════════════════════
 
-def needs_reminder(text: str) -> bool:
-    return any(kw in text.lower() for kw in REMIND_KEYWORDS)
+async def detect_intent(text: str) -> str:
+    """Визначає намір через AI. Повертає: 'image', 'reminder', 'search', 'chat'"""
+    result = await call_ai([{"role": "user", "content": (
+        f"Визнач намір цього повідомлення: '{text}'\n"
+        "Відповідай ТІЛЬКИ одним словом:\n"
+        "- 'image' якщо просять намалювати/згенерувати/створити зображення/фото/картинку\n"
+        "- 'reminder' якщо просять нагадати щось через певний час\n"
+        "- 'search' якщо просять знайти/пошукати актуальну інформацію в інтернеті\n"
+        "- 'chat' для всього іншого\n"
+        "Відповідь має бути ТІЛЬКИ одне слово без пояснень."
+    )}])
+    return result.strip().lower().strip("'\"")
 
-def needs_image(text: str) -> bool:
-    return any(kw in text.lower() for kw in IMAGE_KEYWORDS)
-
-def needs_search(text: str) -> bool:
-    return any(kw in text.lower() for kw in SEARCH_KEYWORDS)
 
 def clean_markdown(text: str) -> str:
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
@@ -431,8 +436,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.message.from_user.id
 
-    # Нагадування
-    if needs_reminder(user_text):
+    intent = await detect_intent(user_text)
+
+    if intent == "reminder":
         try:
             delay_min, remind_text = await do_reminder(update, ctx, user_text)
             await update.message.reply_text(f"✅ Нагадаю через {delay_min} хв: {remind_text}")
@@ -440,14 +446,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Не вдалось встановити нагадування: {e}")
         return
 
-    # Генерація зображення
-    if needs_image(user_text):
+    if intent == "image":
         msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
         await do_generate_image(update, user_text, msg)
         return
 
-    # Пошук
-    if needs_search(user_text):
+    if intent == "search":
         msg     = await update.message.reply_text("🌐 Шукаю в інтернеті...")
         results = search_web(user_text)
         try:
@@ -525,7 +529,9 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"🎤 Ти сказав: {text}\n\n⏳ Обробляю...")
         user_id = update.message.from_user.id
 
-        if needs_reminder(text):
+        intent = await detect_intent(text)
+
+        if intent == "reminder":
             try:
                 delay_min, remind_text = await do_reminder(update, ctx, text)
                 await msg.edit_text(f"🎤 Ти сказав: {text}\n\n✅ Нагадаю через {delay_min} хв: {remind_text}")
@@ -533,7 +539,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text(f"Не вдалось встановити нагадування: {e}")
             return
 
-        if needs_image(text):
+        if intent == "image":
             await msg.edit_text(f"🎤 Ти сказав: {text}\n\n🎨 Генерую зображення...")
             await do_generate_image(update, text, msg)
             return
