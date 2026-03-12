@@ -141,6 +141,29 @@ def update_user_memory(user_id: int, data: dict) -> None:
     memory[uid].update(data)
     save_memory(memory)
 
+async def detect_gender_from_voice(audio_bytes: bytes) -> str | None:
+    """Визначає стать за голосом через Groq Whisper + аналіз AI. Повертає 'male', 'female' або None."""
+    try:
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        files   = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
+        data    = {"model": "whisper-large-v3", "language": "uk", "response_format": "verbose_json"}
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(GROQ_WHISPER_URL, headers=headers, files=files, data=data)
+            r.raise_for_status()
+        transcript_text = r.json().get("text", "")
+        if not transcript_text:
+            return None
+        result = await call_ai([{"role": "user", "content": (
+            f"На основі тексту голосового повідомлення спробуй визначити стать мовця.\n"
+            f"Текст: '{transcript_text}'\n"
+            "Звертай увагу на граматичні форми (казав/казала, зробив/зробила тощо).\n"
+            "Відповідай ТІЛЬКИ одним словом: 'male', 'female' або 'unknown'."
+        )}])
+        gender = result.strip().lower()
+        return gender if gender in ("male", "female") else None
+    except Exception:
+        return None
+
 async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> None:
     try:
         result = await call_ai([{"role": "user", "content": (
@@ -161,10 +184,23 @@ async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> N
     except Exception:
         pass
 
+def get_gender(user_id: int) -> str | None:
+    """Повертає 'male', 'female' або None якщо невідомо."""
+    return get_user_memory(user_id).get("gender")
+
+def gender_suffix(user_id: int) -> str:
+    """Повертає підказку для AI щодо граматичного роду."""
+    g = get_gender(user_id)
+    if g == "male":
+        return " Звертайся до користувача як до чоловіка (він, йому, казав, зробив тощо)."
+    if g == "female":
+        return " Звертайся до користувача як до жінки (вона, їй, казала, зробила тощо)."
+    return ""
+
 def get_system_prompt(user_id: int) -> dict:
     mode = user_personalities.get(user_id, "normal")
     p    = PERSONALITIES.get(mode, PERSONALITIES["normal"])
-    return {"role": "system", "content": p["prompt"]}
+    return {"role": "system", "content": p["prompt"] + gender_suffix(user_id)}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -798,7 +834,17 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await msg.edit_text(f"🎤 Ти сказав: {text}\n\n⏳ Обробляю...")
         user_id = update.message.from_user.id
-        intent  = await detect_intent(text)
+
+        # Визначаємо стать якщо ще не відомо
+        if get_gender(user_id) is None:
+            gender = await detect_gender_from_voice(audio_bytes)
+            if gender:
+                update_user_memory(user_id, {"gender": gender})
+                # Оновлюємо системний промпт з новою інформацією
+                if user_id in chat_histories and chat_histories[user_id]:
+                    chat_histories[user_id][0] = get_system_prompt(user_id)
+
+        intent = await detect_intent(text)
 
         if intent == "image":
             await msg.edit_text(f"🎤 Ти сказав: {text}\n\n🎨 Генерую зображення...")
