@@ -13,6 +13,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -20,6 +21,7 @@ GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 VISION_MODEL = "openrouter/auto"
+HF_IMAGE_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
 
 SYSTEM_PROMPT = {"role": "system", "content": "Ти розумний і корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Використовуй грамотну, природну українську мову без суржику. Будь точним, лаконічним і дружнім. Структуруй відповіді — використовуй абзаци, списки де доречно. Якщо питання незрозуміле — перепитай. Ніколи не вигадуй факти. В групових чатах відповідай тільки коли тебе згадують через @."}
 
@@ -95,7 +97,6 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     except Exception as e:
         return f"Помилка читання PDF: {str(e)}"
 
-
 async def send_reminder(bot, chat_id, text):
     await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
 
@@ -112,16 +113,15 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
     try:
-        import urllib.parse
         translation = await call_ai([
             {"role": "user", "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"}
         ])
-        encoded_prompt = urllib.parse.quote(translation)
-        import random
-        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed={random.randint(1,99999)}"
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.get(image_url)
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        payload = {"inputs": translation}
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(HF_IMAGE_URL, headers=headers, json=payload)
             r.raise_for_status()
             img_bytes = r.content
 
