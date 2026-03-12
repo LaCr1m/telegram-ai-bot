@@ -24,7 +24,9 @@ GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL       = "llama-3.3-70b-versatile"
 VISION_MODEL     = "openrouter/auto"                  # авто-вибір моделі з vision
-IMAGE_MODEL      = "google/gemini-2.5-flash-preview:free"
+CF_API_TOKEN  = os.environ.get("CF_API_TOKEN")
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
+CF_IMAGE_URL  = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
 
 # ── Системний промпт ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = {
@@ -248,39 +250,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def generate_image_openrouter(prompt: str) -> bytes:
-    """Генерує зображення через OpenRouter (Gemini Flash Image, безкоштовно)."""
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    body = {
-        "model": IMAGE_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "modalities": ["image", "text"]
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(OPENROUTER_URL, headers=headers, json=body)
-        r.raise_for_status()
-
-    data = r.json()
-    # Відповідь містить зображення у base64 в полі images або content
-    for block in data.get("choices", [{}])[0].get("message", {}).get("content", []):
-        if isinstance(block, dict) and block.get("type") == "image_url":
-            img_url = block["image_url"]["url"]
-            if img_url.startswith("data:image"):
-                b64 = img_url.split(",", 1)[1]
-                return base64.b64decode(b64)
-
-    # Альтернативне поле images
-    images = data.get("choices", [{}])[0].get("message", {}).get("images", [])
-    if images:
-        b64 = images[0].split(",", 1)[-1]
-        return base64.b64decode(b64)
-
-    raise ValueError(f"Зображення не знайдено у відповіді: {data}")
-
-
 async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(ctx.args)
     if not prompt:
@@ -294,7 +263,26 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"
         }])
 
-        img_bytes = await generate_image_openrouter(translation)
+        url = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
+        headers = {
+            "Authorization": f"Bearer {CF_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        body = {"prompt": translation, "num_steps": 8}
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(url, headers=headers, json=body)
+            r.raise_for_status()
+
+        # Cloudflare повертає зображення як бінарні дані або base64
+        content_type = r.headers.get("content-type", "")
+        if "image" in content_type:
+            img_bytes = r.content
+        else:
+            result = r.json().get("result", {})
+            b64 = result.get("image", "")
+            img_bytes = base64.b64decode(b64)
+
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
     except Exception as e:
