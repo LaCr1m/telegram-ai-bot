@@ -8,6 +8,8 @@ import json
 from datetime import date, datetime, timedelta
 from tavily import TavilyClient
 from PyPDF2 import PdfReader
+import openpyxl
+from docx import Document as DocxDocument
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -211,6 +213,37 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
         return "".join(page.extract_text() or "" for page in reader.pages).strip()
     except Exception as e:
         return f"Помилка читання PDF: {e}"
+
+def extract_excel_text(xlsx_bytes: bytes) -> str:
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+        output = ""
+        for sheet in wb.worksheets:
+            output += f"=== Аркуш: {sheet.title} ===\n"
+            for row in sheet.iter_rows(values_only=True):
+                row_data = [str(cell) if cell is not None else "" for cell in row]
+                if any(row_data):
+                    output += " | ".join(row_data) + "\n"
+        return output.strip() or "Файл порожній."
+    except Exception as e:
+        return f"Помилка читання Excel: {e}"
+
+def extract_word_text(docx_bytes: bytes) -> str:
+    try:
+        doc = DocxDocument(io.BytesIO(docx_bytes))
+        output = ""
+        for para in doc.paragraphs:
+            if para.text.strip():
+                output += para.text + "\n"
+        # Також витягуємо таблиці
+        for table in doc.tables:
+            for row in table.rows:
+                row_data = [cell.text.strip() for cell in row.cells]
+                if any(row_data):
+                    output += " | ".join(row_data) + "\n"
+        return output.strip() or "Документ порожній."
+    except Exception as e:
+        return f"Помилка читання Word: {e}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -495,26 +528,38 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"Помилка при аналізі зображення: {e}")
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc.file_name.lower().endswith(".pdf"):
-        await update.message.reply_text("📄 Наразі підтримуються тільки PDF файли.")
+    doc      = update.message.document
+    fname    = doc.file_name.lower()
+    user_id  = update.message.from_user.id
+    caption  = update.message.caption or "Стисло підсумуй цей документ українською мовою."
+
+    if fname.endswith(".pdf"):
+        msg = await update.message.reply_text("📄 Читаю PDF...")
+        file_bytes = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
+        text = extract_pdf_text(file_bytes)
+    elif fname.endswith((".xlsx", ".xls")):
+        msg = await update.message.reply_text("📊 Читаю Excel...")
+        file_bytes = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
+        text = extract_excel_text(file_bytes)
+    elif fname.endswith((".docx", ".doc")):
+        msg = await update.message.reply_text("📝 Читаю Word...")
+        file_bytes = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
+        text = extract_word_text(file_bytes)
+    else:
+        await update.message.reply_text("📄 Підтримуються: PDF, Excel (.xlsx), Word (.docx)")
         return
-    msg = await update.message.reply_text("📄 Читаю PDF...")
+
     try:
-        file      = await ctx.bot.get_file(doc.file_id)
-        text      = extract_pdf_text(bytes(await file.download_as_bytearray()))
-        if not text:
-            await msg.edit_text("❌ Не вдалось витягти текст з PDF.")
+        if not text or text.startswith("Помилка"):
+            await msg.edit_text(f"❌ {text}")
             return
-        caption      = update.message.caption or "Стисло підсумуй цей документ українською мовою."
         text_preview = text[:4000] + ("..." if len(text) > 4000 else "")
-        user_id      = update.message.from_user.id
         append_and_trim(user_id, "user", f"{caption}\n\nВміст документу:\n{text_preview}")
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
         await msg.edit_text(f"📄 {doc.file_name}\n\n{clean_markdown(reply)}")
     except Exception as e:
-        await msg.edit_text(f"Помилка при обробці PDF: {e}")
+        await msg.edit_text(f"Помилка при обробці документу: {e}")
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🎤 Розпізнаю голосове повідомлення...")
@@ -574,7 +619,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("image",  handle_image))
     app.add_handler(MessageHandler(filters.PHOTO,        handle_photo))
     app.add_handler(MessageHandler(filters.VOICE,        handle_voice))
-    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
+    app.add_handler(MessageHandler(filters.Document.PDF | filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") | filters.Document.MimeType("application/vnd.openxmlformats-officedocument.wordprocessingml.document") | filters.Document.MimeType("application/msword") | filters.Document.MimeType("application/vnd.ms-excel"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущено!")
     app.run_polling()
