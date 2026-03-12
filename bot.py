@@ -24,7 +24,7 @@ GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL       = "llama-3.3-70b-versatile"
 VISION_MODEL     = "openrouter/auto"                  # авто-вибір моделі з vision
-HF_IMAGE_URL     = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+POLLINATIONS_URL = "https://image.pollinations.ai/prompt/"
 
 # ── Системний промпт ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = {
@@ -261,9 +261,11 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"
         }])
 
-        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        from urllib.parse import quote
+        url = POLLINATIONS_URL + quote(translation) + "?width=1024&height=1024&nologo=true"
+
         async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(HF_IMAGE_URL, headers=headers, json={"inputs": translation})
+            r = await client.get(url)
             r.raise_for_status()
 
         await update.message.reply_photo(photo=r.content, caption=f"🎨 {prompt}")
