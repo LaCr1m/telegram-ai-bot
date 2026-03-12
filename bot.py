@@ -398,17 +398,24 @@ def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[b
     return False, user_text
 
 
-IMAGE_KEYWORDS = [
+REMIND_KEYWORDS = [
+    "нагадай", "нагади", "нагадуй", "remind me", "set reminder",
+    "нагадування", "постав нагадування"
+]
     "створи фото", "згенеруй фото", "намалюй", "згенеруй зображення",
     "створи зображення", "зроби фото", "зроби картинку", "створи картинку",
     "generate image", "draw", "create image", "create photo"
 ]
 
-SEARCH_KEYWORDS = [
+IMAGE_KEYWORDS = [
     "пошукай", "знайди", "загугли", "що відбувається", "останні новини",
     "яка погода", "який курс", "поточн", "зараз", "сьогодні", "актуальн",
     "search", "find", "google", "look up"
 ]
+
+def needs_reminder(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in REMIND_KEYWORDS)
 
 def needs_image(text: str) -> bool:
     t = text.lower()
@@ -424,6 +431,28 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.message.from_user.id
+
+    # Автоматичне нагадування
+    if needs_reminder(user_text):
+        try:
+            now_str = datetime.now().strftime("%H:%M")
+            parsed = await call_ai([{"role": "user", "content": (
+                f"Поточний час: {now_str}. "
+                f"З цього тексту витягни час нагадування і текст нагадування: '{user_text}'. "
+                "Відповідай ТІЛЬКИ у форматі JSON: {\"delay_minutes\": 5, \"text\": \"текст\"} "
+                "де delay_minutes — через скільки хвилин нагадати (ціле число). "
+                "Якщо вказано години — переведи в хвилини. Нічого більше не пиши."
+            )}])
+            parsed = parsed.strip().replace("```json", "").replace("```", "")
+            data = json.loads(parsed)
+            delay_min = int(data["delay_minutes"])
+            remind_text = data["text"]
+            fire_at = datetime.now() + timedelta(minutes=delay_min)
+            await schedule_reminder(ctx.bot, update.effective_chat.id, remind_text, fire_at)
+            await update.message.reply_text(f"✅ Нагадаю через {delay_min} хв: {remind_text}")
+        except Exception as e:
+            await update.message.reply_text(f"Не вдалось встановити нагадування: {e}")
+        return
 
     # Автоматична генерація зображення
     if needs_image(user_text):
