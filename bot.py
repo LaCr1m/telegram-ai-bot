@@ -270,7 +270,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         }
         body = {"prompt": translation, "num_steps": 8}
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             r = await client.post(url, headers=headers, json=body)
             r.raise_for_status()
 
