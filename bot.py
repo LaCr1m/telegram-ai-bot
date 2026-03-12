@@ -543,13 +543,13 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("Не вдалось розпізнати мову 😔")
             return
 
-        await msg.edit_text(f"🎤 Ти сказав: _{text}_\n\n⏳ Обробляю...", parse_mode="Markdown")
+        await msg.edit_text(f"🎤 Ти сказав: {text}\n\n⏳ Обробляю...")
 
         user_id = update.message.from_user.id
         append_and_trim(user_id, "user", text)
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
-        await msg.edit_text(f"🎤 Ти сказав: _{text}_\n\n{reply}", parse_mode="Markdown")
+        await msg.edit_text(f"🎤 Ти сказав: {text}\n\n{reply}")
     except Exception as e:
         await msg.edit_text(f"Помилка при обробці голосового: {e}")
 
