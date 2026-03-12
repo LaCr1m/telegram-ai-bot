@@ -136,7 +136,8 @@ REMIND_KEYWORDS = [
 IMAGE_KEYWORDS = [
     "створи фото", "згенеруй фото", "намалюй", "згенеруй зображення",
     "створи зображення", "зроби фото", "зроби картинку", "створи картинку",
-    "generate image", "draw", "create image", "create photo"
+    "зроби зображення", "згенеруй картинку", "покажи зображення",
+    "generate image", "draw", "create image", "create photo", "make image"
 ]
 SEARCH_KEYWORDS = [
     "пошукай", "знайди", "загугли", "що відбувається", "останні новини",
@@ -1100,7 +1101,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Сесію завершено.")
             return
 
-    # Перевіряємо намір ДО сесії — якщо це явний намір (не chat), виходимо з сесії
+    # Швидка перевірка ключових слів зображення — має пріоритет над будь-якою сесією
+    t_low = user_text.lower()
+    if any(kw in t_low for kw in IMAGE_KEYWORDS):
+        user_sessions.pop(user_id, None)
+        msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
+        await do_generate_image(update, user_text, msg)
+        return
+
+    # Визначаємо намір ДО сесії — якщо це явний намір (не chat), виходимо з сесії
     intent = await detect_intent(user_text)
     if intent != "chat" and user_id in user_sessions:
         user_sessions.pop(user_id, None)
