@@ -10,6 +10,7 @@ from tavily import TavilyClient
 import subprocess
 import openpyxl
 from docx import Document as DocxDocument
+from pypdf import PdfReader
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -31,6 +32,11 @@ GROQ_MODEL       = "llama-3.3-70b-versatile"
 VISION_MODEL     = "openrouter/auto"
 CF_IMAGE_URL     = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
 
+# ── Константи ─────────────────────────────────────────────────────────────────
+MAX_HISTORY_MESSAGES = 20
+REMINDERS_FILE       = "reminders.json"
+MEMORY_FILE          = "memory.json"
+
 # ── Системний промпт ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = {
     "role": "system",
@@ -44,18 +50,8 @@ SYSTEM_PROMPT = {
     )
 }
 
-STORY_GENRES = {
-    "fantasy":   {"name": "Фентезі",       "emoji": "🧙"},
-    "horror":    {"name": "Жахи",          "emoji": "👻"},
-    "romance":   {"name": "Романтика",     "emoji": "💕"},
-    "scifi":     {"name": "Наукова фантастика", "emoji": "🚀"},
-    "adventure": {"name": "Пригоди",       "emoji": "⚔️"},
-    "mystery":   {"name": "Детектив",      "emoji": "🔍"},
-    "comedy":    {"name": "Комедія",       "emoji": "😂"},
-}
-
-# Активні сесії рольових ігор / історій
-user_sessions: dict[int, dict] = {}  # {user_id: {"mode": "story"|"rpg", "genre": ..., "context": [...]}}
+# ── FIX #1: PERSONALITIES тепер правильно оголошений як словник ──────────────
+PERSONALITIES = {
     "normal": {
         "name": "Звичайний",
         "emoji": "🤖",
@@ -102,8 +98,32 @@ user_sessions: dict[int, dict] = {}  # {user_id: {"mode": "story"|"rpg", "genre"
     }
 }
 
-# Поточна особистість для кожного користувача
-user_personalities: dict[int, str] = {}
+STORY_GENRES = {
+    "fantasy":   {"name": "Фентезі",            "emoji": "🧙"},
+    "horror":    {"name": "Жахи",               "emoji": "👻"},
+    "romance":   {"name": "Романтика",          "emoji": "💕"},
+    "scifi":     {"name": "Наукова фантастика", "emoji": "🚀"},
+    "adventure": {"name": "Пригоди",            "emoji": "⚔️"},
+    "mystery":   {"name": "Детектив",           "emoji": "🔍"},
+    "comedy":    {"name": "Комедія",            "emoji": "😂"},
+}
+
+ZODIAC_SIGNS = {
+    "овен": "aries", "телець": "taurus", "близнюки": "gemini",
+    "рак": "cancer", "лев": "leo", "діва": "virgo",
+    "терези": "libra", "скорпіон": "scorpio", "стрілець": "sagittarius",
+    "козеріг": "capricorn", "водолій": "aquarius", "риби": "pisces"
+}
+
+QUIZ_CATEGORIES = {
+    "history":   "📜 Історія",
+    "science":   "🔬 Наука",
+    "geography": "🌍 Географія",
+    "movies":    "🎬 Кіно",
+    "sport":     "⚽ Спорт",
+    "ukraine":   "🇺🇦 Україна",
+    "mix":       "🎲 Мікс",
+}
 
 # ── Ключові слова ─────────────────────────────────────────────────────────────
 REMIND_KEYWORDS = [
@@ -122,10 +142,74 @@ SEARCH_KEYWORDS = [
 ]
 
 # ── Стан ─────────────────────────────────────────────────────────────────────
-chat_histories: dict[int, list] = {}
+chat_histories:    dict[int, list] = {}
+user_sessions:     dict[int, dict] = {}
+user_personalities: dict[int, str] = {}
 tavily         = TavilyClient(api_key=TAVILY_API_KEY)
 or_requests    = {"count": 0, "date": date.today()}
 OR_DAILY_LIMIT = 190
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# FIX #2: Функції пам'яті
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_memory() -> dict:
+    if not os.path.exists(MEMORY_FILE):
+        return {}
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_memory(memory: dict) -> None:
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(memory, f, ensure_ascii=False, indent=2)
+
+def get_user_memory(user_id: int) -> dict:
+    memory = load_memory()
+    return memory.get(str(user_id), {})
+
+def update_user_memory(user_id: int, data: dict) -> None:
+    memory = load_memory()
+    uid    = str(user_id)
+    if uid not in memory:
+        memory[uid] = {}
+    memory[uid].update(data)
+    save_memory(memory)
+
+async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> None:
+    """Витягує важливі факти з розмови та зберігає в пам'ять."""
+    try:
+        result = await call_ai([{"role": "user", "content": (
+            f"З цього діалогу витягни важливі факти про користувача (ім'я, вік, місто, вподобання тощо).\n"
+            f"Користувач: {user_text}\nБот: {reply}\n\n"
+            "Відповідай ТІЛЬКИ у форматі JSON: {\"name\": \"...\", \"facts\": [\"факт1\", \"факт2\"]} "
+            "або {} якщо нічого важливого немає. Нічого більше не пиши."
+        )}])
+        result = result.strip().replace("```json", "").replace("```", "")
+        data   = json.loads(result)
+        if data:
+            mem = get_user_memory(user_id)
+            if "name" not in mem and data.get("name"):
+                mem["name"] = data["name"]
+            if data.get("facts"):
+                existing = set(mem.get("facts", []))
+                mem["facts"] = list(existing | set(data["facts"]))
+            update_user_memory(user_id, mem)
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# FIX #3: get_system_prompt
+# ════════════════════════════════════════════════════════════════════════════
+
+def get_system_prompt(user_id: int) -> dict:
+    mode = user_personalities.get(user_id, "normal")
+    p    = PERSONALITIES.get(mode, PERSONALITIES["normal"])
+    return {"role": "system", "content": p["prompt"]}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -133,7 +217,6 @@ OR_DAILY_LIMIT = 190
 # ════════════════════════════════════════════════════════════════════════════
 
 async def detect_intent(text: str) -> str:
-    """Визначає намір. Повертає: 'image','reminder','search','convert','horoscope','fact','joke','chat'"""
     result = await call_ai([{"role": "user", "content": (
         f"Визнач намір цього повідомлення: '{text}'\n"
         "Відповідай ТІЛЬКИ одним словом:\n"
@@ -190,7 +273,6 @@ async def call_ai(messages: list) -> str:
     provider = get_text_provider()
     if provider == "openrouter":
         url, key = OPENROUTER_URL, OPENROUTER_API_KEY
-        # Спробуємо основну модель, при 404 — fallback на роутер
         for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
             body    = {"model": model, "messages": messages}
@@ -204,7 +286,6 @@ async def call_ai(messages: list) -> str:
             r.raise_for_status()
             or_requests["count"] += 1
             return r.json()["choices"][0]["message"]["content"]
-        # Якщо обидві не спрацювали — переходимо на Groq
         or_requests["count"] = OR_DAILY_LIMIT
         return await call_ai(messages)
     else:
@@ -256,162 +337,47 @@ async def generate_image(prompt: str) -> bytes:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Утиліти: пошук і PDF
+# FIX #4: Конвертація валют та одиниць
 # ════════════════════════════════════════════════════════════════════════════
 
-ZODIAC_SIGNS = {
-    " овен": "aries", "телець": "taurus", "близнюки": "gemini",
-    "рак": "cancer", "лев": "leo", "діва": "virgo",
-    "терези": "libra", "скорпіон": "scorpio", "стрілець": "sagittarius",
-    "козеріг": "capricorn", "водолій": "aquarius", "риби": "pisces"
-}
+async def convert_currency(amount: float, from_c: str, to_c: str) -> str:
+    try:
+        result = await call_ai([{"role": "user", "content": (
+            f"Конвертуй {amount} {from_c.upper()} у {to_c.upper()}. "
+            "Використай актуальний курс (або наближений якщо немає доступу). "
+            "Відповідай коротко українською: 'X USD = Y UAH (курс: Z)'"
+        )}])
+        return result
+    except Exception as e:
+        return f"❌ Помилка конвертації: {e}"
 
-# Активні ігрові сесії
-# user_sessions вже є, додаємо типи: "quiz", "riddle", "20q"
-
-QUIZ_CATEGORIES = {
-    "history":  "📜 Історія",
-    "science":  "🔬 Наука",
-    "geography":"🌍 Географія",
-    "movies":   "🎬 Кіно",
-    "sport":    "⚽ Спорт",
-    "ukraine":  "🇺🇦 Україна",
-    "mix":      "🎲 Мікс",
-}
-
-async def start_quiz(user_id: int, category: str) -> str:
-    cat_name = QUIZ_CATEGORIES.get(category, "Мікс")
-    question_data = await call_ai([{"role": "user", "content": (
-        f"Створи питання для вікторини на тему '{cat_name}'. "
-        "Відповідай ТІЛЬКИ у форматі JSON:\n"
-        "{\"question\": \"питання\", \"options\": [\"A) варіант\", \"B) варіант\", \"C) варіант\", \"D) варіант\"], "
-        "\"answer\": \"A\", \"explanation\": \"пояснення\"}\n"
-        "Нічого більше не пиши."
-    )}])
-    question_data = question_data.strip().replace("```json","").replace("```","")
-    data = json.loads(question_data)
-    user_sessions[user_id] = {
-        "mode":     "quiz",
-        "category": category,
-        "score":    0,
-        "total":    0,
-        "current":  data,
-        "context":  []
+def convert_units(amount: float, from_u: str, to_u: str) -> str:
+    """Конвертація одиниць виміру."""
+    conversions = {
+        ("km", "mi"): 0.621371, ("mi", "km"): 1.60934,
+        ("kg", "lb"): 2.20462,  ("lb", "kg"): 0.453592,
+        ("m",  "ft"): 3.28084,  ("ft", "m"):  0.3048,
+        ("l",  "gal"): 0.264172, ("gal", "l"): 3.78541,
     }
-    opts = "\n".join(data["options"])
-    return f"🎯 Вікторина: {cat_name}\n\n❓ {data['question']}\n\n{opts}"
+    key = (from_u.lower(), to_u.lower())
+    # Температура
+    if key == ("c", "f"):
+        res = amount * 9/5 + 32
+        return f"🌡️ {amount}°C = {res:.2f}°F"
+    if key == ("f", "c"):
+        res = (amount - 32) * 5/9
+        return f"🌡️ {amount}°F = {res:.2f}°C"
+    if key in conversions:
+        res = amount * conversions[key]
+        return f"📐 {amount} {from_u} = {res:.4f} {to_u}"
+    return f"❌ Не знаю як конвертувати {from_u} → {to_u}"
 
-async def check_quiz_answer(user_id: int, user_text: str) -> str:
-    session  = user_sessions[user_id]
-    current  = session["current"]
-    answer   = user_text.strip().upper()[:1]
-    correct  = current["answer"].upper()
-    session["total"] += 1
 
-    if answer == correct:
-        session["score"] += 1
-        result = f"✅ Правильно! {current['explanation']}\n\n🏆 Рахунок: {session['score']}/{session['total']}"
-    else:
-        result = f"❌ Неправильно! Правильна відповідь: {correct}\n{current['explanation']}\n\n🏆 Рахунок: {session['score']}/{session['total']}"
+# ════════════════════════════════════════════════════════════════════════════
+# FIX #5: Правильне оголошення get_horoscope, search_web, extract_video_audio
+# ════════════════════════════════════════════════════════════════════════════
 
-    # Наступне питання
-    next_data = await call_ai([{"role": "user", "content": (
-        f"Створи НОВЕ питання для вікторини на тему '{QUIZ_CATEGORIES.get(session['category'])}'. "
-        "Відповідай ТІЛЬКИ у форматі JSON:\n"
-        "{\"question\": \"питання\", \"options\": [\"A) варіант\", \"B) варіант\", \"C) варіант\", \"D) варіант\"], "
-        "\"answer\": \"A\", \"explanation\": \"пояснення\"}\nНічого більше."
-    )}])
-    next_data = next_data.strip().replace("```json","").replace("```","")
-    session["current"] = json.loads(next_data)
-    opts = "\n".join(session["current"]["options"])
-    return f"{result}\n\n➡️ Наступне питання:\n❓ {session['current']['question']}\n\n{opts}"
-
-async def start_riddle(user_id: int) -> str:
-    data = await call_ai([{"role": "user", "content": (
-        "Придумай цікаву загадку українською мовою. "
-        "Відповідай ТІЛЬКИ у форматі JSON:\n"
-        "{\"riddle\": \"текст загадки\", \"answer\": \"відповідь\", \"hint\": \"підказка\"}\n"
-        "Нічого більше не пиши."
-    )}])
-    data = data.strip().replace("```json","").replace("```","")
-    parsed = json.loads(data)
-    user_sessions[user_id] = {
-        "mode":    "riddle",
-        "current": parsed,
-        "hints":   0,
-        "context": []
-    }
-    return f"🧩 Загадка:\n\n{parsed['riddle']}\n\n💡 Напиши відповідь або 'підказка'"
-
-async def check_riddle(user_id: int, user_text: str) -> str:
-    session = user_sessions[user_id]
-    current = session["current"]
-    text    = user_text.lower().strip()
-
-    if "підказка" in text:
-        session["hints"] += 1
-        return f"💡 Підказка: {current['hint']}\n\nСпробуй ще раз!"
-
-    # Перевірка через AI чи відповідь правильна
-    check = await call_ai([{"role": "user", "content": (
-        f"Загадка: '{current['riddle']}'\n"
-        f"Правильна відповідь: '{current['answer']}'\n"
-        f"Відповідь користувача: '{user_text}'\n"
-        "Чи правильна відповідь? Відповідай ТІЛЬКИ 'yes' або 'no'."
-    )}])
-
-    if "yes" in check.lower():
-        hints_penalty = f" (-{session['hints']} підказки)" if session["hints"] else ""
-        user_sessions.pop(user_id, None)
-        return (
-            f"🎉 Правильно! Відповідь: {current['answer']}{hints_penalty}\n\n"
-            f"Ще загадку? /riddle"
-        )
-    else:
-        return f"❌ Не зовсім... Спробуй ще або напиши 'підказка'"
-
-async def start_20q(user_id: int) -> str:
-    user_sessions[user_id] = {
-        "mode":      "20q",
-        "questions": 0,
-        "history":   [],
-        "context":   []
-    }
-    system = (
-        "Ми граємо у гру '20 питань'. Задумай будь-який предмет, тварину або відому особу. "
-        "НЕ розкривай що задумав. Гравець задаватиме питання на які можна відповісти "
-        "тільки 'Так', 'Ні' або 'Частково'. Після 20 питань гравець має вгадати. "
-        "Відповідай українською."
-    )
-    reply = await call_ai([
-        {"role": "system", "content": system},
-        {"role": "user", "content": "Задумав щось. Починаємо!"}
-    ])
-    user_sessions[user_id]["history"].append({"role": "assistant", "content": reply})
-    return f"🤔 Гра '20 питань'\n\nЯ задумав щось... Задавай питання!\nВідповіді: Так / Ні / Частково\n\n{reply}"
-
-async def handle_20q(user_id: int, user_text: str) -> str:
-    session = user_sessions[user_id]
-    session["questions"] += 1
-    q_num = session["questions"]
-
-    system = (
-        "Ми граємо у '20 питань'. Ти задумав предмет/тварину/особу. "
-        "Відповідай на питання тільки 'Так', 'Ні' або 'Частково'. "
-        "Якщо гравець вгадав — підтверди і привітай. "
-        "Відповідай українською."
-    )
-    session["history"].append({"role": "user", "content": f"Питання {q_num}/20: {user_text}"})
-    messages = [{"role": "system", "content": system}] + session["history"][-10:]
-    reply    = await call_ai(messages)
-    session["history"].append({"role": "assistant", "content": reply})
-
-    suffix = f"\n\n❓ Питань залишилось: {20 - q_num}"
-    if q_num >= 20:
-        user_sessions.pop(user_id, None)
-        suffix = "\n\n🏁 Питання вичерпано! /20q — зіграти ще"
-
-    return f"{reply}{suffix}"
+async def get_horoscope(sign: str) -> str:
     sign_en = ZODIAC_SIGNS.get(sign.lower())
     if not sign_en:
         signs = ", ".join(ZODIAC_SIGNS.keys())
@@ -441,6 +407,8 @@ async def get_joke() -> str:
         "Формат: питання/завязка — потім відповідь/кульмінація."
     )}])
     return f"😂 Жарт дня\n\n{reply}"
+
+async def extract_video_audio(video_bytes: bytes) -> bytes:
     """Витягує аудіо з відео через ffmpeg."""
     with open("/tmp/input_video.mp4", "wb") as f:
         f.write(video_bytes)
@@ -459,7 +427,6 @@ async def extract_video_frames(video_bytes: bytes, max_frames: int = 3) -> list[
     with open("/tmp/input_video.mp4", "wb") as f:
         f.write(video_bytes)
     frames = []
-    # Витягуємо кадри рівномірно
     for i, t in enumerate(["00:00:01", "00:00:05", "00:00:10"][:max_frames]):
         out_path = f"/tmp/frame_{i}.jpg"
         proc = await asyncio.create_subprocess_exec(
@@ -475,10 +442,7 @@ async def extract_video_frames(video_bytes: bytes, max_frames: int = 3) -> list[
     return frames
 
 async def analyze_video(video_bytes: bytes, caption: str) -> str:
-    """Повний аналіз відео: транскрипція аудіо + аналіз кадрів."""
     results = []
-
-    # 1. Транскрибуємо аудіо
     try:
         audio_bytes = await extract_video_audio(video_bytes)
         transcript  = await transcribe_voice(audio_bytes)
@@ -486,14 +450,12 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
             results.append(f"🎤 Аудіо у відео:\n{transcript}")
     except Exception:
         pass
-
-    # 2. Аналізуємо кадри
     try:
         frames = await extract_video_frames(video_bytes)
         if frames:
             frame_descriptions = []
             for i, frame in enumerate(frames):
-                b64 = base64.b64encode(frame).decode()
+                b64  = base64.b64encode(frame).decode()
                 desc = await call_vision([
                     SYSTEM_PROMPT,
                     {"role": "user", "content": [
@@ -505,22 +467,19 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
             results.append("🎬 Візуальний вміст:\n" + "\n".join(frame_descriptions))
     except Exception:
         pass
-
     if not results:
         return "❌ Не вдалось проаналізувати відео."
-
-    # 3. Загальний підсумок
     combined = "\n\n".join(results)
     summary  = await call_ai([
         SYSTEM_PROMPT,
         {"role": "user", "content": (
             f"На основі цих даних про відео дай відповідь на запит користувача.\n"
-            f"Запит: {caption}\n\n"
-            f"Дані про відео:\n{combined}\n\n"
-            "Відповідай українською."
+            f"Запит: {caption}\n\nДані про відео:\n{combined}\n\nВідповідай українською."
         )}
     ])
     return f"{combined}\n\n📝 Підсумок:\n{summary}"
+
+async def search_web(query: str) -> str:
     try:
         results = tavily.search(query=query, max_results=3)
         output  = ""
@@ -558,7 +517,6 @@ def extract_word_text(docx_bytes: bytes) -> str:
         for para in doc.paragraphs:
             if para.text.strip():
                 output += para.text + "\n"
-        # Також витягуємо таблиці
         for table in doc.tables:
             for row in table.rows:
                 row_data = [cell.text.strip() for cell in row.cells]
@@ -627,7 +585,115 @@ async def restore_reminders(bot) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Спільна логіка: генерація зображення з тексту
+# Вікторини / загадки / 20 питань
+# ════════════════════════════════════════════════════════════════════════════
+
+async def start_quiz(user_id: int, category: str) -> str:
+    cat_name = QUIZ_CATEGORIES.get(category, "Мікс")
+    question_data = await call_ai([{"role": "user", "content": (
+        f"Створи питання для вікторини на тему '{cat_name}'. "
+        "Відповідай ТІЛЬКИ у форматі JSON:\n"
+        "{\"question\": \"питання\", \"options\": [\"A) варіант\", \"B) варіант\", \"C) варіант\", \"D) варіант\"], "
+        "\"answer\": \"A\", \"explanation\": \"пояснення\"}\nНічого більше не пиши."
+    )}])
+    question_data = question_data.strip().replace("```json", "").replace("```", "")
+    data = json.loads(question_data)
+    user_sessions[user_id] = {
+        "mode": "quiz", "category": category,
+        "score": 0, "total": 0, "current": data, "context": []
+    }
+    opts = "\n".join(data["options"])
+    return f"🎯 Вікторина: {cat_name}\n\n❓ {data['question']}\n\n{opts}"
+
+async def check_quiz_answer(user_id: int, user_text: str) -> str:
+    session = user_sessions[user_id]
+    current = session["current"]
+    answer  = user_text.strip().upper()[:1]
+    correct = current["answer"].upper()
+    session["total"] += 1
+    if answer == correct:
+        session["score"] += 1
+        result = f"✅ Правильно! {current['explanation']}\n\n🏆 Рахунок: {session['score']}/{session['total']}"
+    else:
+        result = f"❌ Неправильно! Правильна відповідь: {correct}\n{current['explanation']}\n\n🏆 Рахунок: {session['score']}/{session['total']}"
+    next_data = await call_ai([{"role": "user", "content": (
+        f"Створи НОВЕ питання для вікторини на тему '{QUIZ_CATEGORIES.get(session['category'])}'. "
+        "Відповідай ТІЛЬКИ у форматі JSON:\n"
+        "{\"question\": \"питання\", \"options\": [\"A) варіант\", \"B) варіант\", \"C) варіант\", \"D) варіант\"], "
+        "\"answer\": \"A\", \"explanation\": \"пояснення\"}\nНічого більше."
+    )}])
+    next_data = next_data.strip().replace("```json", "").replace("```", "")
+    session["current"] = json.loads(next_data)
+    opts = "\n".join(session["current"]["options"])
+    return f"{result}\n\n➡️ Наступне питання:\n❓ {session['current']['question']}\n\n{opts}"
+
+async def start_riddle(user_id: int) -> str:
+    data = await call_ai([{"role": "user", "content": (
+        "Придумай цікаву загадку українською мовою. "
+        "Відповідай ТІЛЬКИ у форматі JSON:\n"
+        "{\"riddle\": \"текст загадки\", \"answer\": \"відповідь\", \"hint\": \"підказка\"}\n"
+        "Нічого більше не пиши."
+    )}])
+    data   = data.strip().replace("```json", "").replace("```", "")
+    parsed = json.loads(data)
+    user_sessions[user_id] = {"mode": "riddle", "current": parsed, "hints": 0, "context": []}
+    return f"🧩 Загадка:\n\n{parsed['riddle']}\n\n💡 Напиши відповідь або 'підказка'"
+
+async def check_riddle(user_id: int, user_text: str) -> str:
+    session = user_sessions[user_id]
+    current = session["current"]
+    text    = user_text.lower().strip()
+    if "підказка" in text:
+        session["hints"] += 1
+        return f"💡 Підказка: {current['hint']}\n\nСпробуй ще раз!"
+    check = await call_ai([{"role": "user", "content": (
+        f"Загадка: '{current['riddle']}'\nПравильна відповідь: '{current['answer']}'\n"
+        f"Відповідь користувача: '{user_text}'\nЧи правильна відповідь? Відповідай ТІЛЬКИ 'yes' або 'no'."
+    )}])
+    if "yes" in check.lower():
+        hints_penalty = f" (-{session['hints']} підказки)" if session["hints"] else ""
+        user_sessions.pop(user_id, None)
+        return f"🎉 Правильно! Відповідь: {current['answer']}{hints_penalty}\n\nЩе загадку? /riddle"
+    else:
+        return "❌ Не зовсім... Спробуй ще або напиши 'підказка'"
+
+async def start_20q(user_id: int) -> str:
+    user_sessions[user_id] = {"mode": "20q", "questions": 0, "history": [], "context": []}
+    system = (
+        "Ми граємо у гру '20 питань'. Задумай будь-який предмет, тварину або відому особу. "
+        "НЕ розкривай що задумав. Гравець задаватиме питання на які можна відповісти "
+        "тільки 'Так', 'Ні' або 'Частково'. Після 20 питань гравець має вгадати. "
+        "Відповідай українською."
+    )
+    reply = await call_ai([
+        {"role": "system", "content": system},
+        {"role": "user", "content": "Задумав щось. Починаємо!"}
+    ])
+    user_sessions[user_id]["history"].append({"role": "assistant", "content": reply})
+    return f"🤔 Гра '20 питань'\n\nЯ задумав щось... Задавай питання!\nВідповіді: Так / Ні / Частково\n\n{reply}"
+
+async def handle_20q(user_id: int, user_text: str) -> str:
+    session = user_sessions[user_id]
+    session["questions"] += 1
+    q_num  = session["questions"]
+    system = (
+        "Ми граємо у '20 питань'. Ти задумав предмет/тварину/особу. "
+        "Відповідай на питання тільки 'Так', 'Ні' або 'Частково'. "
+        "Якщо гравець вгадав — підтверди і привітай. Відповідай українською."
+    )
+    session["history"].append({"role": "user", "content": f"Питання {q_num}/20: {user_text}"})
+    messages = [{"role": "system", "content": system}] + session["history"][-10:]
+    reply    = await call_ai(messages)
+    session["history"].append({"role": "assistant", "content": reply})
+    suffix = f"\n\n❓ Питань залишилось: {20 - q_num}"
+    if q_num >= 20:
+        user_sessions.pop(user_id, None)
+        suffix = "\n\n🏁 Питання вичерпано! /20q — зіграти ще"
+    return f"{reply}{suffix}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Спільна логіка
 # ════════════════════════════════════════════════════════════════════════════
 
 async def do_generate_image(update: Update, text: str, msg):
@@ -655,11 +721,11 @@ async def do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str)
         "Відповідай ТІЛЬКИ у форматі JSON: {\"delay_minutes\": 5, \"text\": \"текст\"} "
         "де delay_minutes — через скільки хвилин нагадати. Нічого більше не пиши."
     )}])
-    parsed    = parsed.strip().replace("```json", "").replace("```", "")
-    data      = json.loads(parsed)
-    delay_min = int(data["delay_minutes"])
+    parsed      = parsed.strip().replace("```json", "").replace("```", "")
+    data        = json.loads(parsed)
+    delay_min   = int(data["delay_minutes"])
     remind_text = data["text"]
-    fire_at   = datetime.now() + timedelta(minutes=delay_min)
+    fire_at     = datetime.now() + timedelta(minutes=delay_min)
     await schedule_reminder(ctx.bot, update.effective_chat.id, remind_text, fire_at)
     return delay_min, remind_text
 
@@ -685,17 +751,12 @@ async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def forget_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    memory = load_memory()
+    memory  = load_memory()
     memory.pop(str(user_id), None)
     save_memory(memory)
     await update.message.reply_text("🗑️ Пам'ять очищено.")
 
 async def convert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /convert 100 usd uah  — валюта
-    /convert 5 km mi      — одиниці
-    /convert 100 c f      — температура
-    """
     if not ctx.args or len(ctx.args) < 3:
         await update.message.reply_text(
             "Використання:\n"
@@ -707,14 +768,12 @@ async def convert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     try:
-        amount   = float(ctx.args[0].replace(",", "."))
-        from_u   = ctx.args[1]
-        to_u     = ctx.args[2]
+        amount = float(ctx.args[0].replace(",", "."))
+        from_u = ctx.args[1]
+        to_u   = ctx.args[2]
     except ValueError:
         await update.message.reply_text("❌ Невірний формат числа.")
         return
-
-    # Визначаємо чи це валюта чи одиниці
     currencies = {
         "usd","eur","uah","gbp","pln","czk","chf",
         "jpy","cad","aud","rub","try","cny","sek","nok"
@@ -723,7 +782,6 @@ async def convert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = await convert_currency(amount, from_u, to_u)
     else:
         result = convert_units(amount, from_u, to_u)
-
     await update.message.reply_text(result, parse_mode="Markdown")
 
 async def horoscope_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -731,8 +789,8 @@ async def horoscope_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         signs = "\n".join(f"• /horoscope {s}" for s in ZODIAC_SIGNS)
         await update.message.reply_text(f"⭐ Вкажи знак зодіаку:\n{signs}")
         return
-    sign  = " ".join(ctx.args).lower()
-    msg   = await update.message.reply_text("⭐ Складаю гороскоп...")
+    sign   = " ".join(ctx.args).lower()
+    msg    = await update.message.reply_text("⭐ Складаю гороскоп...")
     result = await get_horoscope(sign)
     await msg.edit_text(clean_markdown(result))
 
@@ -748,12 +806,10 @@ async def joke_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def story_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-
     if ctx.args and ctx.args[0].lower() == "stop":
         user_sessions.pop(user_id, None)
         await update.message.reply_text("📖 Історію завершено!")
         return
-
     genre_key = ctx.args[0].lower() if ctx.args else None
     if not genre_key or genre_key not in STORY_GENRES:
         lines = ["📖 Оберіть жанр для спільної історії:\n"]
@@ -762,19 +818,12 @@ async def story_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append("\n/story stop — завершити")
         await update.message.reply_text("\n".join(lines))
         return
-
     genre = STORY_GENRES[genre_key]
-    user_sessions[user_id] = {
-        "mode":    "story",
-        "genre":   genre_key,
-        "context": []
-    }
-
+    user_sessions[user_id] = {"mode": "story", "genre": genre_key, "context": []}
     prompt = (
         f"Ми граємо у спільну інтерактивну історію у жанрі {genre['name']}. "
         f"Ти — оповідач. Почни захоплюючу історію (3-4 речення) і в кінці запропонуй "
-        f"користувачу 3 варіанти що робити далі (пронумеровані). "
-        f"Відповідай виключно українською мовою."
+        f"користувачу 3 варіанти що робити далі (пронумеровані). Відповідай українською."
     )
     reply = await call_ai([
         {"role": "system", "content": prompt},
@@ -783,31 +832,21 @@ async def story_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_sessions[user_id]["context"].append({"role": "assistant", "content": reply})
     await update.message.reply_text(f"{genre['emoji']} *{genre['name']}*\n\n{clean_markdown(reply)}")
 
-
 async def rpg_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-
     if ctx.args and ctx.args[0].lower() == "stop":
         user_sessions.pop(user_id, None)
         await update.message.reply_text("⚔️ Гру завершено!")
         return
-
     genre_key = ctx.args[0].lower() if ctx.args else "fantasy"
     if genre_key not in STORY_GENRES:
         genre_key = "fantasy"
-
     genre = STORY_GENRES[genre_key]
-    user_sessions[user_id] = {
-        "mode":    "rpg",
-        "genre":   genre_key,
-        "context": []
-    }
-
+    user_sessions[user_id] = {"mode": "rpg", "genre": genre_key, "context": []}
     prompt = (
         f"Ти — майстер рольової гри у жанрі {genre['name']}. "
-        f"Опиши світ і попроси користувача створити персонажа: "
-        f"ім'я, клас/роль і одну особливість. "
-        f"Будь деталізованим і захоплюючим. Відповідай виключно українською."
+        f"Опиши світ і попроси користувача створити персонажа: ім'я, клас/роль і одну особливість. "
+        f"Будь деталізованим і захоплюючим. Відповідай українською."
     )
     reply = await call_ai([
         {"role": "system", "content": prompt},
@@ -816,44 +855,79 @@ async def rpg_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_sessions[user_id]["context"].append({"role": "assistant", "content": reply})
     await update.message.reply_text(f"{genre['emoji']} *RPG: {genre['name']}*\n\n{clean_markdown(reply)}")
 
+async def quiz_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if ctx.args and ctx.args[0].lower() == "stop":
+        user_sessions.pop(user_id, None)
+        await update.message.reply_text("🎯 Вікторину завершено!")
+        return
+    category = ctx.args[0].lower() if ctx.args and ctx.args[0].lower() in QUIZ_CATEGORIES else "mix"
+    msg = await update.message.reply_text("🎯 Готую питання...")
+    result = await start_quiz(user_id, category)
+    await msg.edit_text(result)
 
+async def riddle_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    msg = await update.message.reply_text("🧩 Придумую загадку...")
+    result = await start_riddle(user_id)
+    await msg.edit_text(result)
+
+async def twentyq_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    msg = await update.message.reply_text("🤔 Починаємо гру...")
+    result = await start_20q(user_id)
+    await msg.edit_text(result)
+
+# FIX #6: handle_session_message тепер обробляє quiz, riddle, 20q
 async def handle_session_message(update: Update, user_id: int, user_text: str) -> bool:
-    """Обробляє повідомлення якщо є активна сесія. Повертає True якщо оброблено."""
     session = user_sessions.get(user_id)
     if not session:
         return False
+    mode = session["mode"]
 
-    mode    = session["mode"]
-    genre   = STORY_GENRES[session["genre"]]
-    context = session["context"]
+    if mode == "quiz":
+        reply = await check_quiz_answer(user_id, user_text)
+        await update.message.reply_text(reply)
+        return True
 
-    if mode == "story":
-        system = (
-            f"Ми граємо у спільну інтерактивну історію у жанрі {genre['name']}. "
-            f"Ти — оповідач. Продовжуй історію на основі вибору користувача (3-4 речення). "
-            f"В кінці завжди пропонуй 3 варіанти дій. Відповідай українською."
-        )
-    else:
-        system = (
-            f"Ти — майстер рольової гри у жанрі {genre['name']}. "
-            f"Реагуй на дії гравця, описуй наслідки, розвивай сюжет. "
-            f"Час від часу додавай кидки кубиків 🎲 (d20) для важливих дій. "
-            f"Відповідай українською."
-        )
+    if mode == "riddle":
+        reply = await check_riddle(user_id, user_text)
+        await update.message.reply_text(reply)
+        return True
 
-    context.append({"role": "user", "content": user_text})
-    messages = [{"role": "system", "content": system}] + context[-10:]  # останні 10 повідомлень
+    if mode == "20q":
+        reply = await handle_20q(user_id, user_text)
+        await update.message.reply_text(reply)
+        return True
 
-    reply = await call_ai(messages)
-    context.append({"role": "assistant", "content": reply})
-    await update.message.reply_text(clean_markdown(reply))
-    return True
+    if mode in ("story", "rpg"):
+        genre   = STORY_GENRES[session["genre"]]
+        context = session["context"]
+        if mode == "story":
+            system = (
+                f"Ми граємо у спільну інтерактивну історію у жанрі {genre['name']}. "
+                f"Ти — оповідач. Продовжуй історію на основі вибору користувача (3-4 речення). "
+                f"В кінці завжди пропонуй 3 варіанти дій. Відповідай українською."
+            )
+        else:
+            system = (
+                f"Ти — майстер рольової гри у жанрі {genre['name']}. "
+                f"Реагуй на дії гравця, описуй наслідки, розвивай сюжет. "
+                f"Час від часу додавай кидки кубиків 🎲 (d20) для важливих дій. "
+                f"Відповідай українською."
+            )
+        context.append({"role": "user", "content": user_text})
+        messages = [{"role": "system", "content": system}] + context[-10:]
+        reply    = await call_ai(messages)
+        context.append({"role": "assistant", "content": reply})
+        await update.message.reply_text(clean_markdown(reply))
+        return True
 
+    return False
 
 async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     current = user_personalities.get(user_id, "normal")
-
     if ctx.args:
         mode = ctx.args[0].lower()
         if mode not in PERSONALITIES:
@@ -862,7 +936,6 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         user_personalities[user_id] = mode
         update_user_memory(user_id, {"mode": mode})
-        # Скидаємо історію з новим промптом
         chat_histories[user_id] = [get_system_prompt(user_id)]
         p = PERSONALITIES[mode]
         await update.message.reply_text(f"{p['emoji']} Режим змінено на: {p['name']}")
@@ -885,6 +958,9 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/joke — жарт дня\n"
         "/story — спільна інтерактивна історія\n"
         "/rpg — рольова гра\n"
+        "/quiz — вікторина\n"
+        "/riddle — загадка\n"
+        "/20q — гра '20 питань'\n"
         "/mode — змінити особистість бота\n"
         "/memory — що бот пам'ятає про тебе\n"
         "/forget — очистити пам'ять про себе\n"
@@ -904,6 +980,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Шукати в інтернеті 🌐\n"
         "• Читати PDF, Excel, Word 📄\n"
         "• Нагадування 🔔\n"
+        "• Вікторини, загадки, ігри 🎮\n"
         "• Працювати в групових чатах 👥\n\n"
         "Просто пиши або говори — я розумію природну мову!\n"
         "Напиши /help щоб побачити всі команди."
@@ -972,7 +1049,7 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напиши що шукати: /search новини України")
         return
     msg     = await update.message.reply_text(f"🌐 Шукаю: {query}...")
-    results = search_web(query)
+    results = await search_web(query)
     try:
         reply = await call_ai([
             SYSTEM_PROMPT,
@@ -1013,7 +1090,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.message.from_user.id
 
-    # Якщо є активна сесія — передаємо туди
     if await handle_session_message(update, user_id, user_text):
         return
 
@@ -1033,12 +1109,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if intent == "horoscope":
-        # Витягуємо знак зодіаку з тексту
         sign = next((s for s in ZODIAC_SIGNS if s in user_text.lower()), None)
         if not sign:
-            await update.message.reply_text("⭐ Вкажи свій знак зодіаку, наприклад: *гороскоп для Лева*")
+            await update.message.reply_text("⭐ Вкажи свій знак зодіаку, наприклад: гороскоп для Лева")
             return
-        msg = await update.message.reply_text("⭐ Складаю гороскоп...")
+        msg    = await update.message.reply_text("⭐ Складаю гороскоп...")
         result = await get_horoscope(sign)
         await msg.edit_text(clean_markdown(result))
         return
@@ -1058,14 +1133,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parsed = await call_ai([{"role": "user", "content": (
                 f"З цього тексту витягни дані для конвертації: '{user_text}'\n"
                 "Відповідай ТІЛЬКИ у форматі JSON: "
-                "{\"amount\": 100, \"from\": \"USD\", \"to\": \"UAH\"}\n"
-                "Нічого більше не пиши."
+                "{\"amount\": 100, \"from\": \"USD\", \"to\": \"UAH\"}\nНічого більше не пиши."
             )}])
-            parsed   = parsed.strip().replace("```json","").replace("```","")
-            data     = json.loads(parsed)
-            amount   = float(data["amount"])
-            from_u   = data["from"]
-            to_u     = data["to"]
+            parsed = parsed.strip().replace("```json", "").replace("```", "")
+            data   = json.loads(parsed)
+            amount = float(data["amount"])
+            from_u = data["from"]
+            to_u   = data["to"]
             currencies = {
                 "usd","eur","uah","gbp","pln","czk","chf",
                 "jpy","cad","aud","rub","try","cny","sek","nok"
@@ -1081,7 +1155,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if intent == "search":
         msg     = await update.message.reply_text("🌐 Шукаю в інтернеті...")
-        results = search_web(user_text)
+        results = await search_web(user_text)
         try:
             reply = await call_ai([
                 SYSTEM_PROMPT,
@@ -1094,7 +1168,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"Помилка: {e}")
         return
 
-    # Звичайна відповідь
     append_and_trim(user_id, "user", user_text)
     try:
         reply = await call_ai(chat_histories[user_id])
@@ -1128,11 +1201,9 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         video   = update.message.video or update.message.video_note
         caption = update.message.caption or "Що відбувається у цьому відео? Опиши детально."
-
-        if video.file_size > 20 * 1024 * 1024:  # 20MB ліміт
+        if video.file_size > 20 * 1024 * 1024:
             await msg.edit_text("❌ Відео занадто велике. Максимум 20MB.")
             return
-
         file        = await ctx.bot.get_file(video.file_id)
         video_bytes = bytes(await file.download_as_bytearray())
         result      = await analyze_video(video_bytes, caption)
@@ -1141,23 +1212,23 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"Помилка при аналізі відео: {e}")
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    doc      = update.message.document
-    fname    = doc.file_name.lower()
-    user_id  = update.message.from_user.id
-    caption  = update.message.caption or "Стисло підсумуй цей документ українською мовою."
+    doc     = update.message.document
+    fname   = doc.file_name.lower()
+    user_id = update.message.from_user.id
+    caption = update.message.caption or "Стисло підсумуй цей документ українською мовою."
 
     if fname.endswith(".pdf"):
-        msg = await update.message.reply_text("📄 Читаю PDF...")
+        msg        = await update.message.reply_text("📄 Читаю PDF...")
         file_bytes = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
-        text = extract_pdf_text(file_bytes)
+        text       = extract_pdf_text(file_bytes)
     elif fname.endswith((".xlsx", ".xls")):
-        msg = await update.message.reply_text("📊 Читаю Excel...")
+        msg        = await update.message.reply_text("📊 Читаю Excel...")
         file_bytes = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
-        text = extract_excel_text(file_bytes)
+        text       = extract_excel_text(file_bytes)
     elif fname.endswith((".docx", ".doc")):
-        msg = await update.message.reply_text("📝 Читаю Word...")
+        msg        = await update.message.reply_text("📝 Читаю Word...")
         file_bytes = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
-        text = extract_word_text(file_bytes)
+        text       = extract_word_text(file_bytes)
     else:
         await update.message.reply_text("📄 Підтримуються: PDF, Excel (.xlsx), Word (.docx)")
         return
@@ -1183,12 +1254,9 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not text:
             await msg.edit_text("Не вдалось розпізнати мову 😔")
             return
-
         await msg.edit_text(f"🎤 Ти сказав: {text}\n\n⏳ Обробляю...")
         user_id = update.message.from_user.id
-
-        intent = await detect_intent(text)
-
+        intent  = await detect_intent(text)
         if intent == "reminder":
             try:
                 delay_min, remind_text = await do_reminder(update, ctx, text)
@@ -1196,12 +1264,10 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await msg.edit_text(f"Не вдалось встановити нагадування: {e}")
             return
-
         if intent == "image":
             await msg.edit_text(f"🎤 Ти сказав: {text}\n\n🎨 Генерую зображення...")
             await do_generate_image(update, text, msg)
             return
-
         append_and_trim(user_id, "user", text)
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
@@ -1216,7 +1282,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app):
     await restore_reminders(app.bot)
-    # Відновлюємо режими користувачів після рестарту
     memory = load_memory()
     for uid, data in memory.items():
         if data.get("mode"):
@@ -1229,26 +1294,36 @@ if __name__ == "__main__":
         .post_init(post_init)
         .build()
     )
-    app.add_handler(CommandHandler("start",      start))
-    app.add_handler(CommandHandler("help",       help_cmd))
-    app.add_handler(CommandHandler("mode",       mode_cmd))
-    app.add_handler(CommandHandler("memory",     memory_cmd))
-    app.add_handler(CommandHandler("forget",     forget_cmd))
-    app.add_handler(CommandHandler("convert",    convert_cmd))
-    app.add_handler(CommandHandler("story",      story_cmd))
-    app.add_handler(CommandHandler("rpg",        rpg_cmd))
-    app.add_handler(CommandHandler("horoscope",  horoscope_cmd))
-    app.add_handler(CommandHandler("fact",       fact_cmd))
-    app.add_handler(CommandHandler("joke",       joke_cmd))
-    app.add_handler(CommandHandler("reset",      reset))
-    app.add_handler(CommandHandler("search", handle_search))
-    app.add_handler(CommandHandler("status", handle_status))
-    app.add_handler(CommandHandler("remind", handle_remind))
-    app.add_handler(CommandHandler("image",  handle_image))
-    app.add_handler(MessageHandler(filters.PHOTO,        handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE,        handle_voice))
+    app.add_handler(CommandHandler("start",     start))
+    app.add_handler(CommandHandler("help",      help_cmd))
+    app.add_handler(CommandHandler("mode",      mode_cmd))
+    app.add_handler(CommandHandler("memory",    memory_cmd))
+    app.add_handler(CommandHandler("forget",    forget_cmd))
+    app.add_handler(CommandHandler("convert",   convert_cmd))
+    app.add_handler(CommandHandler("story",     story_cmd))
+    app.add_handler(CommandHandler("rpg",       rpg_cmd))
+    app.add_handler(CommandHandler("quiz",      quiz_cmd))
+    app.add_handler(CommandHandler("riddle",    riddle_cmd))
+    app.add_handler(CommandHandler("20q",       twentyq_cmd))
+    app.add_handler(CommandHandler("horoscope", horoscope_cmd))
+    app.add_handler(CommandHandler("fact",      fact_cmd))
+    app.add_handler(CommandHandler("joke",      joke_cmd))
+    app.add_handler(CommandHandler("reset",     reset))
+    app.add_handler(CommandHandler("search",    handle_search))
+    app.add_handler(CommandHandler("status",    handle_status))
+    app.add_handler(CommandHandler("remind",    handle_remind))
+    app.add_handler(CommandHandler("image",     handle_image))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
-    app.add_handler(MessageHandler(filters.Document.PDF | filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") | filters.Document.MimeType("application/vnd.openxmlformats-officedocument.wordprocessingml.document") | filters.Document.MimeType("application/msword") | filters.Document.MimeType("application/vnd.ms-excel"), handle_document))
+    app.add_handler(MessageHandler(
+        filters.Document.PDF |
+        filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") |
+        filters.Document.MimeType("application/vnd.openxmlformats-officedocument.wordprocessingml.document") |
+        filters.Document.MimeType("application/msword") |
+        filters.Document.MimeType("application/vnd.ms-excel"),
+        handle_document
+    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущено!")
     app.run_polling()
