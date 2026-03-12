@@ -24,7 +24,7 @@ GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL       = "llama-3.3-70b-versatile"
 VISION_MODEL     = "openrouter/auto"                  # авто-вибір моделі з vision
-POLLINATIONS_URL = "https://image.pollinations.ai/prompt/"
+IMAGE_MODEL      = "google/gemini-2.5-flash-preview:free"
 
 # ── Системний промпт ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = {
@@ -248,6 +248,39 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def generate_image_openrouter(prompt: str) -> bytes:
+    """Генерує зображення через OpenRouter (Gemini Flash Image, безкоштовно)."""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "model": IMAGE_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "modalities": ["image", "text"]
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(OPENROUTER_URL, headers=headers, json=body)
+        r.raise_for_status()
+
+    data = r.json()
+    # Відповідь містить зображення у base64 в полі images або content
+    for block in data.get("choices", [{}])[0].get("message", {}).get("content", []):
+        if isinstance(block, dict) and block.get("type") == "image_url":
+            img_url = block["image_url"]["url"]
+            if img_url.startswith("data:image"):
+                b64 = img_url.split(",", 1)[1]
+                return base64.b64decode(b64)
+
+    # Альтернативне поле images
+    images = data.get("choices", [{}])[0].get("message", {}).get("images", [])
+    if images:
+        b64 = images[0].split(",", 1)[-1]
+        return base64.b64decode(b64)
+
+    raise ValueError(f"Зображення не знайдено у відповіді: {data}")
+
+
 async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(ctx.args)
     if not prompt:
@@ -261,24 +294,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"
         }])
 
-        from urllib.parse import quote
-        import time
-        seed = int(time.time())
-        url = POLLINATIONS_URL + quote(translation) + f"?width=1024&height=1024&model=turbo&nologo=true&seed={seed}"
-
-        img_bytes = None
-        async with httpx.AsyncClient(timeout=120) as client:
-            for attempt in range(3):
-                r = await client.get(url)
-                if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
-                    img_bytes = r.content
-                    break
-                await asyncio.sleep(3)
-
-        if not img_bytes:
-            await msg.edit_text("❌ Сервіс генерації тимчасово недоступний. Спробуй ще раз через хвилину.")
-            return
-
+        img_bytes = await generate_image_openrouter(translation)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
     except Exception as e:
