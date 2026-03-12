@@ -1,7 +1,8 @@
 import os
 import httpx
 import base64
-from datetime import date
+import asyncio
+from datetime import date, datetime, timedelta
 from tavily import TavilyClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
@@ -16,50 +17,36 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL = "llama-3.3-70b-versatile"
-VISION_MODEL = "openrouter/auto"
+VISION_MODEL = "mistralai/mistral-small-3.1-24b-instruct:free"
 
 SYSTEM_PROMPT = {"role": "system", "content": "Ти корисний AI асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою, незалежно від мови запиту. Будь точним, корисним і дружнім."}
 
 chat_histories = {}
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
-# Лічильник запитів OpenRouter
 or_requests = {"count": 0, "date": date.today()}
-OR_DAILY_LIMIT = 190  # трохи менше 200 для запасу
-# Логіка: OpenRouter (190/день) → Groq (14400/день) → наступного дня знову OpenRouter
+OR_DAILY_LIMIT = 190
 
 def get_text_provider():
     global or_requests
     today = date.today()
     if or_requests["date"] != today:
         or_requests = {"count": 0, "date": today}
-
-    if or_requests["count"] < OR_DAILY_LIMIT:
-        return "openrouter"
-    return "groq"
+    return "openrouter" if or_requests["count"] < OR_DAILY_LIMIT else "groq"
 
 async def call_ai(messages):
     provider = get_text_provider()
-
     if provider == "openrouter":
-        url = OPENROUTER_URL
-        key = OPENROUTER_API_KEY
-        model = OPENROUTER_MODEL
+        url, key, model = OPENROUTER_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL
     else:
-        url = GROQ_URL
-        key = GROQ_API_KEY
-        model = GROQ_MODEL
+        url, key, model = GROQ_URL, GROQ_API_KEY, GROQ_MODEL
 
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     body = {"model": model, "messages": messages}
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(url, headers=headers, json=body)
         if r.status_code == 429 and provider == "openrouter":
-            # Якщо OpenRouter повернув 429 — форсуємо Groq
             or_requests["count"] = OR_DAILY_LIMIT
             return await call_ai(messages)
         r.raise_for_status()
@@ -70,10 +57,7 @@ async def call_ai(messages):
     return r.json()["choices"][0]["message"]["content"]
 
 async def call_vision(messages):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     body = {"model": VISION_MODEL, "messages": messages}
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(OPENROUTER_URL, headers=headers, json=body)
@@ -99,18 +83,70 @@ def search_web(query: str) -> str:
     except Exception as e:
         return f"Помилка пошуку: {str(e)}"
 
+async def send_reminder(bot, chat_id, text):
+    await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n• Розуміти голосові повідомлення 🎤\n• Шукати в інтернеті 🌐\n\nКоманди:\n/search [запит] — пошук в інтернеті\n/status — статус запитів\n/reset — очистити історію"
+        "Привіт! Я J.A.R.V.I.S. 🤖\n\nМожу:\n• Відповідати на запитання 💬\n• Аналізувати зображення 🖼️\n• Розуміти голосові повідомлення 🎤\n• Шукати в інтернеті 🌐\n• Нагадування 🔔\n\nКоманди:\n/remind 30m текст — через 30 хвилин\n/remind 2h текст — через 2 години\n/remind 10:30 текст — о конкретному часі\n/search запит — пошук\n/status — статус\n/reset — очистити історію"
     )
+
+async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text(
+            "Використання:\n/remind 30m Зателефонувати\n/remind 2h Нарада\n/remind 14:30 Обід"
+        )
+        return
+
+    time_arg = ctx.args[0]
+    reminder_text = " ".join(ctx.args[1:])
+    now = datetime.now()
+    delay = None
+
+    try:
+        if time_arg.endswith("m"):
+            delay = int(time_arg[:-1]) * 60
+        elif time_arg.endswith("h"):
+            delay = int(time_arg[:-1]) * 3600
+        elif ":" in time_arg:
+            t = datetime.strptime(time_arg, "%H:%M").replace(
+                year=now.year, month=now.month, day=now.day
+            )
+            if t < now:
+                t += timedelta(days=1)
+            delay = (t - now).seconds
+        else:
+            await update.message.reply_text("❌ Формат часу невірний. Використай: 30m, 2h або 14:30")
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Формат часу невірний. Використай: 30m, 2h або 14:30")
+        return
+
+    chat_id = update.effective_chat.id
+    bot = ctx.bot
+
+    async def delayed():
+        await asyncio.sleep(delay)
+        await send_reminder(bot, chat_id, reminder_text)
+
+    asyncio.create_task(delayed())
+
+    if time_arg.endswith("m"):
+        when = f"через {time_arg[:-1]} хвилин"
+    elif time_arg.endswith("h"):
+        when = f"через {time_arg[:-1]} годин"
+    else:
+        when = f"о {time_arg}"
+
+    await update.message.reply_text(f"✅ Нагадаю {when}: {reminder_text}")
 
 async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     provider = get_text_provider()
     remaining = max(0, OR_DAILY_LIMIT - or_requests["count"])
     await update.message.reply_text(
         f"📊 Статус:\n"
-        f"• Поточний провайдер: {'OpenRouter 🟢' if provider == 'openrouter' else 'Groq 🔵'}\n"
-        f"• OpenRouter залишилось: {remaining}/{OR_DAILY_LIMIT} запитів\n"
+        f"• Провайдер: {'OpenRouter 🟢' if provider == 'openrouter' else 'Groq 🔵'}\n"
+        f"• OpenRouter залишилось: {remaining}/{OR_DAILY_LIMIT}\n"
         f"• Ліміт скидається: щодня опівночі"
     )
 
@@ -143,7 +179,7 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user_id not in chat_histories:
         chat_histories[user_id] = [SYSTEM_PROMPT]
 
-    prompt = f"Користувач шукав: '{query}'\n\nРезультати пошуку:\n{results}\n\nСтисло підсумуй результати українською мовою."
+    prompt = f"Користувач шукав: '{query}'\n\nРезультати:\n{results}\n\nСтисло підсумуй українською."
     chat_histories[user_id].append({"role": "user", "content": prompt})
 
     try:
@@ -164,13 +200,10 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         messages = [
             SYSTEM_PROMPT,
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    {"type": "text", "text": caption}
-                ]
-            }
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                {"type": "text", "text": caption}
+            ]}
         ]
         reply = await call_vision(messages)
         await msg.edit_text(reply)
@@ -183,7 +216,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         voice = update.message.voice
         file = await ctx.bot.get_file(voice.file_id)
         audio_bytes = await file.download_as_bytearray()
-
         text = await transcribe_voice(bytes(audio_bytes))
 
         if not text:
@@ -199,7 +231,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_histories[user_id].append({"role": "user", "content": text})
         reply = await call_ai(chat_histories[user_id])
         chat_histories[user_id].append({"role": "assistant", "content": reply})
-
         await msg.edit_text(f"🎤 Ти сказав: _{text}_\n\n{reply}", parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"Помилка при обробці голосового: {str(e)}")
@@ -216,6 +247,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("search", handle_search))
     app.add_handler(CommandHandler("status", handle_status))
+    app.add_handler(CommandHandler("remind", handle_remind))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
