@@ -24,7 +24,7 @@ GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL       = "llama-3.3-70b-versatile"
 VISION_MODEL     = "openrouter/auto"                  # авто-вибір моделі з vision
-HF_IMAGE_URL     = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
+HF_IMAGE_URL     = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
 
 # ── Системний промпт ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = {
