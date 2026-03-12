@@ -398,11 +398,21 @@ def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[b
     return False, user_text
 
 
+IMAGE_KEYWORDS = [
+    "створи фото", "згенеруй фото", "намалюй", "згенеруй зображення",
+    "створи зображення", "зроби фото", "зроби картинку", "створи картинку",
+    "generate image", "draw", "create image", "create photo"
+]
+
 SEARCH_KEYWORDS = [
     "пошукай", "знайди", "загугли", "що відбувається", "останні новини",
     "яка погода", "який курс", "поточн", "зараз", "сьогодні", "актуальн",
     "search", "find", "google", "look up"
 ]
+
+def needs_image(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in IMAGE_KEYWORDS)
 
 def needs_search(text: str) -> bool:
     t = text.lower()
@@ -414,6 +424,37 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.message.from_user.id
+
+    # Автоматична генерація зображення
+    if needs_image(user_text):
+        for kw in IMAGE_KEYWORDS:
+            user_text_clean = user_text.lower().replace(kw, "").strip()
+        prompt = user_text_clean or user_text
+        msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
+        try:
+            translation = await call_ai([{
+                "role": "user",
+                "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"
+            }])
+            url = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
+            headers_cf = {
+                "Authorization": f"Bearer {CF_API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            async with httpx.AsyncClient(timeout=180) as client:
+                r = await client.post(url, headers=headers_cf, json={"prompt": translation, "num_steps": 8})
+                r.raise_for_status()
+            content_type = r.headers.get("content-type", "")
+            if "image" in content_type:
+                img_bytes = r.content
+            else:
+                b64 = r.json().get("result", {}).get("image", "")
+                img_bytes = base64.b64decode(b64)
+            await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
+            await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"Помилка генерації: {e}")
+        return
 
     # Автоматичний пошук якщо користувач просить
     if needs_search(user_text):
