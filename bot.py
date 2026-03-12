@@ -23,7 +23,8 @@ CF_ACCOUNT_ID      = os.environ.get("CF_ACCOUNT_ID")
 OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL         = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-OPENROUTER_MODEL = "google/gemini-2.5-pro-exp-03-25:free"
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+OPENROUTER_MODEL_FALLBACK = "openrouter/free"
 GROQ_MODEL       = "llama-3.3-70b-versatile"
 VISION_MODEL     = "openrouter/auto"
 CF_IMAGE_URL     = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
@@ -119,20 +120,31 @@ def get_text_provider() -> str:
 async def call_ai(messages: list) -> str:
     provider = get_text_provider()
     if provider == "openrouter":
-        url, key, model = OPENROUTER_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL
+        url, key = OPENROUTER_URL, OPENROUTER_API_KEY
+        # Спробуємо основну модель, при 404 — fallback на роутер
+        for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            body    = {"model": model, "messages": messages}
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(url, headers=headers, json=body)
+            if r.status_code == 404:
+                continue
+            if r.status_code == 429:
+                or_requests["count"] = OR_DAILY_LIMIT
+                return await call_ai(messages)
+            r.raise_for_status()
+            or_requests["count"] += 1
+            return r.json()["choices"][0]["message"]["content"]
+        # Якщо обидві не спрацювали — переходимо на Groq
+        or_requests["count"] = OR_DAILY_LIMIT
+        return await call_ai(messages)
     else:
-        url, key, model = GROQ_URL, GROQ_API_KEY, GROQ_MODEL
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    body    = {"model": model, "messages": messages}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=body)
-        if r.status_code == 429 and provider == "openrouter":
-            or_requests["count"] = OR_DAILY_LIMIT
-            return await call_ai(messages)
-        r.raise_for_status()
-    if provider == "openrouter":
-        or_requests["count"] += 1
-    return r.json()["choices"][0]["message"]["content"]
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        body    = {"model": GROQ_MODEL, "messages": messages}
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(GROQ_URL, headers=headers, json=body)
+            r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
 
 async def call_vision(messages: list) -> str:
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
