@@ -95,17 +95,6 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     except Exception as e:
         return f"Помилка читання PDF: {str(e)}"
 
-async def generate_image(prompt: str) -> bytes:
-    encoded = httpx.URL(prompt).path
-    url = f"https://image.pollinations.ai/prompt/{httpx.QueryParams({'prompt': prompt})}"
-    # Простіший спосіб формування URL
-    import urllib.parse
-    encoded_prompt = urllib.parse.quote(prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(image_url)
-        r.raise_for_status()
-        return r.content
 
 async def send_reminder(bot, chat_id, text):
     await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
@@ -121,9 +110,20 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напиши що намалювати: /image захід сонця над морем")
         return
 
-    msg = await update.message.reply_text("🎨 Генерую зображення...")
+    msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
     try:
-        img_bytes = await generate_image(prompt)
+        import urllib.parse
+        translation = await call_ai([
+            {"role": "user", "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"}
+        ])
+        encoded_prompt = urllib.parse.quote(translation)
+        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(image_url)
+            r.raise_for_status()
+            img_bytes = r.content
+
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
     except Exception as e:
