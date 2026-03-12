@@ -72,7 +72,38 @@ OR_DAILY_LIMIT = 190
 # Утиліти: визначення намірів
 # ════════════════════════════════════════════════════════════════════════════
 
-def needs_reminder(text: str) -> bool:
+def clean_markdown(text: str) -> str:
+    """Прибирає markdown розмітку яку Telegram не рендерить."""
+    import re
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # **жирний** → жирний
+    text = re.sub(r'\*(.*?)\*', r'\1', text)        # *курсив* → курсив
+    text = re.sub(r'__(.*?)__', r'\1', text)         # __жирний__ → жирний
+    text = re.sub(r'_(.*?)_', r'\1', text)           # _курсив_ → курсив
+    text = re.sub(r'`(.*?)`', r'\1', text)           # `код` → код
+    return text
+
+async def fix_grammar(text: str) -> str:
+    """Виправляє граматичні помилки у тексті через Groq (швидко і безкоштовно)."""
+    try:
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        body = {
+            "model": GROQ_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": (
+                    "Виправ граматичні та орфографічні помилки в цьому українському тексті. "
+                    "Поверни ТІЛЬКИ виправлений текст, без пояснень, без коментарів:\n\n" + text
+                )
+            }]
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(GROQ_URL, headers=headers, json=body)
+            r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        return text  # якщо щось пішло не так — повертаємо оригінал
+
+
     t = text.lower()
     return any(kw in t for kw in REMIND_KEYWORDS)
 
@@ -484,8 +515,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     append_and_trim(user_id, "user", user_text)
     try:
         reply = await call_ai(chat_histories[user_id])
+        reply = await fix_grammar(reply)
         append_and_trim(user_id, "assistant", reply)
-        await update.message.reply_text(reply)
+        await update.message.reply_text(clean_markdown(reply))
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
 
@@ -596,8 +628,9 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         append_and_trim(user_id, "user", text)
         reply = await call_ai(chat_histories[user_id])
+        reply = await fix_grammar(reply)
         append_and_trim(user_id, "assistant", reply)
-        await msg.edit_text(f"🎤 Ти сказав: {text}\n\n{reply}")
+        await msg.edit_text(f"🎤 Ти сказав: {text}\n\n{clean_markdown(reply)}")
     except Exception as e:
         await msg.edit_text(f"Помилка при обробці голосового: {e}")
 
