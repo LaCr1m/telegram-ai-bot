@@ -11,22 +11,21 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 # ── Змінні середовища ────────────────────────────────────────────────────────
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
-TAVILY_API_KEY    = os.environ.get("TAVILY_API_KEY")
-HF_TOKEN          = os.environ.get("HF_TOKEN")
+GROQ_API_KEY       = os.environ.get("GROQ_API_KEY")
+TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY")
+CF_API_TOKEN       = os.environ.get("CF_API_TOKEN")
+CF_ACCOUNT_ID      = os.environ.get("CF_ACCOUNT_ID")
 
 # ── URL та моделі ────────────────────────────────────────────────────────────
-OPENROUTER_URL  = "https://openrouter.ai/api/v1/chat/completions"
-GROQ_URL        = "https://api.groq.com/openai/v1/chat/completions"
+OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
+GROQ_URL         = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 GROQ_MODEL       = "llama-3.3-70b-versatile"
-VISION_MODEL     = "openrouter/auto"                  # авто-вибір моделі з vision
-CF_API_TOKEN  = os.environ.get("CF_API_TOKEN")
-CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
-CF_IMAGE_URL  = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+VISION_MODEL     = "openrouter/auto"
+CF_IMAGE_URL     = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
 
 # ── Системний промпт ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = {
@@ -41,8 +40,26 @@ SYSTEM_PROMPT = {
     )
 }
 
-MAX_HISTORY_MESSAGES = 20   # максимум повідомлень (не враховуючи system prompt)
-REMINDERS_FILE       = "reminders.json"  # файл для збереження нагадувань
+MAX_HISTORY_MESSAGES = 20
+REMINDERS_FILE       = "reminders.json"
+
+# ── Ключові слова для автовизначення намірів ─────────────────────────────────
+REMIND_KEYWORDS = [
+    "нагадай", "нагади", "нагадуй", "remind me", "set reminder",
+    "нагадування", "постав нагадування"
+]
+
+IMAGE_KEYWORDS = [
+    "створи фото", "згенеруй фото", "намалюй", "згенеруй зображення",
+    "створи зображення", "зроби фото", "зроби картинку", "створи картинку",
+    "generate image", "draw", "create image", "create photo"
+]
+
+SEARCH_KEYWORDS = [
+    "пошукай", "знайди", "загугли", "що відбувається", "останні новини",
+    "яка погода", "який курс", "поточн", "зараз", "сьогодні", "актуальн",
+    "search", "find", "google", "look up"
+]
 
 # ── Стан ─────────────────────────────────────────────────────────────────────
 chat_histories: dict[int, list] = {}
@@ -52,21 +69,35 @@ OR_DAILY_LIMIT = 190
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Утиліти: визначення намірів
+# ════════════════════════════════════════════════════════════════════════════
+
+def needs_reminder(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in REMIND_KEYWORDS)
+
+def needs_image(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in IMAGE_KEYWORDS)
+
+def needs_search(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in SEARCH_KEYWORDS)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Утиліти: історія чату
 # ════════════════════════════════════════════════════════════════════════════
 
 def get_history(user_id: int) -> list:
-    """Повертає історію чату, ініціалізуючи при потребі."""
     if user_id not in chat_histories:
         chat_histories[user_id] = [SYSTEM_PROMPT]
     return chat_histories[user_id]
 
 
 def append_and_trim(user_id: int, role: str, content) -> None:
-    """Додає повідомлення в історію та обрізає до MAX_HISTORY_MESSAGES."""
     history = get_history(user_id)
     history.append({"role": role, "content": content})
-    # Зберігаємо system prompt + останні MAX_HISTORY_MESSAGES повідомлень
     if len(history) > MAX_HISTORY_MESSAGES + 1:
         chat_histories[user_id] = [SYSTEM_PROMPT] + history[-MAX_HISTORY_MESSAGES:]
 
@@ -126,6 +157,26 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Утиліти: генерація зображень
+# ════════════════════════════════════════════════════════════════════════════
+
+async def generate_image(prompt: str) -> bytes:
+    url = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    async with httpx.AsyncClient(timeout=180) as client:
+        r = await client.post(url, headers=headers, json={"prompt": prompt, "num_steps": 8})
+        r.raise_for_status()
+    content_type = r.headers.get("content-type", "")
+    if "image" in content_type:
+        return r.content
+    b64 = r.json().get("result", {}).get("image", "")
+    return base64.b64decode(b64)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Утиліти: пошук
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -172,12 +223,7 @@ def save_reminders(reminders: list) -> None:
 
 
 async def schedule_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> None:
-    """Планує нагадування і зберігає його у файл."""
-    entry = {
-        "chat_id": chat_id,
-        "text": text,
-        "fire_at": fire_at.isoformat()
-    }
+    entry = {"chat_id": chat_id, "text": text, "fire_at": fire_at.isoformat()}
     reminders = load_reminders()
     reminders.append(entry)
     save_reminders(reminders)
@@ -187,16 +233,16 @@ async def schedule_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> 
     async def _run():
         await asyncio.sleep(delay)
         await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
-        # Видаляємо з файлу після спрацювання
         current = load_reminders()
-        current = [r for r in current if not (r["chat_id"] == chat_id and r["text"] == text and r["fire_at"] == fire_at.isoformat())]
+        current = [r for r in current if not (
+            r["chat_id"] == chat_id and r["text"] == text and r["fire_at"] == fire_at.isoformat()
+        )]
         save_reminders(current)
 
     asyncio.create_task(_run())
 
 
 async def restore_reminders(bot) -> None:
-    """Відновлює нагадування після рестарту бота."""
     reminders = load_reminders()
     now = datetime.now()
     valid = []
@@ -204,7 +250,6 @@ async def restore_reminders(bot) -> None:
     for r in reminders:
         fire_at = datetime.fromisoformat(r["fire_at"])
         if fire_at <= now:
-            # Час вже минув — надсилаємо одразу з поміткою
             await bot.send_message(
                 chat_id=r["chat_id"],
                 text=f"🔔 Пропущене нагадування (бот був офлайн): {r['text']}"
@@ -217,7 +262,9 @@ async def restore_reminders(bot) -> None:
                 await asyncio.sleep(delay)
                 await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
                 current = load_reminders()
-                current = [x for x in current if not (x["chat_id"] == chat_id and x["text"] == text and x["fire_at"] == fi.isoformat())]
+                current = [x for x in current if not (
+                    x["chat_id"] == chat_id and x["text"] == text and x["fire_at"] == fi.isoformat()
+                )]
                 save_reminders(current)
 
             asyncio.create_task(_run())
@@ -239,7 +286,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Розуміти голосові повідомлення 🎤\n"
         "• Шукати в інтернеті 🌐\n"
         "• Читати PDF та документи 📄\n"
-        "• Нагадування (зберігаються після рестарту) 🔔\n"
+        "• Нагадування 🔔\n"
         "• Працювати в групових чатах 👥\n\n"
         "Команди:\n"
         "/image опис — генерація зображення\n"
@@ -262,27 +309,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "role": "user",
             "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"
         }])
-
-        url = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
-        headers = {
-            "Authorization": f"Bearer {CF_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        body = {"prompt": translation, "num_steps": 8}
-
-        async with httpx.AsyncClient(timeout=180) as client:
-            r = await client.post(url, headers=headers, json=body)
-            r.raise_for_status()
-
-        # Cloudflare повертає зображення як бінарні дані або base64
-        content_type = r.headers.get("content-type", "")
-        if "image" in content_type:
-            img_bytes = r.content
-        else:
-            result = r.json().get("result", {})
-            b64 = result.get("image", "")
-            img_bytes = base64.b64decode(b64)
-
+        img_bytes = await generate_image(translation)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
     except Exception as e:
@@ -345,28 +372,22 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text(f"🌐 Шукаю: {query}...")
     results = search_web(query)
-
-    # Пошуковий промпт передаємо окремо — НЕ зберігаємо в основну історію,
-    # щоб не засмічувати контекст великими блоками результатів.
     search_messages = [
         SYSTEM_PROMPT,
         {"role": "user", "content": f"Користувач шукав: '{query}'\n\nРезультати:\n{results}\n\nСтисло підсумуй українською."}
     ]
-
     try:
         reply = await call_ai(search_messages)
-        # В основну історію додаємо тільки стислу відповідь
         user_id = update.message.from_user.id
         append_and_trim(user_id, "user", f"Пошук: {query}")
         append_and_trim(user_id, "assistant", reply)
-        await msg.edit_text(f"🌐 *{query}*\n\n{reply}", parse_mode="Markdown")
+        await msg.edit_text(f"🌐 {query}\n\n{reply}")
     except Exception as e:
         await msg.edit_text(f"Помилка: {e}")
 
 
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    chat_histories.pop(user_id, None)
+    chat_histories.pop(update.message.from_user.id, None)
     await update.message.reply_text("Історію чату очищено! 🔄")
 
 
@@ -375,10 +396,6 @@ async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════════════════════
 
 def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
-    """
-    Перевіряє, чи звернулись до бота у груповому чаті.
-    Повертає (addressed, cleaned_text).
-    """
     user_text    = update.message.text or ""
     bot_username = ctx.bot.username
     chat_type    = update.message.chat.type
@@ -386,44 +403,15 @@ def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[b
     if chat_type not in ("group", "supergroup"):
         return True, user_text
 
-    # Згадка через @
     if f"@{bot_username}" in user_text:
         return True, user_text.replace(f"@{bot_username}", "").strip()
 
-    # Відповідь на повідомлення бота
     reply = update.message.reply_to_message
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id:
         return True, user_text
 
     return False, user_text
 
-
-REMIND_KEYWORDS = [
-    "нагадай", "нагади", "нагадуй", "remind me", "set reminder",
-    "нагадування", "постав нагадування"
-]
-    "створи фото", "згенеруй фото", "намалюй", "згенеруй зображення",
-    "створи зображення", "зроби фото", "зроби картинку", "створи картинку",
-    "generate image", "draw", "create image", "create photo"
-]
-
-IMAGE_KEYWORDS = [
-    "пошукай", "знайди", "загугли", "що відбувається", "останні новини",
-    "яка погода", "який курс", "поточн", "зараз", "сьогодні", "актуальн",
-    "search", "find", "google", "look up"
-]
-
-def needs_reminder(text: str) -> bool:
-    t = text.lower()
-    return any(kw in t for kw in REMIND_KEYWORDS)
-
-def needs_image(text: str) -> bool:
-    t = text.lower()
-    return any(kw in t for kw in IMAGE_KEYWORDS)
-
-def needs_search(text: str) -> bool:
-    t = text.lower()
-    return any(kw in t for kw in SEARCH_KEYWORDS)
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addressed, user_text = _is_bot_addressed(update, ctx)
@@ -456,36 +444,26 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Автоматична генерація зображення
     if needs_image(user_text):
+        t = user_text.lower()
+        prompt = user_text
         for kw in IMAGE_KEYWORDS:
-            user_text_clean = user_text.lower().replace(kw, "").strip()
-        prompt = user_text_clean or user_text
+            if kw in t:
+                prompt = user_text[t.index(kw) + len(kw):].strip()
+                break
         msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
         try:
             translation = await call_ai([{
                 "role": "user",
                 "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"
             }])
-            url = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
-            headers_cf = {
-                "Authorization": f"Bearer {CF_API_TOKEN}",
-                "Content-Type": "application/json"
-            }
-            async with httpx.AsyncClient(timeout=180) as client:
-                r = await client.post(url, headers=headers_cf, json={"prompt": translation, "num_steps": 8})
-                r.raise_for_status()
-            content_type = r.headers.get("content-type", "")
-            if "image" in content_type:
-                img_bytes = r.content
-            else:
-                b64 = r.json().get("result", {}).get("image", "")
-                img_bytes = base64.b64decode(b64)
+            img_bytes = await generate_image(translation)
             await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
             await msg.delete()
         except Exception as e:
             await msg.edit_text(f"Помилка генерації: {e}")
         return
 
-    # Автоматичний пошук якщо користувач просить
+    # Автоматичний пошук
     if needs_search(user_text):
         msg = await update.message.reply_text("🌐 Шукаю в інтернеті...")
         results = search_web(user_text)
@@ -502,8 +480,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"Помилка: {e}")
         return
 
+    # Звичайна відповідь
     append_and_trim(user_id, "user", user_text)
-
     try:
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
@@ -519,7 +497,6 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file    = await ctx.bot.get_file(photo.file_id)
         img_b64 = base64.b64encode(await file.download_as_bytearray()).decode()
         caption = update.message.caption or "Що зображено на цьому фото? Опиши детально українською мовою."
-
         messages = [
             SYSTEM_PROMPT,
             {"role": "user", "content": [
@@ -556,7 +533,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         append_and_trim(user_id, "user", f"{caption}\n\nВміст документу:\n{text_preview}")
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
-        await msg.edit_text(f"📄 *{doc.file_name}*\n\n{reply}", parse_mode="Markdown")
+        await msg.edit_text(f"📄 {doc.file_name}\n\n{reply}")
     except Exception as e:
         await msg.edit_text(f"Помилка при обробці PDF: {e}")
 
@@ -575,6 +552,48 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"🎤 Ти сказав: {text}\n\n⏳ Обробляю...")
 
         user_id = update.message.from_user.id
+
+        # Перевіряємо наміри у голосовому повідомленні
+        if needs_reminder(text):
+            try:
+                now_str = datetime.now().strftime("%H:%M")
+                parsed = await call_ai([{"role": "user", "content": (
+                    f"Поточний час: {now_str}. "
+                    f"З цього тексту витягни час нагадування і текст: '{text}'. "
+                    "Відповідай ТІЛЬКИ у форматі JSON: {\"delay_minutes\": 5, \"text\": \"текст\"}. "
+                    "Нічого більше не пиши."
+                )}])
+                parsed = parsed.strip().replace("```json", "").replace("```", "")
+                data = json.loads(parsed)
+                delay_min = int(data["delay_minutes"])
+                remind_text = data["text"]
+                fire_at = datetime.now() + timedelta(minutes=delay_min)
+                await schedule_reminder(ctx.bot, update.effective_chat.id, remind_text, fire_at)
+                await msg.edit_text(f"🎤 Ти сказав: {text}\n\n✅ Нагадаю через {delay_min} хв: {remind_text}")
+            except Exception as e:
+                await msg.edit_text(f"Не вдалось встановити нагадування: {e}")
+            return
+
+        if needs_image(text):
+            t = text.lower()
+            prompt = text
+            for kw in IMAGE_KEYWORDS:
+                if kw in t:
+                    prompt = text[t.index(kw) + len(kw):].strip()
+                    break
+            await msg.edit_text(f"🎤 Ти сказав: {text}\n\n🎨 Генерую зображення...")
+            try:
+                translation = await call_ai([{
+                    "role": "user",
+                    "content": f"Translate this image description to English, return ONLY the translation, no explanations: {prompt}"
+                }])
+                img_bytes = await generate_image(translation)
+                await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
+                await msg.delete()
+            except Exception as e:
+                await msg.edit_text(f"Помилка генерації: {e}")
+            return
+
         append_and_trim(user_id, "user", text)
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
@@ -588,7 +607,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════════════════════
 
 async def post_init(app):
-    """Виконується після запуску бота — відновлює нагадування."""
     await restore_reminders(app.bot)
 
 
