@@ -757,7 +757,8 @@ async def do_price(query: str) -> str:
     if "[Контекст попереднього повідомлення" in query:
         prompt = (
             f"{query}\n\n"
-            f"Витягни з контексту та запиту точну назву товару і місто.\n"
+            f"Витягни з контексту та запиту ТОЧНУ комерційну назву товару (бренд + модель, наприклад 'GameSir Nova 2') і місто.\n"
+            f"Якщо модель чітко вказана в контексті — використай саме її, не узагальнюй.\n"
             f"Розшифруй скорочення:\n{aliases_hint}"
             "Відповідай ТІЛЬКИ JSON: {\"product\": \"...\", \"city\": \"...\" або null}"
         )
@@ -947,16 +948,56 @@ async def do_price(query: str) -> str:
     if not search_results:
         return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{links}"
 
-    summary = await call_ai([{"role": "user", "content": (
+    summary_raw = await call_ai([{"role": "user", "content": (
         f"З цих результатів знайди конкретні числові ціни на '{product}'"
         f"{' у ' + city if city else ' в Україні'}.\n"
-        f"- Вказуй ТІЛЬКИ ціни що явно є в тексті, з назвою магазину і посиланням\n"
-        f"- ВАЖЛИВО: ігноруй ціни на інші моделі (наприклад RTX 4060 якщо шукаємо RTX 5090)\n"
+        f"СУВОРІ ПРАВИЛА:\n"
+        f"- Відповідай ТІЛЬКИ у форматі JSON-масиву, нічого більше:\n"
+        f'  [{{"shop":"Назва","price":999,"url":"https://..."}},...]\n'
+        f"- Вказуй ТІЛЬКИ ціни що дослівно є в тексті результатів\n"
+        f"- Кожен елемент масиву — УНІКАЛЬНИЙ url (не дублювати)\n"
+        f"- ІГНОРУЙ ціни на інші моделі чи схожі товари\n"
         f"- НЕ вигадуй ціни. НЕ згадуй OLX\n"
-        f"- Якщо цін немає — скажи про це і додай посилання:\n{links}\n"
-        f"Відповідай українською.\n\n{search_results}"
+        f"- Якщо цін немає — поверни порожній масив []\n\n"
+        f"{search_results}"
     )}])
-    return f"💰 Ціни на: {product}\n\n{summary}"
+
+    # Парсимо JSON від AI і форматуємо самостійно
+    try:
+        clean_json = summary_raw.strip().replace("```json", "").replace("```", "")
+        price_items = json.loads(clean_json)
+    except Exception:
+        price_items = []
+
+    if price_items:
+        # Дедуплікація за URL
+        seen_urls: set[str] = set()
+        unique_items = []
+        for item in price_items:
+            u = item.get("url", "").split("?")[0]  # ігноруємо query-параметри при порівнянні
+            if u not in seen_urls:
+                seen_urls.add(u)
+                unique_items.append(item)
+
+        unique_items.sort(key=lambda x: x.get("price", 0))
+        city_note = f" у {city}" if city else ""
+        lines = [f"💰 Ціни на: {product}{city_note}\n"]
+        for i, item in enumerate(unique_items[:6]):
+            marker = " 🏆" if i == 0 else ""
+            price_val = item.get("price", "?")
+            price_str = f"{price_val:,} грн".replace(",", " ") if isinstance(price_val, int) else f"{price_val} грн"
+            lines.append(f"• {item.get('shop','?')}: {price_str}{marker}\n  🔗 {item.get('url','')}")
+        lines.append(f"\n💡 Найдешевше: {unique_items[0].get('price','?'):,} грн на {unique_items[0].get('shop','?')}".replace(",", " "))
+        if city:
+            lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
+        return "\n".join(lines)
+
+    # AI не знайшов цін — повертаємо посилання для пошуку
+    return (
+        f"💰 Ціни на: {product}\n\n"
+        f"Не вдалось знайти конкретні ціни автоматично.\n"
+        f"Пошукай вручну:\n{links}"
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
