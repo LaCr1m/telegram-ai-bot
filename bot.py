@@ -352,6 +352,8 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
         "що він продає","що вона продає","що там є","що там продають",
         "яка адреса","який графік","як туди","контакти","телефон магазину",
         "що ще","що інше","а ще","і ще","також розкажи",
+        "щоб купити","хочу купити","можна купити","як купити",
+        "де продається","чи є в продажі","є в наявності",
     ]
     if len(words) <= 10 or any(h in t for h in strong_hints):
         return (
@@ -745,11 +747,20 @@ def _parse_prices(text: str) -> list[int]:
     return prices
 
 async def do_price(query: str) -> str:
-    clean_query = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
+    # Якщо є контекст попереднього повідомлення — витягуємо товар з нього
+    if "[Контекст попереднього повідомлення" in query:
+        prompt = (
+            f"{query}\n\n"
+            "Витягни точну назву товару або об'єкта з контексту для пошуку ціни в інтернет-магазині. "
+            "Відповідай ТІЛЬКИ назвою товару (бренд + модель якщо є), нічого більше."
+        )
+    else:
+        clean_query = query.split("Запит користувача:")[-1].strip()
+        prompt = f"Витягни назву товару для пошуку в магазині. Відповідай ТІЛЬКИ назвою: '{clean_query}'"
     try:
-        product = (await call_ai([{"role":"user","content":f"Витягни назву товару для пошуку в магазині. Відповідай ТІЛЬКИ назвою: '{clean_query}'"}])).strip()
+        product = (await call_ai([{"role": "user", "content": prompt}])).strip()
     except Exception:
-        product = clean_query
+        product = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
 
     encoded = product.replace(" ", "+")
     sites   = {
