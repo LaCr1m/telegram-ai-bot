@@ -1125,8 +1125,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not addressed:
         return
     user_id  = update.message.from_user.id
-    enriched = await resolve_text_with_context(user_id, user_text)
-    intent   = await detect_intent(enriched)
+
+    # Показуємо що бот друкує поки обробляє
+    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        enriched = await resolve_text_with_context(user_id, user_text)
+        intent   = await detect_intent(enriched)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Помилка обробки запиту: {e}")
+        return
 
     if intent == "image":
         msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
@@ -1187,18 +1195,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             append_and_trim(user_id, "assistant", reply)
             await msg.edit_text(clean_markdown(reply))
         except Exception as e:
-            await msg.edit_text(f"Помилка: {e}")
+            await msg.edit_text(f"Помилка пошуку: {e}")
         return
 
     # Звичайна відповідь
-    append_and_trim(user_id, "user", enriched)
     try:
+        append_and_trim(user_id, "user", enriched)
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
         await update.message.reply_text(clean_markdown(reply))
         asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
     except Exception as e:
-        await update.message.reply_text(f"Помилка: {e}")
+        await update.message.reply_text(f"⚠️ Помилка відповіді: {e}")
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔍 Аналізую зображення...")
