@@ -104,6 +104,8 @@ REMIND_KEYWORDS = [
 SEARCH_KEYWORDS = [
     "пошукай", "знайди в інтернеті", "загугли", "що відбувається",
     "останні новини", "актуальні новини", "яка погода", "який курс",
+    "де купити", "де придбати", "де замовити", "де знайти", "де продається",
+    "скільки коштує", "скільки вартує", "яка ціна", "яка вартість",
     "search", "look up"
 ]
 TRANSLATE_KEYWORDS = [
@@ -1244,8 +1246,6 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         append_and_trim(user_id, "user", f"[Фото] {caption}")
         append_and_trim(user_id, "assistant", reply)
         await msg.edit_text(clean_markdown(reply))
-        # DEBUG: підтвердження збереження контексту
-        await update.message.reply_text(f"✅ Контекст збережено. Тепер можеш питати про це фото.")
     except Exception as e:
         await msg.edit_text(f"Помилка при аналізі зображення: {e}")
 
