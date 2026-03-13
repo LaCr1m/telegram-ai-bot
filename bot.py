@@ -1,163 +1,4 @@
-async def do_price(query: str) -> str:
-    # ── Витягуємо товар і місто ───────────────────────────────────────────
-    if "[Контекст попереднього повідомлення" in query:
-        prompt = (
-            f"{query}\n\n"
-            "Витягни з контексту та запиту точну назву товару і місто.\n"
-            "Правила для назви: розшифруй скорочення та неповні назви:\n"
-            "  '5090' або 'відеокарта 5090' → 'GeForce RTX 5090'\n"
-            "  '4090' або 'відеокарта 4090' → 'GeForce RTX 4090'\n"
-            "  '4080' → 'GeForce RTX 4080', '4070' → 'GeForce RTX 4070'\n"
-            "  '4060' → 'GeForce RTX 4060', '3080' → 'GeForce RTX 3080'\n"
-            "  'iPhone 16' → 'Apple iPhone 16', 'MacBook' → 'Apple MacBook'\n"
-            "Відповідай ТІЛЬКИ JSON: {\"product\": \"...\", \"city\": \"...\" або null}"
-        )
-    else:
-        clean = query.split("Запит користувача:")[-1].strip()
-        prompt = (
-            f"Витягни з цього запиту точну назву товару і місто.\n"
-            f"Правила для назви — розшифруй скорочення:\n"
-            f"  '5090' або 'відеокарта 5090' → 'GeForce RTX 5090'\n"
-            f"  '4090' → 'GeForce RTX 4090', '4080' → 'GeForce RTX 4080'\n"
-            f"  '4070' → 'GeForce RTX 4070', '4060' → 'GeForce RTX 4060'\n"
-            f"  '3080' → 'GeForce RTX 3080', '3070' → 'GeForce RTX 3070'\n"
-            f"  'iPhone 16' → 'Apple iPhone 16'\n"
-            f"  'i9 14900' → 'Intel Core i9-14900'\n"
-            f"Запит: '{clean}'\n"
-            "Відповідай ТІЛЬКИ JSON: {\"product\": \"...\", \"city\": \"...\" або null}"
-        )
-    try:
-        raw     = (await call_ai([{"role": "user", "content": prompt}])).strip()
-        raw     = raw.replace("```json", "").replace("```", "")
-        parsed  = json.loads(raw)
-        product = parsed.get("product", "").strip()
-        city    = (parsed.get("city") or "").strip()
-        city    = "" if city.lower() in ("null", "none", "") else city
-    except Exception:
-        clean   = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
-        product = clean
-        city    = ""
-
-    # Резервна нормалізація якщо AI не розпізнав
-    if re.fullmatch(r'\d{4}', product.strip()):
-        product = f"GeForce RTX {product.strip()}"
-    elif re.search(r'(?:відеокарта|видеокарта)\s+(\d{4})', product.lower()):
-        num = re.search(r'\d{4}', product).group()
-        product = f"GeForce RTX {num}"
-
-    if not product:
-        return "❌ Не вдалось визначити назву товару."
-
-    encoded = product.replace(" ", "+")
-    city_str = city or "Україна"
-
-    # ── Спроба 1: Tavily — шукає реальні ціни прямо на сторінках ────────────
-    if TAVILY_API_KEY:
-        try:
-            tavily_query = f"{product} ціна купити {city_str} site:hotline.ua OR site:price.ua OR site:rozetka.com.ua OR site:comfy.ua"
-            raw_results  = await asyncio.to_thread(
-                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(
-                    query=tavily_query, max_results=8, search_depth="advanced"
-                )
-            )
-            items = _filter_results(raw_results.get("results", []))
-            if items:
-                # Витягуємо ціни з текстів результатів
-                found_prices = []
-                for item in items:
-                    text   = item.get("content", "") + " " + item.get("title", "")
-                    domain = ""
-                    url    = item.get("url", "")
-                    for d in ("hotline.ua", "price.ua", "rozetka.com.ua", "comfy.ua"):
-                        if d in url:
-                            domain = d
-                            break
-                    prices = _parse_prices(text)
-                    if prices and domain:
-                        found_prices.append({
-                            "site":  domain,
-                            "price": min(prices),
-                            "url":   url,
-                            "title": item.get("title","")[:60],
-                        })
-
-                if found_prices:
-                    found_prices.sort(key=lambda x: x["price"])
-                    city_note = f" у {city}" if city else ""
-                    lines     = [f"💰 Ціни на: {product}{city_note}\n"]
-                    seen_sites: set[str] = set()
-                    for fp in found_prices[:6]:
-                        marker = " 🏆" if not seen_sites else ""
-                        seen_sites.add(fp["site"])
-                        lines.append(
-                            f"• {fp['site']}: {fp['price']:,} грн{marker}\n"
-                            f"  {fp['title']}\n"
-                            f"  🔗 {fp['url']}"
-                        .replace(",", " "))
-                    lines.append(f"\n💡 Найдешевше: {found_prices[0]['price']:,} грн на {found_prices[0]['site']}".replace(",", " "))
-                    if city:
-                        lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
-                    return "\n".join(lines)
-        except Exception as e:
-            print(f"[Tavily price error]: {e}")
-
-    # ── Спроба 2: прямий парсинг HTML ────────────────────────────────────────
-    sites = {
-        "Hotline":  f"https://hotline.ua/search/?q={encoded}",
-        "Price.ua": f"https://price.ua/search/?text={encoded}",
-        "Rozetka":  f"https://rozetka.com.ua/ua/search/?text={encoded}",
-        "Comfy":    f"https://comfy.ua/ua/search/?q={encoded}",
-    }
-    html_results: dict[str, dict] = {}
-
-    async def _fetch_prices(name: str, url: str) -> None:
-        try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                r = await client.get(url, headers=_HEADERS)
-            if name == "Rozetka":
-                prices = [int(p) for p in re.findall(r'"price":(\d+)', r.text) if 50 < int(p) < 500_000]
-            elif name == "Comfy":
-                prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 50 < int(p) < 500_000]
-                if not prices:
-                    prices = _parse_prices(r.text)
-            else:
-                prices = _parse_prices(r.text)
-            if prices:
-                html_results[name] = {"min": min(prices), "max": max(prices), "url": url}
-        except Exception as e:
-            print(f"[{name} error]: {e}")
-
-    await asyncio.gather(*[_fetch_prices(n, u) for n, u in sites.items()])
-
-    if html_results:
-        cheapest  = min(html_results, key=lambda s: html_results[s]["min"])
-        city_note = f" у {city}" if city else ""
-        lines     = [f"💰 Ціни на: {product}{city_note}\n"]
-        for site, data in html_results.items():
-            tag       = " 🏆" if site == cheapest else ""
-            price_str = (
-                f"{data['min']:,} грн".replace(",", " ")
-                if data["min"] == data["max"]
-                else f"{data['min']:,} – {data['max']:,} грн".replace(",", " ")
-            )
-            lines.append(f"• {site}: {price_str}{tag}\n  🔗 {data['url']}")
-        lines.append(f"\n💡 Найдешевше на {cheapest}: {html_results[cheapest]['min']:,} грн".replace(",", " "))
-        if city:
-            lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
-        return "\n".join(lines)
-
-    # ── Спроба 3: загальний пошук + посилання ────────────────────────────────
-    search_results = await search_web(f"{product} купити ціна {city_str}")
-    links = (
-        f"• https://hotline.ua/search/?q={encoded}\n"
-        f"• https://price.ua/search/?text={encoded}\n"
-        f"• https://rozetka.com.ua/ua/search/?text={encoded}\n"
-        f"• https://comfy.ua/ua/search/?q={encoded}"
-    )
-    if not search_results:
-        return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{links}"
-
-    summary = import os
+import os
 import re
 import httpx
 import base64
@@ -201,6 +42,7 @@ REMINDERS_FILE       = "reminders.json"
 MEMORY_FILE          = "memory.json"
 TASKS_FILE           = "tasks.json"
 HISTORY_FILE         = "history.json"
+BLOCKED_DOMAINS      = {"olx.ua", "olx.com.ua"}
 
 # ── Системний промпт ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = {
@@ -240,7 +82,6 @@ user_personalities: dict[int, str]  = {}
 last_context:       dict[int, dict] = {}
 or_requests = {"count": 0, "date": date.today()}
 OR_DAILY_LIMIT = 190
-
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 
@@ -271,8 +112,7 @@ def get_user_memory(user_id: int) -> dict:
 
 def update_user_memory(user_id: int, data: dict) -> None:
     memory = _load_json(MEMORY_FILE, {})
-    uid = str(user_id)
-    memory.setdefault(uid, {}).update(data)
+    memory.setdefault(str(user_id), {}).update(data)
     _save_json(MEMORY_FILE, memory)
 
 async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> None:
@@ -334,14 +174,12 @@ def get_history(user_id: int) -> list:
     return chat_histories[user_id]
 
 async def _compress_history(user_id: int) -> None:
-    """Стискає стару частину діалогу в підсумок, залишаючи 6 свіжих повідомлень."""
     history = chat_histories.get(user_id, [])
     msgs    = [m for m in history if m.get("role") != "system"]
-    if len(msgs) < 8:   # недостатньо для стиснення
+    if len(msgs) < 8:
         return
     old   = msgs[:-6]
     fresh = msgs[-6:]
-
     old_text = "\n".join(
         f"{'Користувач' if m['role'] == 'user' else 'Бот'}: "
         f"{m['content'] if isinstance(m['content'], str) else '[медіа]'}"
@@ -355,7 +193,6 @@ async def _compress_history(user_id: int) -> None:
     except Exception:
         return
 
-    # Зберігаємо тему в пам'яті фоново — не блокуємо основний потік
     async def _save_topic():
         try:
             topic = await call_ai([{"role": "user", "content": (
@@ -387,7 +224,7 @@ async def append_and_trim(user_id: int, role: str, content) -> None:
             [get_system_prompt(user_id)]
             + chat_histories[user_id][-MAX_HISTORY_MESSAGES:]
         )
-    save_histories()  # зберігаємо після кожної зміни
+    save_histories()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -406,7 +243,6 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     args    = ctx.args or []
     tasks   = get_user_tasks(user_id)
-
     if not args:
         if not tasks:
             await update.message.reply_text("📋 Список задач порожній.\n\nДодати: /tasks add Назва задачі")
@@ -417,7 +253,6 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append("\n/tasks add текст — додати\n/tasks done N — виконано\n/tasks del N — видалити\n/tasks clear — очистити")
         await update.message.reply_text("\n".join(lines))
         return
-
     cmd = args[0].lower()
     if cmd == "add":
         text = " ".join(args[1:])
@@ -427,7 +262,6 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tasks.append({"text": text, "done": False})
         set_user_tasks(user_id, tasks)
         await update.message.reply_text(f"✅ Задачу додано: {text}")
-
     elif cmd in ("done", "del"):
         if len(args) < 2 or not args[1].isdigit():
             await update.message.reply_text(f"Вкажи номер: /tasks {cmd} 1")
@@ -444,7 +278,6 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             removed = tasks.pop(n)
             set_user_tasks(user_id, tasks)
             await update.message.reply_text(f"🗑️ Видалено: {removed['text']}")
-
     elif cmd == "clear":
         set_user_tasks(user_id, [])
         await update.message.reply_text("🗑️ Список задач очищено.")
@@ -500,11 +333,9 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
         return text
     t     = text.lower().strip()
     words = t.split()
-
     if len(words) > 12:
         if not any(h in t for h in ["розкажи про", "що таке ", "поясни ", "напиши про", "хто такий"]):
             return text
-
     strong_hints = [
         "це","цей","цю","цього","на фото","з фото","на зображенні",
         "де купити","де придбати","де замовити","скільки коштує","скільки вартує",
@@ -548,7 +379,6 @@ def clean_markdown(text: str) -> str:
     return text
 
 def _set_ctx(user_id: int, user_text: str, reply: str) -> None:
-    """Зберігає контекст останньої текстової відповіді."""
     last_context[user_id] = {
         "type": "текст",
         "description": f"Запит: {user_text}\nВідповідь: {reply[:400]}"
@@ -695,6 +525,21 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
 # Пошук та документи
 # ════════════════════════════════════════════════════════════════════════════
 
+def _filter_results(items: list[dict]) -> list[dict]:
+    return [i for i in items if not any(bd in i.get("url", "") for bd in BLOCKED_DOMAINS)]
+
+def _parse_prices(text: str) -> list[int]:
+    raw = re.findall(r'[\s>](\d[\d\s\xa0]{1,7})\s*(?:грн|₴)', text)
+    prices = []
+    for p in raw:
+        try:
+            val = int(re.sub(r'[\s\xa0]', '', p))
+            if 200 < val < 500_000:
+                prices.append(val)
+        except ValueError:
+            pass
+    return prices
+
 async def search_web(query: str) -> str:
     if TAVILY_API_KEY:
         try:
@@ -702,7 +547,7 @@ async def search_web(query: str) -> str:
                 lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query=query, max_results=7)
             )
             filtered = _filter_results(results.get("results", []))
-            output = "".join(
+            output   = "".join(
                 f"{i['title']}\n{i['content'][:400]}\n{i['url']}\n\n"
                 for i in filtered
             )
@@ -721,7 +566,7 @@ async def search_web(query: str) -> str:
             t = re.sub(r'<[^>]+>', '', titles[i]).strip()   if i < len(titles)   else ""
             s = re.sub(r'<[^>]+>', '', snippets[i]).strip()
             l = links[i].strip()                            if i < len(links)    else ""
-            if s:
+            if s and not any(bd in l for bd in BLOCKED_DOMAINS):
                 output += f"{t}\n{s}\n{l}\n\n"
         if output:
             return output
@@ -748,7 +593,7 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
 
 def extract_excel_text(xlsx_bytes: bytes) -> str:
     try:
-        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+        wb  = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
         out = ""
         for sheet in wb.worksheets:
             out += f"=== Аркуш: {sheet.title} ===\n"
@@ -834,16 +679,16 @@ async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
         "Нічого більше не пиши."
     )}])
     try:
-        data   = json.loads(parsed.strip().replace("```json","").replace("```",""))
+        data   = json.loads(parsed.strip().replace("```json", "").replace("```", ""))
         action = data.get("action")
         tasks  = get_user_tasks(user_id)
         if action == "add":
-            task_text = data.get("text","")
+            task_text = data.get("text", "")
             if task_text:
                 tasks.append({"text": task_text, "done": False})
                 set_user_tasks(user_id, tasks)
                 await update.message.reply_text(f"✅ Задачу додано: {task_text}")
-        elif action in ("done","del"):
+        elif action in ("done", "del"):
             n = (data.get("number") or 1) - 1
             if 0 <= n < len(tasks):
                 if action == "done":
@@ -858,7 +703,10 @@ async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
             if not tasks:
                 await update.message.reply_text("📋 Список задач порожній.")
                 return
-            lines = ["📋 Твої задачі:\n"] + [f"{'✅' if t.get('done') else '⬜'} {i}. {t['text']}" for i,t in enumerate(tasks,1)]
+            lines = ["📋 Твої задачі:\n"] + [
+                f"{'✅' if t.get('done') else '⬜'} {i}. {t['text']}"
+                for i, t in enumerate(tasks, 1)
+            ]
             await update.message.reply_text("\n".join(lines))
     except Exception:
         await update.message.reply_text("❌ Не вдалось обробити задачу. Спробуй /tasks")
@@ -868,8 +716,8 @@ async def do_news(query: str) -> str:
     if not NEWS_API_KEY:
         return "❌ NEWS_API_KEY не налаштовано."
     try:
-        query_en = await call_ai([{"role":"user","content":f"Translate this news topic to English, return ONLY translation: {clean_query}"}])
-        params = {"q": query_en.strip(), "language": "uk", "sortBy": "publishedAt", "pageSize": 5, "apiKey": NEWS_API_KEY}
+        query_en = await call_ai([{"role": "user", "content": f"Translate this news topic to English, return ONLY translation: {clean_query}"}])
+        params   = {"q": query_en.strip(), "language": "uk", "sortBy": "publishedAt", "pageSize": 5, "apiKey": NEWS_API_KEY}
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get("https://newsapi.org/v2/everything", params=params)
             r.raise_for_status()
@@ -885,91 +733,180 @@ async def do_news(query: str) -> str:
         lines        = [f"📰 Новини за темою: {clean_query}\n"]
         sources_text = ""
         for i, a in enumerate(articles[:5], 1):
-            title       = a.get("title","Без назви")
-            source      = a.get("source",{}).get("name","")
-            published   = a.get("publishedAt","")[:10]
+            title       = a.get("title", "Без назви")
+            source      = a.get("source", {}).get("name", "")
+            published   = a.get("publishedAt", "")[:10]
             description = a.get("description") or ""
             sources_text += f"{title}. {description}\n"
-            lines.append(f"{i}. {title}\n   📅 {published} | {source}\n   🔗 {a.get('url','')}\n")
-        summary = await call_ai([{"role":"user","content":f"Ось заголовки новин за темою '{clean_query}':\n{sources_text}\n\nЗроби короткий підсумок (2-3 речення). Відповідай українською."}])
+            lines.append(f"{i}. {title}\n   📅 {published} | {source}\n   🔗 {a.get('url', '')}\n")
+        summary = await call_ai([{"role": "user", "content": f"Ось заголовки новин за темою '{clean_query}':\n{sources_text}\n\nЗроби короткий підсумок (2-3 речення). Відповідай українською."}])
         lines.insert(1, f"💡 {summary}\n")
         return "\n".join(lines)
     except Exception as e:
         return f"❌ Помилка отримання новин: {e}"
 
-def _parse_prices(text: str) -> list[int]:
-    """Витягує числа-ціни з HTML, фільтруючи сміття."""
-    raw = re.findall(r'[\s>](\d[\d\s\xa0]{1,7})\s*(?:грн|₴)', text)
-    prices = []
-    for p in raw:
-        try:
-            val = int(re.sub(r'[\s\xa0]', '', p))
-            if 200 < val < 500_000:
-                prices.append(val)
-        except ValueError:
-            pass
-    return prices
-
 async def do_price(query: str) -> str:
-    # Якщо є контекст попереднього повідомлення — витягуємо товар з нього
+    # ── Витягуємо товар і місто ───────────────────────────────────────────
+    aliases_hint = (
+        "'5090' або 'відеокарта 5090' → 'GeForce RTX 5090'\n"
+        "'4090' → 'GeForce RTX 4090', '4080' → 'GeForce RTX 4080'\n"
+        "'4070' → 'GeForce RTX 4070', '4060' → 'GeForce RTX 4060'\n"
+        "'3080' → 'GeForce RTX 3080', '3070' → 'GeForce RTX 3070'\n"
+        "'iPhone 16' → 'Apple iPhone 16'\n"
+        "'i9 14900' → 'Intel Core i9-14900'\n"
+    )
     if "[Контекст попереднього повідомлення" in query:
         prompt = (
             f"{query}\n\n"
-            "Витягни точну назву товару або об'єкта з контексту для пошуку ціни в інтернет-магазині. "
-            "Відповідай ТІЛЬКИ назвою товару (бренд + модель якщо є), нічого більше."
+            f"Витягни з контексту та запиту точну назву товару і місто.\n"
+            f"Розшифруй скорочення:\n{aliases_hint}"
+            "Відповідай ТІЛЬКИ JSON: {\"product\": \"...\", \"city\": \"...\" або null}"
         )
     else:
-        clean_query = query.split("Запит користувача:")[-1].strip()
-        prompt = f"Витягни назву товару для пошуку в магазині. Відповідай ТІЛЬКИ назвою: '{clean_query}'"
+        clean  = query.split("Запит користувача:")[-1].strip()
+        prompt = (
+            f"Витягни з цього запиту точну назву товару і місто.\n"
+            f"Розшифруй скорочення:\n{aliases_hint}"
+            f"Запит: '{clean}'\n"
+            "Відповідай ТІЛЬКИ JSON: {\"product\": \"...\", \"city\": \"...\" або null}"
+        )
     try:
-        product = (await call_ai([{"role": "user", "content": prompt}])).strip()
+        raw     = (await call_ai([{"role": "user", "content": prompt}])).strip()
+        raw     = raw.replace("```json", "").replace("```", "")
+        parsed  = json.loads(raw)
+        product = parsed.get("product", "").strip()
+        city    = (parsed.get("city") or "").strip()
+        city    = "" if city.lower() in ("null", "none", "") else city
     except Exception:
-        product = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
+        clean   = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
+        product = clean
+        city    = ""
 
-    encoded = product.replace(" ", "+")
-    sites   = {
+    # Резервна нормалізація
+    if re.fullmatch(r'\d{4}', product.strip()):
+        product = f"GeForce RTX {product.strip()}"
+    elif re.search(r'(?:відеокарта|видеокарта)\s+(\d{4})', product.lower()):
+        num     = re.search(r'\d{4}', product).group()
+        product = f"GeForce RTX {num}"
+
+    if not product:
+        return "❌ Не вдалось визначити назву товару."
+
+    encoded  = product.replace(" ", "+")
+    city_str = city or "Україна"
+    links    = (
+        f"• https://hotline.ua/search/?q={encoded}\n"
+        f"• https://price.ua/search/?text={encoded}\n"
+        f"• https://rozetka.com.ua/ua/search/?text={encoded}\n"
+        f"• https://comfy.ua/ua/search/?q={encoded}"
+    )
+
+    # ── Спроба 1: Tavily advanced ─────────────────────────────────────────
+    if TAVILY_API_KEY:
+        try:
+            tavily_query = (
+                f"{product} ціна купити {city_str} "
+                "site:hotline.ua OR site:price.ua OR site:rozetka.com.ua OR site:comfy.ua"
+            )
+            raw_results = await asyncio.to_thread(
+                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(
+                    query=tavily_query, max_results=8, search_depth="advanced"
+                )
+            )
+            items = _filter_results(raw_results.get("results", []))
+            found_prices = []
+            for item in items:
+                text   = item.get("content", "") + " " + item.get("title", "")
+                url    = item.get("url", "")
+                domain = next((d for d in ("hotline.ua", "price.ua", "rozetka.com.ua", "comfy.ua") if d in url), "")
+                prices = _parse_prices(text)
+                if prices and domain:
+                    found_prices.append({
+                        "site":  domain,
+                        "price": min(prices),
+                        "url":   url,
+                        "title": item.get("title", "")[:60],
+                    })
+            if found_prices:
+                found_prices.sort(key=lambda x: x["price"])
+                city_note = f" у {city}" if city else ""
+                lines     = [f"💰 Ціни на: {product}{city_note}\n"]
+                seen: set[str] = set()
+                for fp in found_prices[:6]:
+                    marker = " 🏆" if not seen else ""
+                    seen.add(fp["site"])
+                    lines.append(
+                        f"• {fp['site']}: {fp['price']:,} грн{marker}\n"
+                        f"  {fp['title']}\n"
+                        f"  🔗 {fp['url']}"
+                        .replace(",", " ")
+                    )
+                lines.append(f"\n💡 Найдешевше: {found_prices[0]['price']:,} грн на {found_prices[0]['site']}".replace(",", " "))
+                if city:
+                    lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
+                return "\n".join(lines)
+        except Exception as e:
+            print(f"[Tavily price error]: {e}")
+
+    # ── Спроба 2: прямий парсинг HTML ────────────────────────────────────
+    sites = {
         "Hotline":  f"https://hotline.ua/search/?q={encoded}",
         "Price.ua": f"https://price.ua/search/?text={encoded}",
         "Rozetka":  f"https://rozetka.com.ua/ua/search/?text={encoded}",
+        "Comfy":    f"https://comfy.ua/ua/search/?q={encoded}",
     }
-    results = {}
+    html_results: dict[str, dict] = {}
 
     async def _fetch_prices(name: str, url: str) -> None:
         try:
             async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
                 r = await client.get(url, headers=_HEADERS)
-            # Rozetka повертає JSON в HTML — шукаємо "price":N
             if name == "Rozetka":
-                raw = re.findall(r'"price":(\d+)', r.text)
-                prices = [int(p) for p in raw if 200 < int(p) < 500_000]
+                prices = [int(p) for p in re.findall(r'"price":(\d+)', r.text) if 50 < int(p) < 500_000]
+            elif name == "Comfy":
+                prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 50 < int(p) < 500_000]
+                if not prices:
+                    prices = _parse_prices(r.text)
             else:
                 prices = _parse_prices(r.text)
             if prices:
-                results[name] = {"min": min(prices), "max": max(prices), "url": url}
+                html_results[name] = {"min": min(prices), "max": max(prices), "url": url}
         except Exception as e:
             print(f"[{name} error]: {e}")
 
     await asyncio.gather(*[_fetch_prices(n, u) for n, u in sites.items()])
 
-    if not results:
-        search_results = await search_web(f"ціна {product} купити Україна")
-        if search_results:
-            summary = await call_ai([{"role":"user","content":f"З цих результатів витягни інформацію про ціни на '{product}' в Україні. Відповідай українською.\n\n{search_results}"}])
-            return f"🔍 Ціни на: {product}\n\n{summary}"
-        return f"❌ Не вдалось знайти ціни на «{product}»."
+    if html_results:
+        cheapest  = min(html_results, key=lambda s: html_results[s]["min"])
+        city_note = f" у {city}" if city else ""
+        out_lines = [f"💰 Ціни на: {product}{city_note}\n"]
+        for site, data in html_results.items():
+            tag       = " 🏆" if site == cheapest else ""
+            price_str = (
+                f"{data['min']:,} грн".replace(",", " ")
+                if data["min"] == data["max"]
+                else f"{data['min']:,} – {data['max']:,} грн".replace(",", " ")
+            )
+            out_lines.append(f"• {site}: {price_str}{tag}\n  🔗 {data['url']}")
+        out_lines.append(f"\n💡 Найдешевше на {cheapest}: {html_results[cheapest]['min']:,} грн".replace(",", " "))
+        if city:
+            out_lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
+        return "\n".join(out_lines)
 
-    cheapest = min(results, key=lambda s: results[s]["min"])
-    lines    = [f"💰 Ціни на: {product}\n"]
-    for site, data in results.items():
-        tag       = " 🏆" if site == cheapest else ""
-        price_str = (
-            f"{data['min']:,} грн".replace(",", " ")
-            if data["min"] == data["max"]
-            else f"{data['min']:,} – {data['max']:,} грн".replace(",", " ")
-        )
-        lines.append(f"• {site}: {price_str}{tag}\n  🔗 {data['url']}")
-    lines.append(f"\n💡 Найдешевше на {cheapest}: {results[cheapest]['min']:,} грн".replace(",", " "))
-    return "\n".join(lines)
+    # ── Спроба 3: загальний пошук + посилання ────────────────────────────
+    search_results = await search_web(f"{product} купити ціна {city_str}")
+    if not search_results:
+        return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{links}"
+
+    summary = await call_ai([{"role": "user", "content": (
+        f"З цих результатів знайди конкретні числові ціни на '{product}'"
+        f"{' у ' + city if city else ' в Україні'}.\n"
+        f"- Вказуй ТІЛЬКИ ціни що явно є в тексті, з назвою магазину і посиланням\n"
+        f"- НЕ вигадуй ціни. НЕ згадуй OLX\n"
+        f"- Якщо цін немає — скажи про це і додай посилання:\n{links}\n"
+        f"Відповідай українською.\n\n{search_results}"
+    )}])
+    return f"💰 Ціни на: {product}\n\n{summary}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -990,7 +927,9 @@ async def schedule_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> 
         delay = max(0, (fire_at - datetime.now()).total_seconds())
         await asyncio.sleep(delay)
         await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
-        save_reminders([r for r in load_reminders() if not (r["chat_id"]==chat_id and r["text"]==text and r["fire_at"]==fire_at.isoformat())])
+        save_reminders([r for r in load_reminders() if not (
+            r["chat_id"] == chat_id and r["text"] == text and r["fire_at"] == fire_at.isoformat()
+        )])
     asyncio.create_task(_run())
 
 async def restore_reminders(bot) -> None:
@@ -1005,7 +944,9 @@ async def restore_reminders(bot) -> None:
                 delay = max(0, (fi - datetime.now()).total_seconds())
                 await asyncio.sleep(delay)
                 await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
-                save_reminders([x for x in load_reminders() if not (x["chat_id"]==chat_id and x["text"]==text and x["fire_at"]==fi.isoformat())])
+                save_reminders([x for x in load_reminders() if not (
+                    x["chat_id"] == chat_id and x["text"] == text and x["fire_at"] == fi.isoformat()
+                )])
             asyncio.create_task(_run())
     save_reminders(valid)
 
@@ -1018,12 +959,12 @@ async def detect_gender_from_transcript(text: str) -> str | None:
     if not text:
         return None
     try:
-        result = await call_ai([{"role":"user","content":(
+        result = await call_ai([{"role": "user", "content": (
             f"Визнач стать мовця за граматичними формами (казав/казала тощо).\n"
             f"Текст: '{text}'\nВідповідай ТІЛЬКИ: 'male', 'female' або 'unknown'."
         )}])
         g = result.strip().lower()
-        return g if g in ("male","female") else None
+        return g if g in ("male", "female") else None
     except Exception:
         return None
 
@@ -1037,11 +978,11 @@ async def do_generate_image(update: Update, text: str, msg):
     prompt = text
     for kw in IMAGE_KEYWORDS:
         if kw in t:
-            prompt = text[t.index(kw)+len(kw):].strip()
+            prompt = text[t.index(kw) + len(kw):].strip()
             break
     prompt = prompt or text
     try:
-        translation = (await call_ai([{"role":"user","content":f"Translate to English, return ONLY translation: {prompt}"}])).strip()
+        translation = (await call_ai([{"role": "user", "content": f"Translate to English, return ONLY translation: {prompt}"}])).strip()
         img_bytes   = await generate_image(translation)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
@@ -1050,15 +991,25 @@ async def do_generate_image(update: Update, text: str, msg):
 
 async def do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     now_str = datetime.now().strftime("%H:%M")
-    parsed  = await call_ai([{"role":"user","content":(
+    parsed  = await call_ai([{"role": "user", "content": (
         f"Поточний час: {now_str}. Витягни час нагадування і текст: '{text}'. "
         "Відповідай ТІЛЬКИ JSON: {\"delay_minutes\": 5, \"text\": \"текст\"}"
     )}])
-    data        = json.loads(parsed.strip().replace("```json","").replace("```",""))
+    data        = json.loads(parsed.strip().replace("```json", "").replace("```", ""))
     delay_min   = int(data["delay_minutes"])
     remind_text = data["text"]
-    await schedule_reminder(ctx.bot, update.effective_chat.id, remind_text, datetime.now()+timedelta(minutes=delay_min))
+    await schedule_reminder(ctx.bot, update.effective_chat.id, remind_text, datetime.now() + timedelta(minutes=delay_min))
     return delay_min, remind_text
+
+async def _send_or_edit(msg, text: str, **kwargs):
+    text   = text.strip()
+    chunks = [text[i:i+4000] for i in range(0, max(len(text), 1), 4000)]
+    try:
+        await msg.edit_text(chunks[0], **kwargs)
+    except Exception:
+        await msg.reply_text(chunks[0], **kwargs)
+    for chunk in chunks[1:]:
+        await msg.reply_text(chunk, **kwargs)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1114,7 +1065,7 @@ async def news_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg    = await update.message.reply_text(f"📰 Шукаю новини про «{query}»...")
     result = await do_news(query)
-    await msg.edit_text(clean_markdown(result), disable_web_page_preview=True)
+    await _send_or_edit(msg, clean_markdown(result), disable_web_page_preview=True)
 
 async def price_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = " ".join(ctx.args)
@@ -1123,7 +1074,7 @@ async def price_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg    = await update.message.reply_text(f"💰 Шукаю ціни на «{query}»...")
     result = await do_price(query)
-    await msg.edit_text(clean_markdown(result), disable_web_page_preview=True)
+    await _send_or_edit(msg, clean_markdown(result), disable_web_page_preview=True)
 
 async def translate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = " ".join(ctx.args)
@@ -1132,7 +1083,7 @@ async def translate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg    = await update.message.reply_text("🌐 Перекладаю...")
     result = await do_translate(text)
-    await msg.edit_text(clean_markdown(result))
+    await _send_or_edit(msg, clean_markdown(result))
 
 async def summarize_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = " ".join(ctx.args)
@@ -1141,16 +1092,19 @@ async def summarize_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg    = await update.message.reply_text("📰 Опрацьовую...")
     result = await do_summarize(text)
-    await msg.edit_text(clean_markdown(result))
+    await _send_or_edit(msg, clean_markdown(result))
 
 async def generate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = " ".join(ctx.args)
     if not text:
-        await update.message.reply_text("Використання:\n/generate резюме для розробника\n/generate лист подяки\n/generate пост про продукт")
+        await update.message.reply_text(
+            "Використання:\n/generate резюме для розробника\n"
+            "/generate лист подяки\n/generate пост про продукт"
+        )
         return
     msg    = await update.message.reply_text("✍️ Генерую текст...")
     result = await do_generate(text)
-    await msg.edit_text(clean_markdown(result))
+    await _send_or_edit(msg, clean_markdown(result))
 
 async def recipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = " ".join(ctx.args)
@@ -1159,7 +1113,7 @@ async def recipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg    = await update.message.reply_text("🍳 Шукаю рецепти...")
     result = await do_recipe(text)
-    await msg.edit_text(clean_markdown(result))
+    await _send_or_edit(msg, clean_markdown(result))
 
 async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -1169,14 +1123,14 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if mode not in PERSONALITIES:
             await update.message.reply_text(f"❌ Доступні режими: {', '.join(PERSONALITIES)}")
             return
-        user_personalities[user_id]  = mode
+        user_personalities[user_id] = mode
         update_user_memory(user_id, {"mode": mode})
         chat_histories[user_id] = [get_system_prompt(user_id)]
         p = PERSONALITIES[mode]
         await update.message.reply_text(f"{p['emoji']} Режим: {p['name']}")
     else:
         lines = ["🎭 Оберіть режим:\n"] + [
-            f"{p['emoji']} /mode {key} — {p['name']}{'  ✅' if key==current else ''}"
+            f"{p['emoji']} /mode {key} — {p['name']}{'  ✅' if key == current else ''}"
             for key, p in PERSONALITIES.items()
         ]
         await update.message.reply_text("\n".join(lines))
@@ -1188,7 +1142,7 @@ async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["🧠 Що я пам'ятаю:\n"]
     if mem.get("name"):   lines.append(f"👤 Ім'я: {mem['name']}")
-    if mem.get("gender"): lines.append(f"👤 Стать: {'чоловік' if mem['gender']=='male' else 'жінка'}")
+    if mem.get("gender"): lines.append(f"👤 Стать: {'чоловік' if mem['gender'] == 'male' else 'жінка'}")
     if mem.get("facts"):
         lines.append("\n📌 Факти:")
         lines += [f"  • {f}" for f in mem["facts"]]
@@ -1210,7 +1164,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.message.reply_text("🎨 Генерую зображення...")
     try:
-        translation = (await call_ai([{"role":"user","content":f"Translate to English, return ONLY translation: {prompt}"}])).strip()
+        translation = (await call_ai([{"role": "user", "content": f"Translate to English, return ONLY translation: {prompt}"}])).strip()
         img_bytes   = await generate_image(translation)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
@@ -1219,18 +1173,21 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or len(ctx.args) < 2:
-        await update.message.reply_text("Використання:\n/remind 30m Зателефонувати\n/remind 2h Нарада\n/remind 14:30 Обід")
+        await update.message.reply_text(
+            "Використання:\n/remind 30m Зателефонувати\n/remind 2h Нарада\n/remind 14:30 Обід"
+        )
         return
     time_arg, reminder_text = ctx.args[0], " ".join(ctx.args[1:])
     now = datetime.now()
     try:
         if time_arg.endswith("m"):
-            fire_at, when = now+timedelta(minutes=int(time_arg[:-1])), f"через {time_arg[:-1]} хв"
+            fire_at, when = now + timedelta(minutes=int(time_arg[:-1])), f"через {time_arg[:-1]} хв"
         elif time_arg.endswith("h"):
-            fire_at, when = now+timedelta(hours=int(time_arg[:-1])), f"через {time_arg[:-1]} год"
+            fire_at, when = now + timedelta(hours=int(time_arg[:-1])), f"через {time_arg[:-1]} год"
         elif ":" in time_arg:
-            t = datetime.strptime(time_arg,"%H:%M").replace(year=now.year,month=now.month,day=now.day)
-            if t < now: t += timedelta(days=1)
+            t = datetime.strptime(time_arg, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
+            if t < now:
+                t += timedelta(days=1)
             fire_at, when = t, f"о {time_arg}"
         else:
             await update.message.reply_text("❌ Формат: 30m, 2h або 14:30")
@@ -1250,10 +1207,10 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg     = await update.message.reply_text(f"🌐 Шукаю: {query}...")
     results = await search_web(query)
     try:
-        reply = await call_ai([SYSTEM_PROMPT, {"role":"user","content":f"Запит: '{query}'\n\nРезультати:\n{results}\n\nСтисло підсумуй українською."}])
+        reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": f"Запит: '{query}'\n\nРезультати:\n{results}\n\nСтисло підсумуй українською."}])
         await append_and_trim(user_id, "user", f"Пошук: {query}")
         await append_and_trim(user_id, "assistant", reply)
-        await msg.edit_text(f"🌐 {query}\n\n{clean_markdown(reply)}")
+        await _send_or_edit(msg, f"🌐 {query}\n\n{clean_markdown(reply)}")
     except Exception as e:
         await msg.edit_text(f"Помилка: {e}")
 
@@ -1269,7 +1226,7 @@ async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             tavily_status = f"🔴 Помилка: {str(e)[:50]}"
     await update.message.reply_text(
         f"📊 Статус:\n"
-        f"• Провайдер: {'OpenRouter 🟢' if provider=='openrouter' else 'Groq 🔵'}\n"
+        f"• Провайдер: {'OpenRouter 🟢' if provider == 'openrouter' else 'Groq 🔵'}\n"
         f"• OpenRouter залишилось: {remaining}/{OR_DAILY_LIMIT}\n"
         f"• Tavily пошук: {tavily_status}\n"
         f"• Активних нагадувань: {len(load_reminders())}\n"
@@ -1284,39 +1241,26 @@ async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Обробники повідомлень
+# Диспетчер інтентів + обробники повідомлень
 # ════════════════════════════════════════════════════════════════════════════
 
 def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
     user_text = update.message.text or ""
-    if update.message.chat.type not in ("group","supergroup"):
+    if update.message.chat.type not in ("group", "supergroup"):
         return True, user_text
     bot_username = ctx.bot.username
     if f"@{bot_username}" in user_text:
-        return True, user_text.replace(f"@{bot_username}","").strip()
+        return True, user_text.replace(f"@{bot_username}", "").strip()
     reply = update.message.reply_to_message
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id:
         return True, user_text
     return False, user_text
 
-async def _send_or_edit(msg, text: str, **kwargs):
-    """Надсилає або редагує повідомлення — безпечно для довгих текстів (ліміт 4096)."""
-    text   = text.strip()
-    chunks = [text[i:i+4000] for i in range(0, max(len(text), 1), 4000)]
-    try:
-        await msg.edit_text(chunks[0], **kwargs)
-    except Exception:
-        await msg.reply_text(chunks[0], **kwargs)
-    for chunk in chunks[1:]:
-        await msg.reply_text(chunk, **kwargs)
-
-async def _dispatch_intent(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                            user_id: int, user_text: str, enriched: str,
-                            intent: str, voice_msg=None) -> bool:
-    """
-    Обробляє інтент і повертає True якщо оброблено.
-    voice_msg — статусне повідомлення для голосових (щоб показати транскрипцію + відповідь).
-    """
+async def _dispatch_intent(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int, user_text: str, enriched: str,
+    intent: str, voice_msg=None
+) -> bool:
     prefix = f"🎤 Ти сказав: {user_text}\n\n" if voice_msg else ""
 
     if intent == "image":
@@ -1330,39 +1274,12 @@ async def _dispatch_intent(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         try:
             delay_min, remind_text = await do_reminder(update, ctx, enriched)
             text = f"{prefix}✅ Нагадаю через {delay_min} хв: {remind_text}"
-            if voice_msg:
-                await voice_msg.edit_text(text)
-            else:
-                await update.message.reply_text(text)
+            if voice_msg: await voice_msg.edit_text(text)
+            else:         await update.message.reply_text(text)
         except Exception as e:
             err = f"{prefix}Не вдалось встановити нагадування: {e}"
             if voice_msg: await voice_msg.edit_text(err)
             else:         await update.message.reply_text(err)
-        return True
-
-    # Інтенти що повертають текстовий результат
-    INTENT_MAP = {
-        "translate": ("🌐 Перекладаю...",      do_translate),
-        "summarize": ("📰 Опрацьовую...",       do_summarize),
-        "generate":  ("✍️ Генерую текст...",    do_generate),
-        "recipe":    ("🍳 Шукаю рецепти...",    do_recipe),
-        "news":      ("📰 Шукаю новини...",     do_news),
-        "price":     ("💰 Шукаю ціни...",       do_price),
-    }
-    if intent in INTENT_MAP:
-        status_text, fn = INTENT_MAP[intent]
-        msg = voice_msg or await update.message.reply_text(status_text)
-        if voice_msg:
-            await msg.edit_text(f"{prefix}{status_text}")
-        try:
-            result = await fn(enriched)
-        except Exception as e:
-            await msg.edit_text(f"{prefix}⚠️ Помилка: {e}")
-            return True
-        kwargs = {"disable_web_page_preview": True} if intent in ("news", "price", "search") else {}
-        out    = clean_markdown(f"{prefix}{result}".strip())
-        await _send_or_edit(msg, out, **kwargs)
-        _set_ctx(user_id, user_text, result)
         return True
 
     if intent == "task":
@@ -1378,7 +1295,7 @@ async def _dispatch_intent(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         try:
             search_query = enriched
             if "[Контекст попереднього повідомлення" in enriched:
-                search_query = (await call_ai([{"role":"user","content":(
+                search_query = (await call_ai([{"role": "user", "content": (
                     f"{enriched}\n\nСклади короткий пошуковий запит (до 10 слів). Відповідай ТІЛЬКИ запитом."
                 )}])).strip()
             results = await search_web(search_query)
@@ -1387,13 +1304,37 @@ async def _dispatch_intent(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 if results else
                 f"Запит: '{enriched}'\n\nВідповідай з власних знань українською."
             )
-            reply = await call_ai([SYSTEM_PROMPT, {"role":"user","content":content}])
+            reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}])
             await append_and_trim(user_id, "user", user_text)
             await append_and_trim(user_id, "assistant", reply)
             _set_ctx(user_id, user_text, reply)
             await _send_or_edit(msg, clean_markdown(f"{prefix}{reply}"), disable_web_page_preview=True)
         except Exception as e:
             await msg.edit_text(f"{prefix}Помилка пошуку: {e}")
+        return True
+
+    # Текстові інтенти через INTENT_MAP
+    INTENT_MAP = {
+        "translate": ("🌐 Перекладаю...",       do_translate),
+        "summarize": ("📰 Опрацьовую...",        do_summarize),
+        "generate":  ("✍️ Генерую текст...",     do_generate),
+        "recipe":    ("🍳 Шукаю рецепти...",     do_recipe),
+        "news":      ("📰 Шукаю новини...",      do_news),
+        "price":     ("💰 Шукаю ціни...",        do_price),
+    }
+    if intent in INTENT_MAP:
+        status_text, fn = INTENT_MAP[intent]
+        msg = voice_msg or await update.message.reply_text(status_text)
+        if voice_msg:
+            await msg.edit_text(f"{prefix}{status_text}")
+        try:
+            result = await fn(enriched)
+        except Exception as e:
+            await msg.edit_text(f"{prefix}⚠️ Помилка: {e}")
+            return True
+        kwargs = {"disable_web_page_preview": True} if intent in ("news", "price") else {}
+        await _send_or_edit(msg, clean_markdown(f"{prefix}{result}".strip()), **kwargs)
+        _set_ctx(user_id, user_text, result)
         return True
 
     return False  # intent == "chat"
@@ -1414,13 +1355,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent):
         return
 
-    # Звичайна відповідь (chat)
     try:
         await append_and_trim(user_id, "user", enriched)
-        reply = await call_ai(get_history(user_id))
+        reply  = await call_ai(get_history(user_id))
         await append_and_trim(user_id, "assistant", reply)
-        # Довгі відповіді розбиваємо на частини
-        chunks = [reply[i:i+4096] for i in range(0, len(reply), 4096)]
+        chunks = [reply[i:i+4000] for i in range(0, max(len(reply), 1), 4000)]
         for chunk in chunks:
             await update.message.reply_text(clean_markdown(chunk))
         _set_ctx(user_id, user_text, reply)
@@ -1436,11 +1375,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file    = await ctx.bot.get_file(photo.file_id)
         img_b64 = base64.b64encode(await file.download_as_bytearray()).decode()
         caption = update.message.caption or "Що зображено на цьому фото? Опиши детально українською."
-        reply   = await call_vision([SYSTEM_PROMPT, {"role":"user","content":[
-            {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{img_b64}"}},
-            {"type":"text","text":caption}
+        reply   = await call_vision([SYSTEM_PROMPT, {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+            {"type": "text", "text": caption}
         ]}])
-        last_context[user_id] = {"type":"фото","description":reply[:500]}
+        last_context[user_id] = {"type": "фото", "description": reply[:500]}
         await append_and_trim(user_id, "user", f"[Фото] {caption}")
         await append_and_trim(user_id, "assistant", reply)
         await _send_or_edit(msg, clean_markdown(reply))
@@ -1458,7 +1397,7 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         video_bytes = bytes(await (await ctx.bot.get_file(video.file_id)).download_as_bytearray())
         result      = await analyze_video(video_bytes, caption)
-        last_context[user_id] = {"type":"відео","description":result[:500]}
+        last_context[user_id] = {"type": "відео", "description": result[:500]}
         await append_and_trim(user_id, "user", f"[Відео] {caption}")
         await append_and_trim(user_id, "assistant", result)
         await _send_or_edit(msg, clean_markdown(result))
@@ -1491,7 +1430,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await append_and_trim(user_id, "user", f"{caption}\n\nВміст документу:\n{text_preview}")
         reply = await call_ai(get_history(user_id))
         await append_and_trim(user_id, "assistant", reply)
-        last_context[user_id] = {"type":"документ","description":reply[:500]}
+        last_context[user_id] = {"type": "документ", "description": reply[:500]}
         await _send_or_edit(msg, f"📄 {doc.file_name}\n\n{clean_markdown(reply)}")
     except Exception as e:
         await msg.edit_text(f"Помилка при обробці документу: {e}")
@@ -1521,7 +1460,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if await _dispatch_intent(update, ctx, user_id, text, enriched, intent, voice_msg=msg):
             return
 
-        # Звичайна відповідь
         await append_and_trim(user_id, "user", enriched)
         reply = await call_ai(get_history(user_id))
         await append_and_trim(user_id, "assistant", reply)
@@ -1544,7 +1482,6 @@ async def post_init(app):
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-
     app.add_handler(CommandHandler("start",     start))
     app.add_handler(CommandHandler("help",      help_cmd))
     app.add_handler(CommandHandler("mode",      mode_cmd))
