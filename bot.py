@@ -825,31 +825,60 @@ async def do_price(query: str) -> str:
         )
         return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{food_links}"
 
-    # ── Техніка: Tavily → Hotline (спроба 1) ───────────────────────────
+    # ── Техніка: Tavily → Hotline ───────────────────────────────────────
     hotline_url = f"https://hotline.ua/search/?q={encoded}&order=1"
     tech_items: list[dict] = []
     product_keywords = [w.lower() for w in re.split(r'[\s\-/]+', product) if len(w) > 2]
+
+    # Паттерни URL які є категоріями/фільтрами, а не конкретним товаром
+    _CATEGORY_PATTERNS = re.compile(
+        r'/fs/\d+|/f/\d+|/c\d{3,}|/search/|\?.*category|/noutbuki-netbuki/$|/computer/$'
+    )
+
+    def _is_category_url(url: str) -> bool:
+        # Сторінка товару має slug у кінці без числового id /fs/ /f/
+        # Категорійні: /fs/1457/, /f/123/, або просто /noutbuki-netbuki/
+        return bool(_CATEGORY_PATTERNS.search(url))
 
     def _relevant(title: str) -> bool:
         t = title.lower()
         return sum(1 for kw in product_keywords if kw in t) >= max(1, len(product_keywords) // 2)
 
-    # Спроба 1: Tavily — вміє рендерити JS-сторінки
+    # Розширюємо назву товару якщо є тільки артикул
+    search_product = product
+    if re.search(r'[A-Z0-9]{5,10}EA\b', product) and len(product.split()) <= 2:
+        try:
+            expanded = await call_ai([{"role": "user", "content": (
+                f"Що це за товар: '{product}'? Дай повну назву моделі (бренд + серія + модель). "
+                "Відповідай ТІЛЬКИ назвою, без пояснень. Якщо не знаєш — поверни оригінал."
+            )}])
+            expanded = expanded.strip().strip('"\'.')
+            if len(expanded) > len(product) and not expanded.startswith("Я"):
+                search_product = expanded
+                print(f"[Price] Розширено: {product!r} → {search_product!r}")
+        except Exception:
+            pass
+
+    search_encoded = search_product.replace(" ", "+")
+    hotline_url    = f"https://hotline.ua/search/?q={search_encoded}&order=1"
+
+    # Спроба 1: Tavily
     if TAVILY_API_KEY:
         try:
-            tavily_query = f'"{product}" ціна купити site:hotline.ua'
+            tavily_query = f'"{search_product}" ціна купити site:hotline.ua'
             raw_results = await asyncio.to_thread(
                 lambda: TavilyClient(api_key=TAVILY_API_KEY).search(
                     query=tavily_query, max_results=10, search_depth="advanced"
                 )
             )
             for item in _filter_results(raw_results.get("results", [])):
-                url_t  = item.get("url", "")
-                title  = item.get("title", "")
-                cont   = item.get("content", "")
+                url_t = item.get("url", "")
+                title = item.get("title", "")
+                cont  = item.get("content", "")
                 if "hotline.ua" not in url_t:
                     continue
-                if re.search(r'/c\d{3,}/', url_t):
+                if _is_category_url(url_t):
+                    print(f"[Tavily] Пропущено категорію: {url_t[:80]}")
                     continue
                 if not _relevant(title) and not _relevant(cont[:300]):
                     continue
@@ -859,13 +888,12 @@ async def do_price(query: str) -> str:
                         "title": title.strip()[:80],
                         "price": min(prices),
                         "url":   url_t,
-                        "shop":  "Hotline",
                     })
             print(f"[Tavily Hotline] знайдено: {len(tech_items)}")
         except Exception as e:
             print(f"[Tavily Hotline error]: {e}")
 
-    # Спроба 2: прямий GET Hotline (для серверного рендерингу / мобільної версії)
+    # Спроба 2: прямий GET Hotline (мобільний UA — частіше серверний рендеринг)
     if not tech_items:
         try:
             _HL_HEADERS = {
@@ -879,7 +907,6 @@ async def do_price(query: str) -> str:
                 r = await client.get(hotline_url, headers=_HL_HEADERS)
             html = r.text
 
-            # JSON-LD structured data
             blocks = re.findall(
                 r'"name"\s*:\s*"([^"]{5,200})"[^{}]{0,400}?"price"\s*:\s*"?(\d+)"?[^{}]{0,200}?"url"\s*:\s*"([^"]+)"',
                 html
@@ -887,38 +914,26 @@ async def do_price(query: str) -> str:
             for name_t, price_t, url_t in blocks:
                 try:
                     pv = int(price_t)
-                    if 200 < pv < 2_000_000 and _relevant(name_t):
-                        tech_items.append({
-                            "title": name_t.strip()[:80],
-                            "price": pv,
-                            "url": url_t if url_t.startswith("http") else f"https://hotline.ua{url_t}",
-                            "shop": "Hotline",
-                        })
+                    full_url = url_t if url_t.startswith("http") else f"https://hotline.ua{url_t}"
+                    if 200 < pv < 2_000_000 and _relevant(name_t) and not _is_category_url(full_url):
+                        tech_items.append({"title": name_t.strip()[:80], "price": pv, "url": full_url})
                 except ValueError:
                     pass
 
-            # data-атрибути
             if not tech_items:
                 for m in re.finditer(
-                    r'data-(?:name|title)=["\']([^"\']{5,150})["\'][^>]{0,200}?data-price=["\'](\d+)["\']',
+                    r'data-(?:name|title)=["\']([ ^"\']{5,150})["\'][^>]{0,200}?data-price=["\'](\d+)["\']',
                     html
                 ):
                     try:
                         pv = int(m.group(2))
                         if 200 < pv < 2_000_000 and _relevant(m.group(1)):
-                            tech_items.append({
-                                "title": m.group(1).strip()[:80],
-                                "price": pv,
-                                "url": hotline_url,
-                                "shop": "Hotline",
-                            })
+                            tech_items.append({"title": m.group(1).strip()[:80], "price": pv, "url": hotline_url})
                     except ValueError:
                         pass
             print(f"[Hotline GET] знайдено: {len(tech_items)}")
         except Exception as e:
             print(f"[Hotline GET error]: {e}")
-
-    # Якщо Hotline дав результати — виводимо топ-10
     if tech_items:
         seen_urls: set[str] = set()
         unique: list[dict] = []
