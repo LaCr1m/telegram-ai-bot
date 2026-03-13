@@ -746,7 +746,6 @@ async def do_news(query: str) -> str:
         return f"❌ Помилка отримання новин: {e}"
 
 async def do_price(query: str) -> str:
-    # ── Витягуємо товар і місто ───────────────────────────────────────────
     aliases_hint = (
         "'5090' або 'відеокарта 5090' → 'GeForce RTX 5090'\n"
         "'4090' → 'GeForce RTX 4090', '4080' → 'GeForce RTX 4080'\n"
@@ -782,7 +781,6 @@ async def do_price(query: str) -> str:
         product = clean
         city    = ""
 
-    # Резервна нормалізація
     if re.fullmatch(r'\d{4}', product.strip()):
         product = f"GeForce RTX {product.strip()}"
     elif re.search(r'(?:відеокарта|видеокарта)\s+(\d{4})', product.lower()):
@@ -801,11 +799,18 @@ async def do_price(query: str) -> str:
         f"• https://comfy.ua/ua/search/?q={encoded}"
     )
 
+    # ── Ключові слова для фільтрації нерелевантних результатів ─────────────
+    product_keywords = [w.lower() for w in re.split(r'\s+', product) if len(w) > 2]
+
+    def _is_relevant(title: str) -> bool:
+        t = title.lower()
+        return all(kw in t for kw in product_keywords)
+
     # ── Спроба 1: Tavily advanced ─────────────────────────────────────────
     if TAVILY_API_KEY:
         try:
             tavily_query = (
-                f"{product} ціна купити {city_str} "
+                f'"{product}" ціна купити {city_str} '
                 "site:hotline.ua OR site:price.ua OR site:rozetka.com.ua OR site:comfy.ua"
             )
             raw_results = await asyncio.to_thread(
@@ -816,17 +821,25 @@ async def do_price(query: str) -> str:
             items = _filter_results(raw_results.get("results", []))
             found_prices = []
             for item in items:
-                text   = item.get("content", "") + " " + item.get("title", "")
-                url    = item.get("url", "")
-                domain = next((d for d in ("hotline.ua", "price.ua", "rozetka.com.ua", "comfy.ua") if d in url), "")
-                prices = _parse_prices(text)
+                title   = item.get("title", "")
+                content = item.get("content", "")
+                url     = item.get("url", "")
+                domain  = next((d for d in ("hotline.ua", "price.ua", "rozetka.com.ua", "comfy.ua") if d in url), "")
+
+                # Пропускаємо нерелевантні результати
+                if not _is_relevant(title) and not _is_relevant(content[:200]):
+                    print(f"[Price filter] Пропущено: {title[:60]}")
+                    continue
+
+                prices = _parse_prices(content + " " + title)
                 if prices and domain:
                     found_prices.append({
                         "site":  domain,
                         "price": min(prices),
                         "url":   url,
-                        "title": item.get("title", "")[:60],
+                        "title": title[:60],
                     })
+
             if found_prices:
                 found_prices.sort(key=lambda x: x["price"])
                 city_note = f" у {city}" if city else ""
@@ -836,12 +849,16 @@ async def do_price(query: str) -> str:
                     marker = " 🏆" if not seen else ""
                     seen.add(fp["site"])
                     lines.append(
-                        f"• {fp['site']}: {fp['price']:,} грн{marker}\n"
-                        f"  {fp['title']}\n"
-                        f"  🔗 {fp['url']}"
-                        .replace(",", " ")
+                        (
+                            f"• {fp['site']}: {fp['price']:,} грн{marker}\n"
+                            f"  {fp['title']}\n"
+                            f"  🔗 {fp['url']}"
+                        ).replace(",", " ")
                     )
-                lines.append(f"\n💡 Найдешевше: {found_prices[0]['price']:,} грн на {found_prices[0]['site']}".replace(",", " "))
+                lines.append(
+                    f"\n💡 Найдешевше: {found_prices[0]['price']:,} грн на {found_prices[0]['site']}"
+                    .replace(",", " ")
+                )
                 if city:
                     lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
                 return "\n".join(lines)
@@ -861,14 +878,26 @@ async def do_price(query: str) -> str:
         try:
             async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
                 r = await client.get(url, headers=_HEADERS)
+
             if name == "Rozetka":
-                prices = [int(p) for p in re.findall(r'"price":(\d+)', r.text) if 50 < int(p) < 500_000]
+                # Витягуємо пари name+price і фільтруємо за релевантністю
+                pairs  = re.findall(r'"name"\s*:\s*"([^"]{5,120})"\s*,\s*"price"\s*:\s*(\d+)', r.text)
+                prices = [
+                    int(p) for nm, p in pairs
+                    if _is_relevant(nm) and 200 < int(p) < 1_000_000
+                ]
+                # fallback — всі ціни якщо жодної релевантної не знайдено
+                if not prices:
+                    prices = [int(p) for p in re.findall(r'"price":(\d+)', r.text) if 200 < int(p) < 1_000_000]
+
             elif name == "Comfy":
-                prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 50 < int(p) < 500_000]
+                prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 200 < int(p) < 1_000_000]
                 if not prices:
                     prices = _parse_prices(r.text)
-            else:
+
+            else:  # Hotline, Price.ua
                 prices = _parse_prices(r.text)
+
             if prices:
                 html_results[name] = {"min": min(prices), "max": max(prices), "url": url}
         except Exception as e:
@@ -888,13 +917,16 @@ async def do_price(query: str) -> str:
                 else f"{data['min']:,} – {data['max']:,} грн".replace(",", " ")
             )
             out_lines.append(f"• {site}: {price_str}{tag}\n  🔗 {data['url']}")
-        out_lines.append(f"\n💡 Найдешевше на {cheapest}: {html_results[cheapest]['min']:,} грн".replace(",", " "))
+        out_lines.append(
+            f"\n💡 Найдешевше на {cheapest}: {html_results[cheapest]['min']:,} грн"
+            .replace(",", " ")
+        )
         if city:
             out_lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
         return "\n".join(out_lines)
 
     # ── Спроба 3: загальний пошук + посилання ────────────────────────────
-    search_results = await search_web(f"{product} купити ціна {city_str}")
+    search_results = await search_web(f'"{product}" купити ціна {city_str}')
     if not search_results:
         return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{links}"
 
@@ -902,6 +934,7 @@ async def do_price(query: str) -> str:
         f"З цих результатів знайди конкретні числові ціни на '{product}'"
         f"{' у ' + city if city else ' в Україні'}.\n"
         f"- Вказуй ТІЛЬКИ ціни що явно є в тексті, з назвою магазину і посиланням\n"
+        f"- ВАЖЛИВО: ігноруй ціни на інші моделі (наприклад RTX 4060 якщо шукаємо RTX 5090)\n"
         f"- НЕ вигадуй ціни. НЕ згадуй OLX\n"
         f"- Якщо цін немає — скажи про це і додай посилання:\n{links}\n"
         f"Відповідай українською.\n\n{search_results}"
@@ -1313,7 +1346,6 @@ async def _dispatch_intent(
             await msg.edit_text(f"{prefix}Помилка пошуку: {e}")
         return True
 
-    # Текстові інтенти через INTENT_MAP
     INTENT_MAP = {
         "translate": ("🌐 Перекладаю...",       do_translate),
         "summarize": ("📰 Опрацьовую...",        do_summarize),
@@ -1337,7 +1369,7 @@ async def _dispatch_intent(
         _set_ctx(user_id, user_text, result)
         return True
 
-    return False  # intent == "chat"
+    return False
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addressed, user_text = _is_bot_addressed(update, ctx)
