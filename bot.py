@@ -754,11 +754,19 @@ async def do_price(query: str) -> str:
         "'iPhone 16' → 'Apple iPhone 16'\n"
         "'i9 14900' → 'Intel Core i9-14900'\n"
     )
+
+    # ── Витягування товару та міста ──────────────────────────────────────────
     if "[Контекст попереднього повідомлення" in query:
+        # ВИПРАВЛЕННЯ: назва товару береться з контексту (фото/відео/текст),
+        # а місто та уточнення — із запиту користувача
         prompt = (
             f"{query}\n\n"
-            f"Витягни з контексту та запиту ТОЧНУ комерційну назву товару (бренд + модель, наприклад 'GameSir Nova 2') і місто.\n"
-            f"Якщо модель чітко вказана в контексті — використай саме її, не узагальнюй.\n"
+            f"ВАЖЛИВО: назва товару міститься В КОНТЕКСТІ (опис фото/відео/тексту), "
+            f"а НЕ в запиті користувача.\n"
+            f"Запит користувача містить лише уточнення (місто, побажання тощо).\n"
+            f"Витягни:\n"
+            f"1. product — точну назву товару З КОНТЕКСТУ (наприклад 'банан', 'iPhone 15 Pro', 'Nike Air Max')\n"
+            f"2. city — місто ІЗ ЗАПИТУ користувача (або null якщо не вказано)\n"
             f"Розшифруй скорочення:\n{aliases_hint}"
             "Відповідай ТІЛЬКИ JSON: {\"product\": \"...\", \"city\": \"...\" або null}"
         )
@@ -809,14 +817,11 @@ async def do_price(query: str) -> str:
         )
     else:
         links    = (
-            f"• https://hotline.ua/search/?q={encoded}\n"
             f"• https://rozetka.com.ua/ua/search/?text={encoded}\n"
             f"• https://comfy.ua/ua/search/?q={encoded}\n"
             f"• https://www.ktc.ua/ua/search/?q={encoded}"
         )
 
-    # Ключові слова для фільтрації нерелевантних результатів
-    # Числа та слова довжиною > 2 символи
     product_keywords = [w.lower() for w in re.split(r'[\s\-/]+', product) if len(w) > 2]
 
     def _is_relevant(title: str) -> bool:
@@ -835,7 +840,7 @@ async def do_price(query: str) -> str:
             else:
                 tavily_query = (
                     f'"{product}" ціна купити {city_str} '
-                    "site:hotline.ua OR site:rozetka.com.ua OR site:comfy.ua OR site:ktc.ua"
+                    "site:rozetka.com.ua OR site:comfy.ua OR site:ktc.ua"
                 )
             raw_results = await asyncio.to_thread(
                 lambda: TavilyClient(api_key=TAVILY_API_KEY).search(
@@ -848,16 +853,13 @@ async def do_price(query: str) -> str:
                 title   = item.get("title", "")
                 content = item.get("content", "")
                 url     = item.get("url", "")
-                domain  = next((d for d in ("hotline.ua", "price.ua", "rozetka.com.ua", "comfy.ua") if d in url), "")
+                domain  = next((d for d in ("price.ua", "rozetka.com.ua", "comfy.ua") if d in url), "")
 
-                # Пропускаємо сторінки категорій (містять змішані товари)
-                # Rozetka: /videocards/c80087/ — це категорія, не конкретний товар
                 is_category_page = bool(re.search(r'/c\d{3,}/', url))
                 if is_category_page:
                     print(f"[Price filter] Пропущено сторінку категорії: {url[:80]}")
                     continue
 
-                # Пропускаємо нерелевантні результати
                 if not _is_relevant(title) and not _is_relevant(content[:200]):
                     print(f"[Price filter] Пропущено нерелевантний: {title[:60]}")
                     continue
@@ -906,7 +908,6 @@ async def do_price(query: str) -> str:
         }
     else:
         sites = {
-            "Hotline": f"https://hotline.ua/search/?q={encoded}",
             "Rozetka": f"https://rozetka.com.ua/ua/search/?text={encoded}",
             "Comfy":   f"https://comfy.ua/ua/search/?q={encoded}",
             "KTC":     f"https://www.ktc.ua/ua/search/?q={encoded}",
@@ -919,25 +920,20 @@ async def do_price(query: str) -> str:
                 r = await client.get(url, headers=_HEADERS)
 
             if name == "Rozetka":
-                # Варіант 1: "title":"...RTX 5090...","price":NNN
                 pairs = re.findall(r'"title"\s*:\s*"([^"]{5,150})"[^}]{0,200}?"price"\s*:\s*(\d+)', r.text)
                 prices = [
                     int(p) for nm, p in pairs
                     if _is_relevant(nm) and 200 < int(p) < 1_000_000
                 ]
-                # Варіант 2: "name":"...RTX 5090...","price":NNN
                 if not prices:
                     pairs = re.findall(r'"name"\s*:\s*"([^"]{5,150})"[^}]{0,200}?"price"\s*:\s*(\d+)', r.text)
                     prices = [
                         int(p) for nm, p in pairs
                         if _is_relevant(nm) and 200 < int(p) < 1_000_000
                     ]
-                # Варіант 3: data-price або :price на сторінці з фільтрацією
                 if not prices:
-                    # Шукаємо блоки що містять назву товару поруч з ціною
                     blocks = re.findall(r'(?:' + re.escape(product_keywords[-1]) + r')[^<]{0,300}?(\d{4,7})\s*(?:грн|₴)', r.text, re.IGNORECASE)
                     prices = [int(p) for p in blocks if 200 < int(p) < 1_000_000]
-                # НЕ робимо fallback без фільтрації — краще не показати Rozetka ніж показати неправильну ціну
 
             elif name == "Comfy":
                 prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 200 < int(p) < 1_000_000]
@@ -945,13 +941,11 @@ async def do_price(query: str) -> str:
                     prices = _parse_prices(r.text)
 
             if name in ("Сільпо", "Metro", "Fozzy", "АТБ"):
-                # Продуктові магазини — ціни зазвичай в JSON або data-атрибутах
                 prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 1 < int(p) < 100_000]
                 if not prices:
                     prices = [int(p) for p in re.findall(r'"price"\s*:\s*"?(\d+\.?\d*)"?', r.text)
                               if 1 < float(p) < 100_000]
                 if not prices:
-                    # Для продуктів нижня межа менша (можуть бути товари по 10-20 грн)
                     raw = re.findall(r'[\s>](\d[\d\s\xa0]{0,5})\s*(?:грн|₴)', r.text)
                     for p in raw:
                         try:
@@ -969,16 +963,13 @@ async def do_price(query: str) -> str:
                     prices = [p for p in _parse_prices(r.text) if p >= 500]
 
             elif name == "Hotline":
-                # Hotline: ціни в data-price або у spans з класом price
                 prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 1000 < int(p) < 2_000_000]
                 if not prices:
-                    # Fallback: шукаємо ціни в JSON-LD або мета-тегах
                     prices = [int(p) for p in re.findall(r'"price"\s*:\s*"?(\d+)"?', r.text) if 1000 < int(p) < 2_000_000]
                 if not prices:
                     prices = [p for p in _parse_prices(r.text) if p >= 1000]
 
             elif name == "Price.ua":
-                # Price.ua: ціни в data-price або spans
                 prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 1000 < int(p) < 2_000_000]
                 if not prices:
                     prices = [p for p in _parse_prices(r.text) if p >= 1000]
@@ -1010,14 +1001,15 @@ async def do_price(query: str) -> str:
             out_lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
         return "\n".join(out_lines)
 
-    # ── Спроба 3: загальний пошук з фільтрацією по дозволених доменах ────
+    # ── Спроба 3: загальний пошук ─────────────────────────────────────────
     allowed_domains = (
         ["silpo.ua", "metro.ua", "fozzyshop.ua", "atbmarket.com"]
         if is_food else
-        ["hotline.ua", "rozetka.com.ua", "comfy.ua", "ktc.ua"]
+        ["silpo.ua", "metro.ua", "fozzyshop.ua", "atbmarket.com"]
+        if is_food else
+        ["rozetka.com.ua", "comfy.ua", "ktc.ua"]
     )
     search_results = await search_web(f'"{product}" купити ціна {city_str}')
-    # Фільтруємо результати — лише дозволені домени
     filtered_lines = []
     for line in search_results.splitlines():
         if not line.strip():
@@ -1045,7 +1037,6 @@ async def do_price(query: str) -> str:
         f"{search_results_filtered}"
     )}])
 
-    # Парсимо JSON від AI і форматуємо самостійно
     try:
         clean_json  = summary_raw.strip().replace("```json", "").replace("```", "").strip()
         price_items = json.loads(clean_json)
@@ -1055,11 +1046,10 @@ async def do_price(query: str) -> str:
         price_items = []
 
     if price_items:
-        # Дедуплікація за URL
         seen_urls: set[str] = set()
         unique_items = []
         for item in price_items:
-            u = item.get("url", "").split("?")[0]  # ігноруємо query-параметри при порівнянні
+            u = item.get("url", "").split("?")[0]
             if u not in seen_urls:
                 seen_urls.add(u)
                 unique_items.append(item)
@@ -1077,7 +1067,6 @@ async def do_price(query: str) -> str:
             lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
         return "\n".join(lines)
 
-    # AI не знайшов цін — повертаємо посилання для пошуку
     return (
         f"💰 Ціни на: {product}\n\n"
         f"Не вдалось знайти конкретні ціни автоматично.\n"
