@@ -825,124 +825,123 @@ async def do_price(query: str) -> str:
         )
         return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{food_links}"
 
-    # ── Техніка: основний парсер — Hotline ───────────────────────────────
-    # URL з сортуванням за зростанням ціни (?order=1)
+    # ── Техніка: Tavily → Hotline (спроба 1) ───────────────────────────
     hotline_url = f"https://hotline.ua/search/?q={encoded}&order=1"
-    hotline_items: list[dict] = []
+    tech_items: list[dict] = []
+    product_keywords = [w.lower() for w in re.split(r'[\s\-/]+', product) if len(w) > 2]
 
-    _HOTLINE_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://hotline.ua/",
-    }
+    def _relevant(title: str) -> bool:
+        t = title.lower()
+        return sum(1 for kw in product_keywords if kw in t) >= max(1, len(product_keywords) // 2)
 
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            r = await client.get(hotline_url, headers=_HOTLINE_HEADERS)
-        html = r.text
-
-        # Парсимо блоки товарів — шукаємо пари (назва, ціна, посилання)
-        # Hotline структура: клас "item-title" або "product-name" + "price-value"
-        # Спроба 1: JSON-LD або structured data
-        json_blocks = re.findall(r'"name"\s*:\s*"([^"]{5,200})"[^{}]{0,300}?"price"\s*:\s*"?(\d+)"?[^{}]{0,200}?"url"\s*:\s*"([^"]+)"', html)
-        for name_txt, price_txt, url_txt in json_blocks:
-            try:
-                price_val = int(price_txt)
-                if 200 < price_val < 2_000_000 and "hotline.ua" in url_txt:
-                    hotline_items.append({
-                        "title": name_txt.strip()[:80],
-                        "price": price_val,
-                        "url":   url_txt if url_txt.startswith("http") else f"https://hotline.ua{url_txt}",
+    # Спроба 1: Tavily — вміє рендерити JS-сторінки
+    if TAVILY_API_KEY:
+        try:
+            tavily_query = f'"{product}" ціна купити site:hotline.ua'
+            raw_results = await asyncio.to_thread(
+                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(
+                    query=tavily_query, max_results=10, search_depth="advanced"
+                )
+            )
+            for item in _filter_results(raw_results.get("results", [])):
+                url_t  = item.get("url", "")
+                title  = item.get("title", "")
+                cont   = item.get("content", "")
+                if "hotline.ua" not in url_t:
+                    continue
+                if re.search(r'/c\d{3,}/', url_t):
+                    continue
+                if not _relevant(title) and not _relevant(cont[:300]):
+                    continue
+                prices = _parse_prices(cont + " " + title)
+                if prices:
+                    tech_items.append({
+                        "title": title.strip()[:80],
+                        "price": min(prices),
+                        "url":   url_t,
+                        "shop":  "Hotline",
                     })
-            except ValueError:
-                pass
+            print(f"[Tavily Hotline] знайдено: {len(tech_items)}")
+        except Exception as e:
+            print(f"[Tavily Hotline error]: {e}")
 
-        # Спроба 2: data-атрибути
-        if not hotline_items:
-            data_blocks = re.findall(
-                r'data-name=["\']([^"\']{5,150})["\'][^>]*data-price=["\'](\d+)["\']',
+    # Спроба 2: прямий GET Hotline (для серверного рендерингу / мобільної версії)
+    if not tech_items:
+        try:
+            _HL_HEADERS = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+                "Accept-Language": "uk-UA,uk;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://hotline.ua/",
+            }
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                r = await client.get(hotline_url, headers=_HL_HEADERS)
+            html = r.text
+
+            # JSON-LD structured data
+            blocks = re.findall(
+                r'"name"\s*:\s*"([^"]{5,200})"[^{}]{0,400}?"price"\s*:\s*"?(\d+)"?[^{}]{0,200}?"url"\s*:\s*"([^"]+)"',
                 html
             )
-            for name_txt, price_txt in data_blocks:
+            for name_t, price_t, url_t in blocks:
                 try:
-                    price_val = int(price_txt)
-                    if 200 < price_val < 2_000_000:
-                        hotline_items.append({
-                            "title": name_txt.strip()[:80],
-                            "price": price_val,
-                            "url":   hotline_url,
+                    pv = int(price_t)
+                    if 200 < pv < 2_000_000 and _relevant(name_t):
+                        tech_items.append({
+                            "title": name_t.strip()[:80],
+                            "price": pv,
+                            "url": url_t if url_t.startswith("http") else f"https://hotline.ua{url_t}",
+                            "shop": "Hotline",
                         })
                 except ValueError:
                     pass
 
-        # Спроба 3: витягуємо href + ціну поруч у HTML-блоці
-        if not hotline_items:
-            # Шукаємо посилання на сторінки товарів з hotline.ua
-            product_links = re.findall(
-                r'href="(/[a-z]{2}/[^"]{10,150})"[^>]*>([^<]{5,150})</a>',
-                html
-            )
-            price_raw = re.findall(r'(\d[\d\s]{2,8})\s*(?:грн|₴)', html)
-            prices_clean = []
-            for p in price_raw:
-                try:
-                    val = int(re.sub(r'\s', '', p))
-                    if 200 < val < 2_000_000:
-                        prices_clean.append(val)
-                except ValueError:
-                    pass
+            # data-атрибути
+            if not tech_items:
+                for m in re.finditer(
+                    r'data-(?:name|title)=["\']([^"\']{5,150})["\'][^>]{0,200}?data-price=["\'](\d+)["\']',
+                    html
+                ):
+                    try:
+                        pv = int(m.group(2))
+                        if 200 < pv < 2_000_000 and _relevant(m.group(1)):
+                            tech_items.append({
+                                "title": m.group(1).strip()[:80],
+                                "price": pv,
+                                "url": hotline_url,
+                                "shop": "Hotline",
+                            })
+                    except ValueError:
+                        pass
+            print(f"[Hotline GET] знайдено: {len(tech_items)}")
+        except Exception as e:
+            print(f"[Hotline GET error]: {e}")
 
-            for i, (href, title) in enumerate(product_links[:15]):
-                if i < len(prices_clean):
-                    hotline_items.append({
-                        "title": title.strip()[:80],
-                        "price": prices_clean[i],
-                        "url":   f"https://hotline.ua{href}",
-                    })
-
-        # Фільтруємо нерелевантні та сортуємо за ціною
-        product_keywords = [w.lower() for w in re.split(r'[\s\-/]+', product) if len(w) > 2]
-
-        def _relevant(title: str) -> bool:
-            t = title.lower()
-            return sum(1 for kw in product_keywords if kw in t) >= max(1, len(product_keywords) // 2)
-
-        hotline_items = [i for i in hotline_items if _relevant(i["title"])]
-
-        # Дедуплікація по URL
+    # Якщо Hotline дав результати — виводимо топ-10
+    if tech_items:
         seen_urls: set[str] = set()
-        unique_items: list[dict] = []
-        for item in hotline_items:
-            key = item["url"].split("?")[0]
+        unique: list[dict] = []
+        for it in tech_items:
+            key = it["url"].split("?")[0]
             if key not in seen_urls:
                 seen_urls.add(key)
-                unique_items.append(item)
+                unique.append(it)
+        unique.sort(key=lambda x: x["price"])
+        top10 = unique[:10]
 
-        unique_items.sort(key=lambda x: x["price"])
-        top10 = unique_items[:10]
-
-        if top10:
-            lines = [
-                f"💰 Ціни на: {product}{city_note}",
-                f"📊 Джерело: hotline.ua (сортування: ціна ↑)\n",
-            ]
-            for i, item in enumerate(top10, 1):
-                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-                price_str = f"{item['price']:,} грн".replace(",", " ")
-                lines.append(f"{medal} {price_str} — {item['title']}\n   🔗 {item['url']}")
-            lines.append(
-                f"\n💡 Найдешевше: {top10[0]['price']:,} грн"
-                .replace(",", " ")
-            )
-            if city:
-                lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
-            lines.append(f"\n🔍 Всі результати: {hotline_url}")
-            return "\n".join(lines)
-
-    except Exception as e:
-        print(f"[Hotline error]: {e}")
+        lines = [
+            f"💰 Ціни на: {product}{city_note}",
+            f"📊 Джерело: hotline.ua (сортування: ціна ↑)\n",
+        ]
+        for i, it in enumerate(top10, 1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            lines.append(f"{medal} {it['price']:,} грн — {it['title']}\n   🔗 {it['url']}".replace(",", " "))
+        lines.append(f"\n💡 Найдешевше: {top10[0]['price']:,} грн".replace(",", " "))
+        if city:
+            lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
+        lines.append(f"\n🔍 Всі результати: {hotline_url}")
+        return "\n".join(lines)
 
     # ── Fallback: Rozetka / Comfy / KTC ──────────────────────────────────
     print("[Price] Hotline не дав результатів, перехід на fallback")
@@ -952,7 +951,6 @@ async def do_price(query: str) -> str:
         "KTC":     f"https://www.ktc.ua/ua/search/?q={encoded}",
     }
     fallback_results: dict[str, dict] = {}
-    product_keywords = [w.lower() for w in re.split(r'[\s\-/]+', product) if len(w) > 2]
 
     def _is_relevant(title: str) -> bool:
         t = title.lower()
