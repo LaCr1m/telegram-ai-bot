@@ -139,9 +139,7 @@ TASK_KEYWORDS = [
 # ── Стан ─────────────────────────────────────────────────────────────────────
 chat_histories:     dict[int, list] = {}
 user_personalities: dict[int, str]  = {}
-# Короткочасна пам'ять: останній контекст (фото/відео/документ) для кожного юзера
-last_context:       dict[int, dict] = {}  # {user_id: {"type": "photo"|"video"|"doc", "description": "..."}}
-tavily_client  = TavilyClient(api_key=TAVILY_API_KEY)
+last_context:       dict[int, dict] = {}
 or_requests    = {"count": 0, "date": date.today()}
 OR_DAILY_LIMIT = 190
 
@@ -241,7 +239,6 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args    = ctx.args
 
     if not args:
-        # Показати список
         tasks = get_user_tasks(user_id)
         if not tasks:
             await update.message.reply_text("📋 Список задач порожній.\n\nДодати: /tasks add Назва задачі")
@@ -306,16 +303,16 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def detect_intent_local(text: str) -> str | None:
     t = text.lower()
-    if any(kw in t for kw in IMAGE_KEYWORDS):    return "image"
-    if any(kw in t for kw in REMIND_KEYWORDS):   return "reminder"
-    if any(kw in t for kw in NEWS_KEYWORDS):     return "news"
-    if any(kw in t for kw in TRANSLATE_KEYWORDS):return "translate"
-    if any(kw in t for kw in RECIPE_KEYWORDS):   return "recipe"
-    if any(kw in t for kw in GENERATE_KEYWORDS): return "generate"
-    if any(kw in t for kw in TASK_KEYWORDS):     return "task"
-    if any(kw in t for kw in SUMMARIZE_KEYWORDS):return "summarize"
-    if any(kw in t for kw in SEARCH_KEYWORDS):   return "search"
-    if re.search(r'https?://\S+', text):         return "summarize"
+    if any(kw in t for kw in IMAGE_KEYWORDS):     return "image"
+    if any(kw in t for kw in REMIND_KEYWORDS):    return "reminder"
+    if any(kw in t for kw in NEWS_KEYWORDS):      return "news"
+    if any(kw in t for kw in TRANSLATE_KEYWORDS): return "translate"
+    if any(kw in t for kw in RECIPE_KEYWORDS):    return "recipe"
+    if any(kw in t for kw in GENERATE_KEYWORDS):  return "generate"
+    if any(kw in t for kw in TASK_KEYWORDS):      return "task"
+    if any(kw in t for kw in SUMMARIZE_KEYWORDS): return "summarize"
+    if any(kw in t for kw in SEARCH_KEYWORDS):    return "search"
+    if re.search(r'https?://\S+', text):          return "summarize"
     return None
 
 async def resolve_text_with_context(user_id: int, text: str) -> str:
@@ -324,15 +321,16 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
     if not ctx:
         return text
 
-    t = text.lower().strip()
+    t     = text.lower().strip()
     words = t.split()
 
-    # 1. Однозначно НЕ контекст — довге самодостатнє повідомлення без натяків
-    no_context_hints = ["розкажи про", "що таке ", "поясни ", "напиши про", "хто такий"]
-    if len(words) > 12 and not any(h in t for h in no_context_hints):
-        return text
+    # Однозначно НЕ контекст — довге самодостатнє повідомлення
+    if len(words) > 12:
+        no_context_hints = ["розкажи про", "що таке ", "поясни ", "напиши про", "хто такий"]
+        if not any(h in t for h in no_context_hints):
+            return text
 
-    # 2. Швидка локальна перевірка — очевидні тригери
+    # Очевидні тригери — одразу додаємо контекст
     strong_hints = [
         "це", "цей", "цю", "цього", "на фото", "з фото", "на зображенні",
         "де купити", "де придбати", "де замовити", "скільки коштує",
@@ -347,7 +345,7 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
             f"Запит користувача: {text}"
         )
 
-    # 3. Сірa зона (10-12 слів, без очевидних тригерів) — питаємо AI
+    # Сіра зона — питаємо AI
     try:
         check = await call_ai([{"role": "user", "content": (
             f"Контекст: {ctx['type']} — «{ctx['description'][:200]}»\n"
@@ -363,19 +361,6 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
         pass
 
     return text
-    t = text.lower()
-    if any(kw in t for kw in IMAGE_KEYWORDS):    return "image"
-    if any(kw in t for kw in REMIND_KEYWORDS):   return "reminder"
-    if any(kw in t for kw in NEWS_KEYWORDS):     return "news"
-    if any(kw in t for kw in TRANSLATE_KEYWORDS):return "translate"
-    if any(kw in t for kw in RECIPE_KEYWORDS):   return "recipe"
-    if any(kw in t for kw in GENERATE_KEYWORDS): return "generate"
-    if any(kw in t for kw in TASK_KEYWORDS):     return "task"
-    if any(kw in t for kw in SUMMARIZE_KEYWORDS):return "summarize"
-    if any(kw in t for kw in SEARCH_KEYWORDS):   return "search"
-    # Посилання — одразу підсумовуємо
-    if re.search(r'https?://\S+', text):         return "summarize"
-    return None
 
 async def detect_intent_ai(text: str) -> str:
     result = await call_ai([{"role": "user", "content": (
@@ -407,11 +392,11 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r'__(.*?)__',     r'\1', text)
     text = re.sub(r'_(.*?)_',       r'\1', text)
     text = re.sub(r'`(.*?)`',       r'\1', text)
-    # Конвертуємо markdown посилання [текст](url) → просто url
     text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1: \2', text)
     return text
 
 def get_history(user_id: int) -> list:
+    """Повертає історію, ініціалізуючи якщо потрібно."""
     if user_id not in chat_histories:
         chat_histories[user_id] = [get_system_prompt(user_id)]
     return chat_histories[user_id]
@@ -465,13 +450,16 @@ async def call_vision(messages: list) -> str:
         r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
-async def transcribe_voice(audio_bytes: bytes) -> str:
+async def transcribe_voice(audio_bytes: bytes, response_format: str = "text") -> str:
+    """FIX: параметр response_format дозволяє отримати verbose_json без дублювання запиту."""
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     files   = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
-    data    = {"model": "whisper-large-v3", "language": "uk", "response_format": "text"}
+    data    = {"model": "whisper-large-v3", "language": "uk", "response_format": response_format}
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(GROQ_WHISPER_URL, headers=headers, files=files, data=data)
         r.raise_for_status()
+    if response_format == "verbose_json":
+        return r.json().get("text", "").strip()
     return r.text.strip()
 
 
@@ -570,7 +558,6 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 async def search_web(query: str) -> str:
-    # Спроба 1: Tavily
     if TAVILY_API_KEY:
         try:
             results = await asyncio.to_thread(
@@ -584,7 +571,6 @@ async def search_web(query: str) -> str:
         except Exception as e:
             print(f"[Tavily error]: {e}")
 
-    # Спроба 2: DuckDuckGo HTML (надійніший ніж JSON API)
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.get(
@@ -592,7 +578,6 @@ async def search_web(query: str) -> str:
                 params={"q": query},
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             )
-        # Витягуємо результати з HTML
         snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', r.text, re.DOTALL)
         links    = re.findall(r'class="result__url"[^>]*>(.*?)</span>', r.text, re.DOTALL)
         titles   = re.findall(r'class="result__a"[^>]*>(.*?)</a>', r.text, re.DOTALL)
@@ -612,12 +597,10 @@ async def search_web(query: str) -> str:
     return ""
 
 async def fetch_url_text(url: str) -> str:
-    """Завантажує текст сторінки за посиланням."""
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             r.raise_for_status()
-        # Прибираємо HTML теги
         text = re.sub(r'<[^>]+>', ' ', r.text)
         text = re.sub(r'\s+', ' ', text).strip()
         return text[:6000]
@@ -663,7 +646,7 @@ def extract_word_text(docx_bytes: bytes) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Нові функції: переклад, підсумок, генерація, рецепт
+# Функції обробки
 # ════════════════════════════════════════════════════════════════════════════
 
 async def do_translate(text: str) -> str:
@@ -677,7 +660,6 @@ async def do_translate(text: str) -> str:
     return reply
 
 async def do_summarize(text: str) -> str:
-    # Перевіряємо чи є посилання
     url_match = re.search(r'https?://\S+', text)
     if url_match:
         url      = url_match.group()
@@ -700,7 +682,7 @@ async def do_summarize(text: str) -> str:
     return await call_ai([{"role": "user", "content": prompt}])
 
 async def do_generate(text: str) -> str:
-    reply = await call_ai([
+    return await call_ai([
         SYSTEM_PROMPT,
         {"role": "user", "content": (
             f"Виконай це завдання з генерації тексту: {text}\n\n"
@@ -710,19 +692,16 @@ async def do_generate(text: str) -> str:
             "Якщо пост — зроби його живим і залучальним."
         )}
     ])
-    return reply
 
 async def do_recipe(text: str) -> str:
-    reply = await call_ai([{"role": "user", "content": (
+    return await call_ai([{"role": "user", "content": (
         f"Користувач має такі інгредієнти або продукти: {text}\n\n"
         "Запропонуй 2-3 рецепти які можна приготувати. "
         "Для кожного рецепту вкажи: назву, час приготування, короткий список кроків. "
         "Відповідай українською мовою. Будь практичним і конкретним."
     )}])
-    return reply
 
 async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
-    """Обробка задач через природну мову."""
     parsed = await call_ai([{"role": "user", "content": (
         f"З цього повідомлення визнач дію зі списком задач: '{text}'\n"
         "Відповідай ТІЛЬКИ у форматі JSON:\n"
@@ -763,15 +742,15 @@ async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
     except Exception:
         await update.message.reply_text("❌ Не вдалось обробити задачу. Спробуй /tasks")
 
-
 async def do_news(query: str) -> str:
-    """Отримує новини за темою через NewsAPI і підсумовує їх."""
+    # Беремо лише чистий запит (без контексту попереднього повідомлення)
+    clean_query = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
+
     if not NEWS_API_KEY:
         return "❌ NEWS_API_KEY не налаштовано."
     try:
-        # Перекладаємо запит на англійську для кращих результатів
         query_en = await call_ai([{"role": "user", "content":
-            f"Translate this news topic to English, return ONLY translation: {query}"}])
+            f"Translate this news topic to English, return ONLY translation: {clean_query}"}])
         url    = "https://newsapi.org/v2/everything"
         params = {
             "q":        query_en.strip(),
@@ -785,7 +764,6 @@ async def do_news(query: str) -> str:
             r.raise_for_status()
         articles = r.json().get("articles", [])
 
-        # Якщо українських немає — беремо англійські
         if not articles:
             params["language"] = "en"
             async with httpx.AsyncClient(timeout=15) as client:
@@ -794,9 +772,9 @@ async def do_news(query: str) -> str:
             articles = r.json().get("articles", [])
 
         if not articles:
-            return f"📰 Новин за темою «{query}» не знайдено."
+            return f"📰 Новин за темою «{clean_query}» не знайдено."
 
-        lines = [f"📰 Новини за темою: {query}\n"]
+        lines = [f"📰 Новини за темою: {clean_query}\n"]
         sources_text = ""
         for i, a in enumerate(articles[:5], 1):
             title       = a.get("title", "Без назви")
@@ -807,9 +785,8 @@ async def do_news(query: str) -> str:
             sources_text += f"{title}. {description}\n"
             lines.append(f"{i}. {title}\n   📅 {published} | {source}\n   🔗 {url_a}\n")
 
-        # AI підсумок
         summary = await call_ai([{"role": "user", "content": (
-            f"Ось заголовки новин за темою '{query}':\n{sources_text}\n\n"
+            f"Ось заголовки новин за темою '{clean_query}':\n{sources_text}\n\n"
             "Зроби короткий підсумок (2-3 речення) що відбувається. Відповідай українською."
         )}])
         lines.insert(1, f"💡 {summary}\n")
@@ -851,6 +828,7 @@ async def schedule_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> 
     asyncio.create_task(_run())
 
 async def restore_reminders(bot) -> None:
+    """FIX: delay обчислюється всередині замикання, щоб уникнути race condition."""
     reminders  = load_reminders()
     now, valid = datetime.now(), []
     for r in reminders:
@@ -862,8 +840,9 @@ async def restore_reminders(bot) -> None:
             )
         else:
             valid.append(r)
-            delay = (fire_at - now).total_seconds()
             async def _run(chat_id=r["chat_id"], text=r["text"], fi=fire_at):
+                # FIX: delay обчислюється тут, а не в зовнішньому scope
+                delay = max(0, (fi - datetime.now()).total_seconds())
                 await asyncio.sleep(delay)
                 await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
                 save_reminders([x for x in load_reminders() if not (
@@ -877,17 +856,11 @@ async def restore_reminders(bot) -> None:
 # Визначення статі за голосом
 # ════════════════════════════════════════════════════════════════════════════
 
-async def detect_gender_from_voice(audio_bytes: bytes) -> str | None:
+async def detect_gender_from_transcript(transcript_text: str) -> str | None:
+    """FIX: приймає вже готову транскрипцію замість повторного виклику Whisper."""
+    if not transcript_text:
+        return None
     try:
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-        files   = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
-        data    = {"model": "whisper-large-v3", "language": "uk", "response_format": "verbose_json"}
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(GROQ_WHISPER_URL, headers=headers, files=files, data=data)
-            r.raise_for_status()
-        transcript_text = r.json().get("text", "")
-        if not transcript_text:
-            return None
         result = await call_ai([{"role": "user", "content": (
             f"На основі тексту голосового повідомлення визнач стать мовця.\n"
             f"Текст: '{transcript_text}'\n"
@@ -1143,7 +1116,6 @@ async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     provider  = get_text_provider()
     remaining = max(0, OR_DAILY_LIMIT - or_requests["count"])
 
-    # Перевіряємо Tavily
     tavily_status = "❌ Не налаштовано"
     if TAVILY_API_KEY:
         try:
@@ -1189,9 +1161,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addressed, user_text = _is_bot_addressed(update, ctx)
     if not addressed:
         return
-    user_id  = update.message.from_user.id
+    user_id = update.message.from_user.id
 
-    # Показуємо що бот друкує поки обробляє
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
@@ -1250,7 +1221,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if intent == "search":
         msg = await update.message.reply_text("🌐 Шукаю в інтернеті...")
-        # Формуємо пошуковий запит: якщо є контекст — просимо AI скласти короткий запит
         try:
             if "[Контекст попереднього повідомлення" in enriched:
                 search_query = await call_ai([{"role": "user", "content": (
@@ -1286,7 +1256,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Звичайна відповідь
     try:
         append_and_trim(user_id, "user", enriched)
-        reply = await call_ai(chat_histories[user_id])
+        reply = await call_ai(get_history(user_id))
         append_and_trim(user_id, "assistant", reply)
         await update.message.reply_text(clean_markdown(reply))
         asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
@@ -1308,7 +1278,6 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 {"type": "text", "text": caption}
             ]}
         ])
-        # Зберігаємо контекст ДО відповіді
         last_context[user_id] = {"type": "фото", "description": reply[:500]}
         append_and_trim(user_id, "user", f"[Фото] {caption}")
         append_and_trim(user_id, "assistant", reply)
@@ -1318,16 +1287,17 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🎬 Аналізую відео (аудіо + кадри)...")
+    user_id = update.message.from_user.id
     try:
+        # FIX: video_note не має caption, тому беремо його тільки з video
         video   = update.message.video or update.message.video_note
-        caption = update.message.caption or "Що відбувається у цьому відео? Опиши детально."
+        caption = (update.message.caption if update.message.video else None) \
+                  or "Що відбувається у цьому відео? Опиши детально."
         if video.file_size > 20 * 1024 * 1024:
             await msg.edit_text("❌ Відео занадто велике. Максимум 20MB.")
             return
         video_bytes = bytes(await (await ctx.bot.get_file(video.file_id)).download_as_bytearray())
         result      = await analyze_video(video_bytes, caption)
-        # Зберігаємо опис відео як контекст
-        user_id = update.message.from_user.id
         last_context[user_id] = {"type": "відео", "description": result[:500]}
         append_and_trim(user_id, "user", f"[Відео] {caption}")
         append_and_trim(user_id, "assistant", result)
@@ -1359,10 +1329,10 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ {text}")
             return
         text_preview = text[:4000] + ("..." if len(text) > 4000 else "")
+        # FIX: використовуємо get_history для гарантованої ініціалізації
         append_and_trim(user_id, "user", f"{caption}\n\nВміст документу:\n{text_preview}")
-        reply = await call_ai(chat_histories[user_id])
+        reply = await call_ai(get_history(user_id))
         append_and_trim(user_id, "assistant", reply)
-        # Зберігаємо опис документу як контекст
         last_context[user_id] = {"type": "документ", "description": reply[:500]}
         await msg.edit_text(f"📄 {doc.file_name}\n\n{clean_markdown(reply)}")
     except Exception as e:
@@ -1373,16 +1343,17 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         file        = await ctx.bot.get_file(update.message.voice.file_id)
         audio_bytes = bytes(await file.download_as_bytearray())
-        text        = await transcribe_voice(audio_bytes)
+        # FIX: один виклик Whisper замість двох
+        text = await transcribe_voice(audio_bytes)
         if not text:
             await msg.edit_text("Не вдалось розпізнати мову 😔")
             return
         await msg.edit_text(f"🎤 Ти сказав: {text}\n\n⏳ Обробляю...")
         user_id = update.message.from_user.id
 
-        # Визначаємо стать якщо ще не відомо
+        # Визначаємо стать на основі вже готової транскрипції (без повторного виклику Whisper)
         if get_gender(user_id) is None:
-            gender = await detect_gender_from_voice(audio_bytes)
+            gender = await detect_gender_from_transcript(text)
             if gender:
                 update_user_memory(user_id, {"gender": gender})
                 if user_id in chat_histories and chat_histories[user_id]:
@@ -1419,7 +1390,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         append_and_trim(user_id, "user", text)
-        reply = await call_ai(chat_histories[user_id])
+        reply = await call_ai(get_history(user_id))
         append_and_trim(user_id, "assistant", reply)
         await msg.edit_text(f"🎤 Ти сказав: {text}\n\n{clean_markdown(reply)}")
     except Exception as e:
