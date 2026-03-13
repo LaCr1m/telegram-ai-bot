@@ -880,15 +880,25 @@ async def do_price(query: str) -> str:
                 r = await client.get(url, headers=_HEADERS)
 
             if name == "Rozetka":
-                # Витягуємо пари name+price і фільтруємо за релевантністю
-                pairs  = re.findall(r'"name"\s*:\s*"([^"]{5,120})"\s*,\s*"price"\s*:\s*(\d+)', r.text)
+                # Варіант 1: "title":"...RTX 5090...","price":NNN
+                pairs = re.findall(r'"title"\s*:\s*"([^"]{5,150})"[^}]{0,200}?"price"\s*:\s*(\d+)', r.text)
                 prices = [
                     int(p) for nm, p in pairs
                     if _is_relevant(nm) and 200 < int(p) < 1_000_000
                 ]
-                # fallback — всі ціни якщо жодної релевантної не знайдено
+                # Варіант 2: "name":"...RTX 5090...","price":NNN
                 if not prices:
-                    prices = [int(p) for p in re.findall(r'"price":(\d+)', r.text) if 200 < int(p) < 1_000_000]
+                    pairs = re.findall(r'"name"\s*:\s*"([^"]{5,150})"[^}]{0,200}?"price"\s*:\s*(\d+)', r.text)
+                    prices = [
+                        int(p) for nm, p in pairs
+                        if _is_relevant(nm) and 200 < int(p) < 1_000_000
+                    ]
+                # Варіант 3: data-price або :price на сторінці з фільтрацією
+                if not prices:
+                    # Шукаємо блоки що містять назву товару поруч з ціною
+                    blocks = re.findall(r'(?:' + re.escape(product_keywords[-1]) + r')[^<]{0,300}?(\d{4,7})\s*(?:грн|₴)', r.text, re.IGNORECASE)
+                    prices = [int(p) for p in blocks if 200 < int(p) < 1_000_000]
+                # НЕ робимо fallback без фільтрації — краще не показати Rozetka ніж показати неправильну ціну
 
             elif name == "Comfy":
                 prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 200 < int(p) < 1_000_000]
