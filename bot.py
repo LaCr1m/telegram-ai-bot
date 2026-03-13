@@ -137,6 +137,8 @@ TASK_KEYWORDS = [
 # ── Стан ─────────────────────────────────────────────────────────────────────
 chat_histories:     dict[int, list] = {}
 user_personalities: dict[int, str]  = {}
+# Короткочасна пам'ять: останній контекст (фото/відео/документ) для кожного юзера
+last_context:       dict[int, dict] = {}  # {user_id: {"type": "photo"|"video"|"doc", "description": "..."}}
 tavily_client  = TavilyClient(api_key=TAVILY_API_KEY)
 or_requests    = {"count": 0, "date": date.today()}
 OR_DAILY_LIMIT = 190
@@ -300,7 +302,26 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Утиліти
 # ════════════════════════════════════════════════════════════════════════════
 
-def detect_intent_local(text: str) -> str | None:
+def resolve_text_with_context(user_id: int, text: str) -> str:
+    """Якщо є збережений контекст і текст схожий на продовження — підставляємо його."""
+    ctx = last_context.get(user_id)
+    if not ctx:
+        return text
+    # Ключові слова що натякають на попередній контекст
+    context_hints = [
+        "це", "цей", "цю", "цього", "той", "те", "таке", "тут", "тут є",
+        "на фото", "на зображенні", "на картинці", "з фото", "з картинки",
+        "у відео", "з відео", "цей товар", "ця річ", "цей продукт",
+        "знайди", "пошукай", "скільки коштує", "де купити", "що це таке",
+        "розкажи більше", "що про це", "докладніше", "ще про це"
+    ]
+    t = text.lower()
+    if any(hint in t for hint in context_hints):
+        return (
+            f"[Контекст попереднього повідомлення — {ctx['type']}: {ctx['description']}]\n\n"
+            f"Запит користувача: {text}"
+        )
+    return text
     t = text.lower()
     if any(kw in t for kw in IMAGE_KEYWORDS):    return "image"
     if any(kw in t for kw in REMIND_KEYWORDS):   return "reminder"
@@ -1078,17 +1099,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addressed, user_text = _is_bot_addressed(update, ctx)
     if not addressed:
         return
-    user_id = update.message.from_user.id
-    intent  = await detect_intent(user_text)
+    user_id  = update.message.from_user.id
+    # Підставляємо контекст якщо є логічний зв'язок з попереднім повідомленням
+    enriched = resolve_text_with_context(user_id, user_text)
+    intent   = await detect_intent(enriched)
 
     if intent == "image":
         msg = await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
-        await do_generate_image(update, user_text, msg)
+        await do_generate_image(update, enriched, msg)
         return
 
     if intent == "reminder":
         try:
-            delay_min, remind_text = await do_reminder(update, ctx, user_text)
+            delay_min, remind_text = await do_reminder(update, ctx, enriched)
             await update.message.reply_text(f"✅ Нагадаю через {delay_min} хв: {remind_text}")
         except Exception as e:
             await update.message.reply_text(f"Не вдалось встановити нагадування: {e}")
@@ -1096,45 +1119,45 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if intent == "translate":
         msg    = await update.message.reply_text("🌐 Перекладаю...")
-        result = await do_translate(user_text)
+        result = await do_translate(enriched)
         await msg.edit_text(clean_markdown(result))
         return
 
     if intent == "summarize":
         msg    = await update.message.reply_text("📰 Опрацьовую...")
-        result = await do_summarize(user_text)
+        result = await do_summarize(enriched)
         await msg.edit_text(clean_markdown(result))
         return
 
     if intent == "generate":
         msg    = await update.message.reply_text("✍️ Генерую текст...")
-        result = await do_generate(user_text)
+        result = await do_generate(enriched)
         await msg.edit_text(clean_markdown(result))
         return
 
     if intent == "recipe":
         msg    = await update.message.reply_text("🍳 Шукаю рецепти...")
-        result = await do_recipe(user_text)
+        result = await do_recipe(enriched)
         await msg.edit_text(clean_markdown(result))
         return
 
     if intent == "task":
-        await do_task_nlp(update, user_id, user_text)
+        await do_task_nlp(update, user_id, enriched)
         return
 
     if intent == "news":
         msg    = await update.message.reply_text("📰 Шукаю новини...")
-        result = await do_news(user_text)
+        result = await do_news(enriched)
         await msg.edit_text(clean_markdown(result), disable_web_page_preview=True)
         return
 
     if intent == "search":
         msg     = await update.message.reply_text("🌐 Шукаю в інтернеті...")
-        results = await search_web(user_text)
+        results = await search_web(enriched)
         try:
             reply = await call_ai([
                 SYSTEM_PROMPT,
-                {"role": "user", "content": f"Запит: '{user_text}'\n\nРезультати:\n{results}\n\nДай корисну відповідь українською."}
+                {"role": "user", "content": f"Запит: '{enriched}'\n\nРезультати:\n{results}\n\nДай корисну відповідь українською."}
             ])
             append_and_trim(user_id, "user", user_text)
             append_and_trim(user_id, "assistant", reply)
@@ -1144,7 +1167,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # Звичайна відповідь
-    append_and_trim(user_id, "user", user_text)
+    append_and_trim(user_id, "user", enriched)
     try:
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
@@ -1167,6 +1190,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 {"type": "text", "text": caption}
             ]}
         ])
+        # Зберігаємо опис фото як контекст
+        user_id = update.message.from_user.id
+        last_context[user_id] = {"type": "фото", "description": reply[:500]}
+        append_and_trim(user_id, "user", f"[Фото] {caption}")
+        append_and_trim(user_id, "assistant", reply)
         await msg.edit_text(clean_markdown(reply))
     except Exception as e:
         await msg.edit_text(f"Помилка при аналізі зображення: {e}")
@@ -1181,6 +1209,11 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         video_bytes = bytes(await (await ctx.bot.get_file(video.file_id)).download_as_bytearray())
         result      = await analyze_video(video_bytes, caption)
+        # Зберігаємо опис відео як контекст
+        user_id = update.message.from_user.id
+        last_context[user_id] = {"type": "відео", "description": result[:500]}
+        append_and_trim(user_id, "user", f"[Відео] {caption}")
+        append_and_trim(user_id, "assistant", result)
         await msg.edit_text(clean_markdown(result))
     except Exception as e:
         await msg.edit_text(f"Помилка при аналізі відео: {e}")
@@ -1212,6 +1245,8 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         append_and_trim(user_id, "user", f"{caption}\n\nВміст документу:\n{text_preview}")
         reply = await call_ai(chat_histories[user_id])
         append_and_trim(user_id, "assistant", reply)
+        # Зберігаємо опис документу як контекст
+        last_context[user_id] = {"type": "документ", "description": reply[:500]}
         await msg.edit_text(f"📄 {doc.file_name}\n\n{clean_markdown(reply)}")
     except Exception as e:
         await msg.edit_text(f"Помилка при обробці документу: {e}")
