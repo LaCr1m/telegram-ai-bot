@@ -571,38 +571,43 @@ async def search_web(query: str) -> str:
     # Спроба 1: Tavily
     if TAVILY_API_KEY:
         try:
-            results = await asyncio.to_thread(tavily_client.search, query=query, max_results=3)
-            output  = ""
+            results = await asyncio.to_thread(
+                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query=query, max_results=5)
+            )
+            output = ""
             for item in results.get("results", []):
-                output += f"{item['title']}\n{item['content'][:300]}\n{item['url']}\n\n"
+                output += f"{item['title']}\n{item['content'][:400]}\n{item['url']}\n\n"
             if output:
                 return output
         except Exception as e:
-            pass  # Переходимо до fallback
+            print(f"[Tavily error]: {e}")
 
-    # Спроба 2: DuckDuckGo через httpx (без API ключа)
+    # Спроба 2: DuckDuckGo HTML (надійніший ніж JSON API)
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.get(
-                "https://api.duckduckgo.com/",
-                params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
-                headers={"User-Agent": "Mozilla/5.0"}
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             )
-            data    = r.json()
-            output  = ""
-            # AbstractText
-            if data.get("AbstractText"):
-                output += f"{data['AbstractText']}\n{data.get('AbstractURL','')}\n\n"
-            # RelatedTopics
-            for topic in data.get("RelatedTopics", [])[:3]:
-                if isinstance(topic, dict) and topic.get("Text"):
-                    output += f"{topic['Text']}\n{topic.get('FirstURL','')}\n\n"
-            if output:
-                return output
-    except Exception:
-        pass
+        # Витягуємо результати з HTML
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', r.text, re.DOTALL)
+        links    = re.findall(r'class="result__url"[^>]*>(.*?)</span>', r.text, re.DOTALL)
+        titles   = re.findall(r'class="result__a"[^>]*>(.*?)</a>', r.text, re.DOTALL)
 
-    return ""  # Порожній рядок — AI відповість зі своїх знань
+        output = ""
+        for i in range(min(4, len(snippets))):
+            title   = re.sub(r'<[^>]+>', '', titles[i]).strip()   if i < len(titles)   else ""
+            snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip() if i < len(snippets) else ""
+            link    = links[i].strip()                            if i < len(links)    else ""
+            if snippet:
+                output += f"{title}\n{snippet}\n{link}\n\n"
+        if output:
+            return output
+    except Exception as e:
+        print(f"[DuckDuckGo error]: {e}")
+
+    return ""
 
 async def fetch_url_text(url: str) -> str:
     """Завантажує текст сторінки за посиланням."""
@@ -1135,10 +1140,23 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     provider  = get_text_provider()
     remaining = max(0, OR_DAILY_LIMIT - or_requests["count"])
+
+    # Перевіряємо Tavily
+    tavily_status = "❌ Не налаштовано"
+    if TAVILY_API_KEY:
+        try:
+            await asyncio.to_thread(
+                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query="test", max_results=1)
+            )
+            tavily_status = "🟢 Працює"
+        except Exception as e:
+            tavily_status = f"🔴 Помилка: {str(e)[:50]}"
+
     await update.message.reply_text(
         f"📊 Статус:\n"
         f"• Провайдер: {'OpenRouter 🟢' if provider == 'openrouter' else 'Groq 🔵'}\n"
         f"• OpenRouter залишилось: {remaining}/{OR_DAILY_LIMIT}\n"
+        f"• Tavily пошук: {tavily_status}\n"
         f"• Активних нагадувань: {len(load_reminders())}\n"
         f"• Ліміт скидається: щодня опівночі"
     )
