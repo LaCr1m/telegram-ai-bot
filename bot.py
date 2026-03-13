@@ -1010,9 +1010,24 @@ async def do_price(query: str) -> str:
             out_lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
         return "\n".join(out_lines)
 
-    # ── Спроба 3: загальний пошук + посилання ────────────────────────────
+    # ── Спроба 3: загальний пошук з фільтрацією по дозволених доменах ────
+    allowed_domains = (
+        ["silpo.ua", "metro.ua", "fozzyshop.ua", "atbmarket.com"]
+        if is_food else
+        ["hotline.ua", "rozetka.com.ua", "comfy.ua", "ktc.ua"]
+    )
     search_results = await search_web(f'"{product}" купити ціна {city_str}')
-    if not search_results:
+    # Фільтруємо результати — лише дозволені домени
+    filtered_lines = []
+    for line in search_results.splitlines():
+        if not line.strip():
+            filtered_lines.append(line)
+            continue
+        if any(d in line for d in allowed_domains) or not line.startswith("http"):
+            filtered_lines.append(line)
+    search_results_filtered = "\n".join(filtered_lines).strip()
+
+    if not search_results_filtered:
         return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{links}"
 
     summary_raw = await call_ai([{"role": "user", "content": (
@@ -1021,18 +1036,21 @@ async def do_price(query: str) -> str:
         f"СУВОРІ ПРАВИЛА:\n"
         f"- Відповідай ТІЛЬКИ у форматі JSON-масиву, нічого більше:\n"
         f'  [{{"shop":"Назва","price":999,"url":"https://..."}},...]\n'
+        f"- Використовуй ТІЛЬКИ ці магазини: {', '.join(allowed_domains)}\n"
         f"- Вказуй ТІЛЬКИ ціни що дослівно є в тексті результатів\n"
         f"- Кожен елемент масиву — УНІКАЛЬНИЙ url (не дублювати)\n"
-        f"- ІГНОРУЙ ціни на інші моделі чи схожі товари\n"
+        f"- ІГНОРУЙ будь-які інші сайти (новини, YouTube, нерухомість тощо)\n"
         f"- НЕ вигадуй ціни. НЕ згадуй OLX\n"
         f"- Якщо цін немає — поверни порожній масив []\n\n"
-        f"{search_results}"
+        f"{search_results_filtered}"
     )}])
 
     # Парсимо JSON від AI і форматуємо самостійно
     try:
-        clean_json = summary_raw.strip().replace("```json", "").replace("```", "")
+        clean_json  = summary_raw.strip().replace("```json", "").replace("```", "").strip()
         price_items = json.loads(clean_json)
+        if not isinstance(price_items, list):
+            price_items = []
     except Exception:
         price_items = []
 
