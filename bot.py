@@ -1226,6 +1226,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔍 Аналізую зображення...")
+    user_id = update.message.from_user.id
     try:
         photo   = update.message.photo[-1]
         file    = await ctx.bot.get_file(photo.file_id)
@@ -1238,12 +1239,13 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 {"type": "text", "text": caption}
             ]}
         ])
-        # Зберігаємо опис фото як контекст
-        user_id = update.message.from_user.id
+        # Зберігаємо контекст ДО відповіді
         last_context[user_id] = {"type": "фото", "description": reply[:500]}
         append_and_trim(user_id, "user", f"[Фото] {caption}")
         append_and_trim(user_id, "assistant", reply)
         await msg.edit_text(clean_markdown(reply))
+        # DEBUG: підтвердження збереження контексту
+        await update.message.reply_text(f"✅ Контекст збережено. Тепер можеш питати про це фото.")
     except Exception as e:
         await msg.edit_text(f"Помилка при аналізі зображення: {e}")
 
