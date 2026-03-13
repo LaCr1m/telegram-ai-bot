@@ -832,7 +832,15 @@ async def do_price(query: str) -> str:
 
     # Паттерни URL які є категоріями/фільтрами, а не конкретним товаром
     _CATEGORY_PATTERNS = re.compile(
-        r'/fs/\d+|/f/\d+|/c\d{3,}|/search/|\?.*category|/noutbuki-netbuki/$|/computer/$'
+        r'/fs/\d+'             # підбірки /fs/1457/
+        r'|/f/\d+'             # фільтри /f/123/
+        r'|/c\d{3,}'           # категорії /c12345/
+        r'|/search/'            # сторінки пошуку
+        r'|\?.*category'       # query-параметр category
+        r'|series=true'         # сторінки серії ноутбуків
+        r'|/noutbuki-netbuki/$' # корінь категорії без товару
+        r'|/computer/$'
+        r'|\d{5,}-\d{5,}/'   # числовий id серії /294413-21382354/
     )
 
     def _is_category_url(url: str) -> bool:
@@ -840,27 +848,28 @@ async def do_price(query: str) -> str:
         # Категорійні: /fs/1457/, /f/123/, або просто /noutbuki-netbuki/
         return bool(_CATEGORY_PATTERNS.search(url))
 
-    def _relevant(title: str) -> bool:
-        t = title.lower()
-        return sum(1 for kw in product_keywords if kw in t) >= max(1, len(product_keywords) // 2)
-
-    # Розширюємо назву товару якщо є тільки артикул
-    search_product = product
-    if re.search(r'[A-Z0-9]{5,10}EA\b', product) and len(product.split()) <= 2:
-        try:
-            expanded = await call_ai([{"role": "user", "content": (
-                f"Що це за товар: '{product}'? Дай повну назву моделі (бренд + серія + модель). "
-                "Відповідай ТІЛЬКИ назвою, без пояснень. Якщо не знаєш — поверни оригінал."
-            )}])
-            expanded = expanded.strip().strip('"\'.')
-            if len(expanded) > len(product) and not expanded.startswith("Я"):
-                search_product = expanded
-                print(f"[Price] Розширено: {product!r} → {search_product!r}")
-        except Exception:
-            pass
+    # Визначаємо пошуковий запит для Hotline
+    # Якщо product містить артикул — шукаємо ТІЛЬКИ по артикулу (точніший результат)
+    # AI-розширення прибрано бо воно помилялось з артикулами
+    artikul_match = re.search(r'\b([A-Z][A-Z0-9]{4,9}[A-Z])\b', product)
+    if artikul_match and len(product.split()) <= 3:
+        # Є артикул + коротка назва — шукаємо по артикулу, він унікальний
+        search_product = artikul_match.group(1)
+        print(f"[Price] Пошук по артикулу: {search_product!r}")
+    else:
+        search_product = product
 
     search_encoded = search_product.replace(" ", "+")
     hotline_url    = f"https://hotline.ua/search/?q={search_encoded}&order=1"
+
+
+    def _relevant(title: str) -> bool:
+        t = title.lower()
+        if artikul_match and artikul_match.group(1).lower() in t:
+            return True
+        return sum(1 for kw in product_keywords if kw in t) >= max(1, len(product_keywords) // 2)
+
+
 
     # Спроба 1: Tavily
     if TAVILY_API_KEY:
