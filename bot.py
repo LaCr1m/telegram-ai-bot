@@ -176,10 +176,12 @@ def get_history(user_id: int) -> list:
 
 async def _compress_history(user_id: int) -> None:
     """Стискає стару частину діалогу в підсумок, залишаючи 6 свіжих повідомлень."""
-    history  = chat_histories.get(user_id, [])
-    msgs     = [m for m in history if m.get("role") != "system"]
-    old      = msgs[:-6]
-    fresh    = msgs[-6:]
+    history = chat_histories.get(user_id, [])
+    msgs    = [m for m in history if m.get("role") != "system"]
+    if len(msgs) < 8:   # недостатньо для стиснення
+        return
+    old   = msgs[:-6]
+    fresh = msgs[-6:]
 
     old_text = "\n".join(
         f"{'Користувач' if m['role'] == 'user' else 'Бот'}: "
@@ -194,19 +196,21 @@ async def _compress_history(user_id: int) -> None:
     except Exception:
         return
 
-    # Зберігаємо тему в пам'яті
-    try:
-        topic = await call_ai([{"role": "user", "content": (
-            f"Визнач головну тему цього діалогу одним реченням до 10 слів. "
-            f"Відповідай ТІЛЬКИ темою.\n\n{old_text[:1000]}"
-        )}])
-        topic = topic.strip()
-        if topic:
-            mem    = get_user_memory(user_id)
-            topics = ([topic] + mem.get("topics", []))[:10]
-            update_user_memory(user_id, {"topics": topics})
-    except Exception:
-        pass
+    # Зберігаємо тему в пам'яті фоново — не блокуємо основний потік
+    async def _save_topic():
+        try:
+            topic = await call_ai([{"role": "user", "content": (
+                f"Визнач головну тему цього діалогу одним реченням до 10 слів. "
+                f"Відповідай ТІЛЬКИ темою.\n\n{old_text[:1000]}"
+            )}])
+            topic = topic.strip()
+            if topic:
+                mem    = get_user_memory(user_id)
+                topics = ([topic] + mem.get("topics", []))[:10]
+                update_user_memory(user_id, {"topics": topics})
+        except Exception:
+            pass
+    asyncio.create_task(_save_topic())
 
     chat_histories[user_id] = (
         [get_system_prompt(user_id),
@@ -224,7 +228,7 @@ async def append_and_trim(user_id: int, role: str, content) -> None:
             [get_system_prompt(user_id)]
             + chat_histories[user_id][-MAX_HISTORY_MESSAGES:]
         )
-    save_histories()
+    save_histories()  # зберігаємо після кожної зміни
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -536,11 +540,12 @@ async def search_web(query: str) -> str:
     if TAVILY_API_KEY:
         try:
             results = await asyncio.to_thread(
-                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query=query, max_results=5)
+                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query=query, max_results=7)
             )
+            filtered = _filter_results(results.get("results", []))
             output = "".join(
                 f"{i['title']}\n{i['content'][:400]}\n{i['url']}\n\n"
-                for i in results.get("results", [])
+                for i in filtered
             )
             if output:
                 return output
@@ -1137,8 +1142,12 @@ def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[b
 
 async def _send_or_edit(msg, text: str, **kwargs):
     """Надсилає або редагує повідомлення — безпечно для довгих текстів (ліміт 4096)."""
-    chunks = [text[i:i+4096] for i in range(0, len(text), 4096)]
-    await msg.edit_text(chunks[0], **kwargs)
+    text   = text.strip()
+    chunks = [text[i:i+4000] for i in range(0, max(len(text), 1), 4000)]
+    try:
+        await msg.edit_text(chunks[0], **kwargs)
+    except Exception:
+        await msg.reply_text(chunks[0], **kwargs)
     for chunk in chunks[1:]:
         await msg.reply_text(chunk, **kwargs)
 
@@ -1186,9 +1195,14 @@ async def _dispatch_intent(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         msg = voice_msg or await update.message.reply_text(status_text)
         if voice_msg:
             await msg.edit_text(f"{prefix}{status_text}")
-        result = await fn(enriched)
-        kwargs = {"disable_web_page_preview": True} if intent in ("news","price","search") else {}
-        await _send_or_edit(msg, clean_markdown(f"{prefix}{result}"), **kwargs)
+        try:
+            result = await fn(enriched)
+        except Exception as e:
+            await msg.edit_text(f"{prefix}⚠️ Помилка: {e}")
+            return True
+        kwargs = {"disable_web_page_preview": True} if intent in ("news", "price", "search") else {}
+        out    = clean_markdown(f"{prefix}{result}".strip())
+        await _send_or_edit(msg, out, **kwargs)
         _set_ctx(user_id, user_text, result)
         return True
 
