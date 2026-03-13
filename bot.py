@@ -338,6 +338,11 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
         "купити", "придбати", "замовити", "знайди", "пошукай",
         "що це", "розкажи більше", "докладніше", "ще про",
         "як використовувати", "рецепт з", "з відео", "у відео",
+        # Тригери для текстового контексту ("цей магазин", "цей сайт" тощо)
+        "цей магазин", "цей сайт", "ця компанія", "цей товар", "цей продукт",
+        "що він продає", "що вона продає", "що там є", "що там продають",
+        "яка адреса", "який графік", "як туди", "контакти", "телефон магазину",
+        "що ще", "що інше", "а ще", "і ще", "також розкажи",
     ]
     if len(words) <= 10 or any(h in t for h in strong_hints):
         return (
@@ -1189,24 +1194,28 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg    = await update.message.reply_text("🌐 Перекладаю...")
         result = await do_translate(enriched)
         await msg.edit_text(clean_markdown(result))
+        last_context[user_id] = {"type": "текст", "description": f"Запит: {user_text}\nВідповідь: {result[:400]}"}
         return
 
     if intent == "summarize":
         msg    = await update.message.reply_text("📰 Опрацьовую...")
         result = await do_summarize(enriched)
         await msg.edit_text(clean_markdown(result))
+        last_context[user_id] = {"type": "текст", "description": f"Запит: {user_text}\nВідповідь: {result[:400]}"}
         return
 
     if intent == "generate":
         msg    = await update.message.reply_text("✍️ Генерую текст...")
         result = await do_generate(enriched)
         await msg.edit_text(clean_markdown(result))
+        last_context[user_id] = {"type": "текст", "description": f"Запит: {user_text}\nВідповідь: {result[:400]}"}
         return
 
     if intent == "recipe":
         msg    = await update.message.reply_text("🍳 Шукаю рецепти...")
         result = await do_recipe(enriched)
         await msg.edit_text(clean_markdown(result))
+        last_context[user_id] = {"type": "текст", "description": f"Запит: {user_text}\nВідповідь: {result[:400]}"}
         return
 
     if intent == "task":
@@ -1217,6 +1226,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg    = await update.message.reply_text("📰 Шукаю новини...")
         result = await do_news(enriched)
         await msg.edit_text(clean_markdown(result), disable_web_page_preview=True)
+        last_context[user_id] = {"type": "текст", "description": f"Запит: {user_text}\nВідповідь: {result[:400]}"}
         return
 
     if intent == "search":
@@ -1248,6 +1258,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}])
             append_and_trim(user_id, "user", user_text)
             append_and_trim(user_id, "assistant", reply)
+            # Зберігаємо контекст пошукової відповіді
+            last_context[user_id] = {"type": "текст", "description": f"Запит: {user_text}\nВідповідь: {reply[:400]}"}
             await msg.edit_text(clean_markdown(reply))
         except Exception as e:
             await msg.edit_text(f"Помилка пошуку: {e}")
@@ -1259,6 +1271,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply = await call_ai(get_history(user_id))
         append_and_trim(user_id, "assistant", reply)
         await update.message.reply_text(clean_markdown(reply))
+        # Зберігаємо контекст текстової відповіді, щоб наступні уточнення
+        # ("що продає цей магазин?", "яка адреса?") відносились до неї,
+        # а не до старого фото/відео
+        last_context[user_id] = {"type": "текст", "description": f"Запит: {user_text}\nВідповідь: {reply[:400]}"}
         asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
     except Exception as e:
         await update.message.reply_text(f"⚠️ Помилка відповіді: {e}")
