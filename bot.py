@@ -303,23 +303,49 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════════════════════
 
 async def resolve_text_with_context(user_id: int, text: str) -> str:
-    """AI визначає чи повідомлення відноситься до попереднього контексту."""
+    """Визначає чи повідомлення відноситься до попереднього контексту."""
     ctx = last_context.get(user_id)
     if not ctx:
         return text
 
-    check = await call_ai([{"role": "user", "content": (
-        f"Попередній контекст розмови — {ctx['type']}: «{ctx['description'][:300]}»\n"
-        f"Нове повідомлення: «{text}»\n\n"
-        "Чи це нове повідомлення стосується попереднього контексту? "
-        "Відповідай ТІЛЬКИ 'yes' або 'no'."
-    )}])
+    t = text.lower().strip()
+    words = t.split()
 
-    if "yes" in check.lower():
+    # 1. Однозначно НЕ контекст — довге самодостатнє повідомлення без натяків
+    no_context_hints = ["розкажи про", "що таке ", "поясни ", "напиши про", "хто такий"]
+    if len(words) > 12 and not any(h in t for h in no_context_hints):
+        return text
+
+    # 2. Швидка локальна перевірка — очевидні тригери
+    strong_hints = [
+        "це", "цей", "цю", "цього", "на фото", "з фото", "на зображенні",
+        "де купити", "де придбати", "де замовити", "скільки коштує",
+        "скільки вартує", "яка ціна", "яка вартість", "ціна", "вартість",
+        "купити", "придбати", "замовити", "знайди", "пошукай",
+        "що це", "розкажи більше", "докладніше", "ще про",
+        "як використовувати", "рецепт з", "з відео", "у відео",
+    ]
+    if len(words) <= 10 or any(h in t for h in strong_hints):
         return (
             f"[Контекст попереднього повідомлення — {ctx['type']}: {ctx['description'][:500]}]\n\n"
             f"Запит користувача: {text}"
         )
+
+    # 3. Сірa зона (10-12 слів, без очевидних тригерів) — питаємо AI
+    try:
+        check = await call_ai([{"role": "user", "content": (
+            f"Контекст: {ctx['type']} — «{ctx['description'][:200]}»\n"
+            f"Повідомлення: «{text}»\n"
+            "Чи це повідомлення стосується контексту? Відповідай ТІЛЬКИ 'yes' або 'no'."
+        )}])
+        if "yes" in check.lower():
+            return (
+                f"[Контекст попереднього повідомлення — {ctx['type']}: {ctx['description'][:500]}]\n\n"
+                f"Запит користувача: {text}"
+            )
+    except Exception:
+        pass
+
     return text
     t = text.lower()
     if any(kw in t for kw in IMAGE_KEYWORDS):    return "image"
