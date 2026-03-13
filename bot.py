@@ -1247,12 +1247,32 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if intent == "search":
-        msg     = await update.message.reply_text("🌐 Шукаю в інтернеті...")
-        results = await search_web(enriched)
+        msg = await update.message.reply_text("🌐 Шукаю в інтернеті...")
+        # Формуємо пошуковий запит: якщо є контекст — просимо AI скласти короткий запит
         try:
-            content = f"Запит: '{enriched}'\n\nРезультати пошуку:\n{results}\n\nДай корисну відповідь українською." \
-                      if results else \
-                      f"Запит: '{enriched}'\n\nВідповідай з власних знань українською. Якщо не знаєш точної інформації — скажи що краще перевірити на офіційних сайтах."
+            if "[Контекст попереднього повідомлення" in enriched:
+                search_query = await call_ai([{"role": "user", "content": (
+                    f"{enriched}\n\n"
+                    "Склади короткий пошуковий запит (до 10 слів) для Google на основі цього. "
+                    "Відповідай ТІЛЬКИ запитом, нічого більше."
+                )}])
+                search_query = search_query.strip()
+            else:
+                search_query = user_text
+        except Exception:
+            search_query = user_text
+
+        results = await search_web(search_query)
+        try:
+            content = (
+                f"Запит користувача: '{enriched}'\n\n"
+                f"Результати пошуку за запитом '{search_query}':\n{results}\n\n"
+                "Дай корисну конкретну відповідь українською з посиланнями."
+            ) if results else (
+                f"Запит: '{enriched}'\n\n"
+                "Відповідай з власних знань українською. "
+                "Якщо не знаєш точної інформації — скажи що краще перевірити на офіційних сайтах."
+            )
             reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}])
             append_and_trim(user_id, "user", user_text)
             append_and_trim(user_id, "assistant", reply)
