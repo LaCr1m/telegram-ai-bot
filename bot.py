@@ -16,7 +16,6 @@ except ImportError:
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
-# ── Змінні середовища ────────────────────────────────────────────────────────
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY")
@@ -25,7 +24,6 @@ CF_API_TOKEN       = os.environ.get("CF_API_TOKEN")
 CF_ACCOUNT_ID      = os.environ.get("CF_ACCOUNT_ID")
 NEWS_API_KEY       = os.environ.get("NEWS_API_KEY")
 
-# ── URL та моделі ────────────────────────────────────────────────────────────
 OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL                  = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL          = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -35,7 +33,6 @@ GROQ_MODEL                = "llama-3.3-70b-versatile"
 VISION_MODEL              = "openrouter/auto"
 CF_IMAGE_URL              = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
 
-# ── Константи ─────────────────────────────────────────────────────────────────
 MAX_HISTORY_MESSAGES = 20
 SUMMARY_THRESHOLD    = 16
 REMINDERS_FILE       = "reminders.json"
@@ -44,7 +41,6 @@ TASKS_FILE           = "tasks.json"
 HISTORY_FILE         = "history.json"
 BLOCKED_DOMAINS      = {"olx.ua", "olx.com.ua"}
 
-# ── Системний промпт ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = {
     "role": "system",
     "content": (
@@ -64,7 +60,6 @@ PERSONALITIES = {
     "business": {"name": "Діловий",    "emoji": "💼", "prompt": "Ти професійний бізнес-асистент на ім'я J.A.R.V.I.S. Завжди відповідай виключно українською мовою. Діловий стиль, чіткі структуровані відповіді. Ніколи не вигадуй факти."},
 }
 
-# ── Ключові слова ─────────────────────────────────────────────────────────────
 IMAGE_KEYWORDS     = ["створи фото","згенеруй фото","намалюй","згенеруй зображення","створи зображення","зроби фото","зроби картинку","створи картинку","зроби зображення","згенеруй картинку","покажи зображення","generate image","draw","create image","create photo","make image"]
 REMIND_KEYWORDS    = ["нагадай","нагади","нагадуй","remind me","set reminder","нагадування","постав нагадування","нагадай мені"]
 PRICE_KEYWORDS     = ["скільки коштує","скільки вартує","яка ціна","яка вартість","де купити дешевше","де найдешевше","порівняй ціни","ціна на","почім","по чім","знайди ціну","ціни на","купити дешево","де дешевше купити"]
@@ -76,7 +71,6 @@ RECIPE_KEYWORDS    = ["що приготувати","що зробити з","р
 NEWS_KEYWORDS      = ["новини про","новини щодо","що нового про","останні новини про","news about","що відбувається з","новини на тему"]
 TASK_KEYWORDS      = ["додай задачу","додай до списку","запам'ятай задачу","нова задача","видали задачу","видалити задачу","покажи задачі","мої задачі","список задач","виконано","задачу виконано"]
 
-# ── Стан ─────────────────────────────────────────────────────────────────────
 chat_histories:     dict[int, list] = {}
 user_personalities: dict[int, str]  = {}
 last_context:       dict[int, dict] = {}
@@ -84,10 +78,6 @@ or_requests = {"count": 0, "date": date.today()}
 OR_DAILY_LIMIT = 190
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Утиліти — JSON файли
-# ════════════════════════════════════════════════════════════════════════════
 
 def _load_json(path: str, default):
     if not os.path.exists(path):
@@ -102,10 +92,6 @@ def _save_json(path: str, data) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Пам'ять
-# ════════════════════════════════════════════════════════════════════════════
 
 def get_user_memory(user_id: int) -> dict:
     return _load_json(MEMORY_FILE, {}).get(str(user_id), {})
@@ -149,10 +135,6 @@ def get_system_prompt(user_id: int) -> dict:
     p    = PERSONALITIES.get(mode, PERSONALITIES["normal"])
     return {"role": "system", "content": p["prompt"] + gender_suffix(user_id)}
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Персистентна історія + стиснення
-# ════════════════════════════════════════════════════════════════════════════
 
 def save_histories() -> None:
     to_save = {}
@@ -227,10 +209,6 @@ async def append_and_trim(user_id: int, role: str, content) -> None:
     save_histories()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Список задач
-# ════════════════════════════════════════════════════════════════════════════
-
 def get_user_tasks(user_id: int) -> list:
     return _load_json(TASKS_FILE, {}).get(str(user_id), [])
 
@@ -284,10 +262,6 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❓ Невідома команда. Використай: add / done / del / clear")
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Визначення інтенту
-# ════════════════════════════════════════════════════════════════════════════
 
 def detect_intent_local(text: str) -> str | None:
     t = text.lower()
@@ -385,10 +359,6 @@ def _set_ctx(user_id: int, user_text: str, reply: str) -> None:
     }
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# AI
-# ════════════════════════════════════════════════════════════════════════════
-
 def get_text_provider() -> str:
     today = date.today()
     if or_requests["date"] != today:
@@ -437,10 +407,6 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
     return r.text.strip()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Генерація зображень
-# ════════════════════════════════════════════════════════════════════════════
-
 async def generate_image(prompt: str) -> bytes:
     url     = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
@@ -458,10 +424,6 @@ async def generate_image(prompt: str) -> bytes:
             await asyncio.sleep(5)
     raise last_error
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Відео
-# ════════════════════════════════════════════════════════════════════════════
 
 async def extract_video_audio(video_bytes: bytes) -> bytes:
     with open("/tmp/input_video.mp4", "wb") as f:
@@ -520,10 +482,6 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
     summary  = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": f"Запит: {caption}\n\nДані відео:\n{combined}\n\nВідповідай українською."}])
     return f"{combined}\n\n📝 Підсумок:\n{summary}"
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Пошук та документи
-# ════════════════════════════════════════════════════════════════════════════
 
 def _filter_results(items: list[dict]) -> list[dict]:
     return [i for i in items if not any(bd in i.get("url", "") for bd in BLOCKED_DOMAINS)]
@@ -621,10 +579,6 @@ def extract_word_text(docx_bytes: bytes) -> str:
     except Exception as e:
         return f"Помилка читання Word: {e}"
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Функції обробки інтентів
-# ════════════════════════════════════════════════════════════════════════════
 
 async def do_translate(text: str) -> str:
     return await call_ai([{"role": "user", "content": (
@@ -755,17 +709,15 @@ async def do_price(query: str) -> str:
         "'i9 14900' → 'Intel Core i9-14900'\n"
     )
 
-    # ── Витягування товару та міста ──────────────────────────────────────────
+    # ── Витягуємо назву товару і місто ───────────────────────────────────
     if "[Контекст попереднього повідомлення" in query:
-        # ВИПРАВЛЕННЯ: назва товару береться з контексту (фото/відео/текст),
-        # а місто та уточнення — із запиту користувача
         prompt = (
             f"{query}\n\n"
             f"ВАЖЛИВО: назва товару міститься В КОНТЕКСТІ (опис фото/відео/тексту), "
             f"а НЕ в запиті користувача.\n"
             f"Запит користувача містить лише уточнення (місто, побажання тощо).\n"
             f"Витягни:\n"
-            f"1. product — точну назву товару З КОНТЕКСТУ (наприклад 'банан', 'iPhone 15 Pro', 'Nike Air Max')\n"
+            f"1. product — точну назву товару З КОНТЕКСТУ\n"
             f"2. city — місто ІЗ ЗАПИТУ користувача (або null якщо не вказано)\n"
             f"Розшифруй скорочення:\n{aliases_hint}"
             "Відповідай ТІЛЬКИ JSON: {\"product\": \"...\", \"city\": \"...\" або null}"
@@ -799,193 +751,241 @@ async def do_price(query: str) -> str:
     if not product:
         return "❌ Не вдалось визначити назву товару."
 
-    # ── Визначаємо чи це продукт харчування ──────────────────────────────
+    # ── Перевірка: їжа чи техніка ────────────────────────────────────────
     food_check = await call_ai([{"role": "user", "content": (
         f"Чи є '{product}' продуктом харчування або напоєм? "
         "Відповідай ТІЛЬКИ 'yes' або 'no'."
     )}])
-    is_food = "yes" in food_check.strip().lower()
-
+    is_food  = "yes" in food_check.strip().lower()
     encoded  = product.replace(" ", "+")
     city_str = city or "Україна"
+    city_note = f" у {city}" if city else ""
+
+    # ── Для їжі — старі магазини (Hotline не має їжі) ────────────────────
     if is_food:
-        links = (
-            f"• https://silpo.ua/search?search={encoded}\n"
-            f"• https://metro.ua/uk/search?query={encoded}\n"
-            f"• https://fozzyshop.ua/ua/search?controller=search&s={encoded}\n"
-            f"• https://www.atbmarket.com/catalog/search?query={encoded}"
-        )
-    else:
-        links    = (
-            f"• https://rozetka.com.ua/ua/search/?text={encoded}\n"
-            f"• https://comfy.ua/ua/search/?q={encoded}\n"
-            f"• https://www.ktc.ua/ua/search/?q={encoded}"
-        )
-
-    product_keywords = [w.lower() for w in re.split(r'[\s\-/]+', product) if len(w) > 2]
-
-    def _is_relevant(title: str) -> bool:
-        t = title.lower()
-        return all(kw in t for kw in product_keywords)
-
-    # ── Спроба 1: Tavily advanced ─────────────────────────────────────────
-    if TAVILY_API_KEY:
-        try:
-            if is_food:
-                tavily_query = (
-                    f'"{product}" ціна купити {city_str} '
-                    "site:silpo.ua OR site:metro.ua OR site:fozzyshop.ua OR site:atbmarket.com"
-                )
-                food_domains = ("silpo.ua", "metro.ua", "fozzyshop.ua", "atbmarket.com")
-            else:
-                tavily_query = (
-                    f'"{product}" ціна купити {city_str} '
-                    "site:rozetka.com.ua OR site:comfy.ua OR site:ktc.ua"
-                )
-            raw_results = await asyncio.to_thread(
-                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(
-                    query=tavily_query, max_results=8, search_depth="advanced"
-                )
-            )
-            items = _filter_results(raw_results.get("results", []))
-            found_prices = []
-            for item in items:
-                title   = item.get("title", "")
-                content = item.get("content", "")
-                url     = item.get("url", "")
-                domain  = next((d for d in ("price.ua", "rozetka.com.ua", "comfy.ua") if d in url), "")
-
-                is_category_page = bool(re.search(r'/c\d{3,}/', url))
-                if is_category_page:
-                    print(f"[Price filter] Пропущено сторінку категорії: {url[:80]}")
-                    continue
-
-                if not _is_relevant(title) and not _is_relevant(content[:200]):
-                    print(f"[Price filter] Пропущено нерелевантний: {title[:60]}")
-                    continue
-
-                prices = _parse_prices(content + " " + title)
-                if prices and domain:
-                    found_prices.append({
-                        "site":  domain,
-                        "price": min(prices),
-                        "url":   url,
-                        "title": title[:60],
-                    })
-
-            if found_prices:
-                found_prices.sort(key=lambda x: x["price"])
-                city_note = f" у {city}" if city else ""
-                lines     = [f"💰 Ціни на: {product}{city_note}\n"]
-                seen: set[str] = set()
-                for fp in found_prices[:6]:
-                    marker = " 🏆" if not seen else ""
-                    seen.add(fp["site"])
-                    lines.append(
-                        (
-                            f"• {fp['site']}: {fp['price']:,} грн{marker}\n"
-                            f"  {fp['title']}\n"
-                            f"  🔗 {fp['url']}"
-                        ).replace(",", " ")
-                    )
-                lines.append(
-                    f"\n💡 Найдешевше: {found_prices[0]['price']:,} грн на {found_prices[0]['site']}"
-                    .replace(",", " ")
-                )
-                if city:
-                    lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
-                return "\n".join(lines)
-        except Exception as e:
-            print(f"[Tavily price error]: {e}")
-
-    # ── Спроба 2: прямий парсинг HTML ────────────────────────────────────
-    if is_food:
-        sites = {
-            "Сільпо":     f"https://silpo.ua/search?search={encoded}",
-            "Metro":      f"https://metro.ua/uk/search?query={encoded}",
-            "Fozzy":      f"https://fozzyshop.ua/ua/search?controller=search&s={encoded}",
-            "АТБ":        f"https://www.atbmarket.com/catalog/search?query={encoded}",
+        food_sites = {
+            "Сільпо": f"https://silpo.ua/search?search={encoded}",
+            "Metro":  f"https://metro.ua/uk/search?query={encoded}",
+            "Fozzy":  f"https://fozzyshop.ua/ua/search?controller=search&s={encoded}",
+            "АТБ":    f"https://www.atbmarket.com/catalog/search?query={encoded}",
         }
-    else:
-        sites = {
-            "Rozetka": f"https://rozetka.com.ua/ua/search/?text={encoded}",
-            "Comfy":   f"https://comfy.ua/ua/search/?q={encoded}",
-            "KTC":     f"https://www.ktc.ua/ua/search/?q={encoded}",
-        }
-    html_results: dict[str, dict] = {}
+        food_results: dict[str, dict] = {}
 
-    async def _fetch_prices(name: str, url: str) -> None:
-        try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                r = await client.get(url, headers=_HEADERS)
-
-            if name == "Rozetka":
-                pairs = re.findall(r'"title"\s*:\s*"([^"]{5,150})"[^}]{0,200}?"price"\s*:\s*(\d+)', r.text)
-                prices = [
-                    int(p) for nm, p in pairs
-                    if _is_relevant(nm) and 200 < int(p) < 1_000_000
-                ]
-                if not prices:
-                    pairs = re.findall(r'"name"\s*:\s*"([^"]{5,150})"[^}]{0,200}?"price"\s*:\s*(\d+)', r.text)
-                    prices = [
-                        int(p) for nm, p in pairs
-                        if _is_relevant(nm) and 200 < int(p) < 1_000_000
-                    ]
-                if not prices:
-                    blocks = re.findall(r'(?:' + re.escape(product_keywords[-1]) + r')[^<]{0,300}?(\d{4,7})\s*(?:грн|₴)', r.text, re.IGNORECASE)
-                    prices = [int(p) for p in blocks if 200 < int(p) < 1_000_000]
-
-            elif name == "Comfy":
-                prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 200 < int(p) < 1_000_000]
-                if not prices:
-                    prices = _parse_prices(r.text)
-
-            if name in ("Сільпо", "Metro", "Fozzy", "АТБ"):
+        async def _fetch_food(name: str, url: str) -> None:
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                    r = await client.get(url, headers=_HEADERS)
                 prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 1 < int(p) < 100_000]
                 if not prices:
-                    prices = [int(p) for p in re.findall(r'"price"\s*:\s*"?(\d+\.?\d*)"?', r.text)
-                              if 1 < float(p) < 100_000]
+                    prices = [int(p) for p in re.findall(r'"price"\s*:\s*"?(\d+\.?\d*)"?', r.text) if 1 < float(p) < 100_000]
                 if not prices:
-                    raw = re.findall(r'[\s>](\d[\d\s\xa0]{0,5})\s*(?:грн|₴)', r.text)
-                    for p in raw:
+                    raw_p = re.findall(r'[\s>](\d[\d\s\xa0]{0,5})\s*(?:грн|₴)', r.text)
+                    for p in raw_p:
                         try:
                             val = int(re.sub(r'[\s\xa0]', '', p))
                             if 5 < val < 100_000:
                                 prices.append(val)
                         except ValueError:
                             pass
+                if prices:
+                    food_results[name] = {"min": min(prices), "max": max(prices), "url": url}
+            except Exception as e:
+                print(f"[{name} error]: {e}")
 
+        await asyncio.gather(*[_fetch_food(n, u) for n, u in food_sites.items()])
+
+        if food_results:
+            cheapest  = min(food_results, key=lambda s: food_results[s]["min"])
+            out_lines = [f"💰 Ціни на: {product}{city_note}\n"]
+            for site, data in sorted(food_results.items(), key=lambda x: x[1]["min"]):
+                tag       = " 🏆" if site == cheapest else ""
+                price_str = (
+                    f"{data['min']:,} грн".replace(",", " ")
+                    if data["min"] == data["max"]
+                    else f"{data['min']:,} – {data['max']:,} грн".replace(",", " ")
+                )
+                out_lines.append(f"• {site}: {price_str}{tag}\n  🔗 {data['url']}")
+            out_lines.append(f"\n💡 Найдешевше на {cheapest}: {food_results[cheapest]['min']:,} грн".replace(",", " "))
+            if city:
+                out_lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
+            return "\n".join(out_lines)
+
+        food_links = (
+            f"• https://silpo.ua/search?search={encoded}\n"
+            f"• https://metro.ua/uk/search?query={encoded}\n"
+            f"• https://fozzyshop.ua/ua/search?controller=search&s={encoded}\n"
+            f"• https://www.atbmarket.com/catalog/search?query={encoded}"
+        )
+        return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{food_links}"
+
+    # ── Техніка: основний парсер — Hotline ───────────────────────────────
+    # URL з сортуванням за зростанням ціни (?order=1)
+    hotline_url = f"https://hotline.ua/search/?q={encoded}&order=1"
+    hotline_items: list[dict] = []
+
+    _HOTLINE_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://hotline.ua/",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            r = await client.get(hotline_url, headers=_HOTLINE_HEADERS)
+        html = r.text
+
+        # Парсимо блоки товарів — шукаємо пари (назва, ціна, посилання)
+        # Hotline структура: клас "item-title" або "product-name" + "price-value"
+        # Спроба 1: JSON-LD або structured data
+        json_blocks = re.findall(r'"name"\s*:\s*"([^"]{5,200})"[^{}]{0,300}?"price"\s*:\s*"?(\d+)"?[^{}]{0,200}?"url"\s*:\s*"([^"]+)"', html)
+        for name_txt, price_txt, url_txt in json_blocks:
+            try:
+                price_val = int(price_txt)
+                if 200 < price_val < 2_000_000 and "hotline.ua" in url_txt:
+                    hotline_items.append({
+                        "title": name_txt.strip()[:80],
+                        "price": price_val,
+                        "url":   url_txt if url_txt.startswith("http") else f"https://hotline.ua{url_txt}",
+                    })
+            except ValueError:
+                pass
+
+        # Спроба 2: data-атрибути
+        if not hotline_items:
+            data_blocks = re.findall(
+                r'data-name=["\']([^"\']{5,150})["\'][^>]*data-price=["\'](\d+)["\']',
+                html
+            )
+            for name_txt, price_txt in data_blocks:
+                try:
+                    price_val = int(price_txt)
+                    if 200 < price_val < 2_000_000:
+                        hotline_items.append({
+                            "title": name_txt.strip()[:80],
+                            "price": price_val,
+                            "url":   hotline_url,
+                        })
+                except ValueError:
+                    pass
+
+        # Спроба 3: витягуємо href + ціну поруч у HTML-блоці
+        if not hotline_items:
+            # Шукаємо посилання на сторінки товарів з hotline.ua
+            product_links = re.findall(
+                r'href="(/[a-z]{2}/[^"]{10,150})"[^>]*>([^<]{5,150})</a>',
+                html
+            )
+            price_raw = re.findall(r'(\d[\d\s]{2,8})\s*(?:грн|₴)', html)
+            prices_clean = []
+            for p in price_raw:
+                try:
+                    val = int(re.sub(r'\s', '', p))
+                    if 200 < val < 2_000_000:
+                        prices_clean.append(val)
+                except ValueError:
+                    pass
+
+            for i, (href, title) in enumerate(product_links[:15]):
+                if i < len(prices_clean):
+                    hotline_items.append({
+                        "title": title.strip()[:80],
+                        "price": prices_clean[i],
+                        "url":   f"https://hotline.ua{href}",
+                    })
+
+        # Фільтруємо нерелевантні та сортуємо за ціною
+        product_keywords = [w.lower() for w in re.split(r'[\s\-/]+', product) if len(w) > 2]
+
+        def _relevant(title: str) -> bool:
+            t = title.lower()
+            return sum(1 for kw in product_keywords if kw in t) >= max(1, len(product_keywords) // 2)
+
+        hotline_items = [i for i in hotline_items if _relevant(i["title"])]
+
+        # Дедуплікація по URL
+        seen_urls: set[str] = set()
+        unique_items: list[dict] = []
+        for item in hotline_items:
+            key = item["url"].split("?")[0]
+            if key not in seen_urls:
+                seen_urls.add(key)
+                unique_items.append(item)
+
+        unique_items.sort(key=lambda x: x["price"])
+        top10 = unique_items[:10]
+
+        if top10:
+            lines = [
+                f"💰 Ціни на: {product}{city_note}",
+                f"📊 Джерело: hotline.ua (сортування: ціна ↑)\n",
+            ]
+            for i, item in enumerate(top10, 1):
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                price_str = f"{item['price']:,} грн".replace(",", " ")
+                lines.append(f"{medal} {price_str} — {item['title']}\n   🔗 {item['url']}")
+            lines.append(
+                f"\n💡 Найдешевше: {top10[0]['price']:,} грн"
+                .replace(",", " ")
+            )
+            if city:
+                lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
+            lines.append(f"\n🔍 Всі результати: {hotline_url}")
+            return "\n".join(lines)
+
+    except Exception as e:
+        print(f"[Hotline error]: {e}")
+
+    # ── Fallback: Rozetka / Comfy / KTC ──────────────────────────────────
+    print("[Price] Hotline не дав результатів, перехід на fallback")
+    fallback_sites = {
+        "Rozetka": f"https://rozetka.com.ua/ua/search/?text={encoded}",
+        "Comfy":   f"https://comfy.ua/ua/search/?q={encoded}",
+        "KTC":     f"https://www.ktc.ua/ua/search/?q={encoded}",
+    }
+    fallback_results: dict[str, dict] = {}
+    product_keywords = [w.lower() for w in re.split(r'[\s\-/]+', product) if len(w) > 2]
+
+    def _is_relevant(title: str) -> bool:
+        t = title.lower()
+        return all(kw in t for kw in product_keywords)
+
+    async def _fetch_fallback(name: str, url: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                r = await client.get(url, headers=_HEADERS)
+            prices: list[int] = []
+            if name == "Rozetka":
+                pairs = re.findall(r'"title"\s*:\s*"([^"]{5,150})"[^}]{0,200}?"price"\s*:\s*(\d+)', r.text)
+                prices = [int(p) for nm, p in pairs if _is_relevant(nm) and 200 < int(p) < 1_000_000]
+                if not prices:
+                    pairs = re.findall(r'"name"\s*:\s*"([^"]{5,150})"[^}]{0,200}?"price"\s*:\s*(\d+)', r.text)
+                    prices = [int(p) for nm, p in pairs if _is_relevant(nm) and 200 < int(p) < 1_000_000]
+            elif name == "Comfy":
+                prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 200 < int(p) < 1_000_000]
+                if not prices:
+                    prices = _parse_prices(r.text)
             elif name == "KTC":
                 prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 500 < int(p) < 2_000_000]
                 if not prices:
                     prices = [int(p) for p in re.findall(r'"price"\s*:\s*"?(\d+)"?', r.text) if 500 < int(p) < 2_000_000]
                 if not prices:
                     prices = [p for p in _parse_prices(r.text) if p >= 500]
-
-            elif name == "Hotline":
-                prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 1000 < int(p) < 2_000_000]
-                if not prices:
-                    prices = [int(p) for p in re.findall(r'"price"\s*:\s*"?(\d+)"?', r.text) if 1000 < int(p) < 2_000_000]
-                if not prices:
-                    prices = [p for p in _parse_prices(r.text) if p >= 1000]
-
-            elif name == "Price.ua":
-                prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 1000 < int(p) < 2_000_000]
-                if not prices:
-                    prices = [p for p in _parse_prices(r.text) if p >= 1000]
-
             if prices:
-                html_results[name] = {"min": min(prices), "max": max(prices), "url": url}
+                fallback_results[name] = {"min": min(prices), "max": max(prices), "url": url}
         except Exception as e:
-            print(f"[{name} error]: {e}")
+            print(f"[{name} fallback error]: {e}")
 
-    await asyncio.gather(*[_fetch_prices(n, u) for n, u in sites.items()])
+    await asyncio.gather(*[_fetch_fallback(n, u) for n, u in fallback_sites.items()])
 
-    if html_results:
-        cheapest  = min(html_results, key=lambda s: html_results[s]["min"])
-        city_note = f" у {city}" if city else ""
-        out_lines = [f"💰 Ціни на: {product}{city_note}\n"]
-        for site, data in html_results.items():
+    if fallback_results:
+        cheapest  = min(fallback_results, key=lambda s: fallback_results[s]["min"])
+        out_lines = [
+            f"💰 Ціни на: {product}{city_note}",
+            f"⚠️ Hotline недоступний, показую дані з інших магазинів\n",
+        ]
+        for site, data in sorted(fallback_results.items(), key=lambda x: x[1]["min"]):
             tag       = " 🏆" if site == cheapest else ""
             price_str = (
                 f"{data['min']:,} грн".replace(",", " ")
@@ -993,90 +993,19 @@ async def do_price(query: str) -> str:
                 else f"{data['min']:,} – {data['max']:,} грн".replace(",", " ")
             )
             out_lines.append(f"• {site}: {price_str}{tag}\n  🔗 {data['url']}")
-        out_lines.append(
-            f"\n💡 Найдешевше на {cheapest}: {html_results[cheapest]['min']:,} грн"
-            .replace(",", " ")
-        )
+        out_lines.append(f"\n💡 Найдешевше на {cheapest}: {fallback_results[cheapest]['min']:,} грн".replace(",", " "))
         if city:
             out_lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
         return "\n".join(out_lines)
 
-    # ── Спроба 3: загальний пошук ─────────────────────────────────────────
-    allowed_domains = (
-        ["silpo.ua", "metro.ua", "fozzyshop.ua", "atbmarket.com"]
-        if is_food else
-        ["silpo.ua", "metro.ua", "fozzyshop.ua", "atbmarket.com"]
-        if is_food else
-        ["rozetka.com.ua", "comfy.ua", "ktc.ua"]
+    tech_links = (
+        f"• https://hotline.ua/search/?q={encoded}&order=1\n"
+        f"• https://rozetka.com.ua/ua/search/?text={encoded}\n"
+        f"• https://comfy.ua/ua/search/?q={encoded}\n"
+        f"• https://www.ktc.ua/ua/search/?q={encoded}"
     )
-    search_results = await search_web(f'"{product}" купити ціна {city_str}')
-    filtered_lines = []
-    for line in search_results.splitlines():
-        if not line.strip():
-            filtered_lines.append(line)
-            continue
-        if any(d in line for d in allowed_domains) or not line.startswith("http"):
-            filtered_lines.append(line)
-    search_results_filtered = "\n".join(filtered_lines).strip()
+    return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{tech_links}"
 
-    if not search_results_filtered:
-        return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{links}"
-
-    summary_raw = await call_ai([{"role": "user", "content": (
-        f"З цих результатів знайди конкретні числові ціни на '{product}'"
-        f"{' у ' + city if city else ' в Україні'}.\n"
-        f"СУВОРІ ПРАВИЛА:\n"
-        f"- Відповідай ТІЛЬКИ у форматі JSON-масиву, нічого більше:\n"
-        f'  [{{"shop":"Назва","price":999,"url":"https://..."}},...]\n'
-        f"- Використовуй ТІЛЬКИ ці магазини: {', '.join(allowed_domains)}\n"
-        f"- Вказуй ТІЛЬКИ ціни що дослівно є в тексті результатів\n"
-        f"- Кожен елемент масиву — УНІКАЛЬНИЙ url (не дублювати)\n"
-        f"- ІГНОРУЙ будь-які інші сайти (новини, YouTube, нерухомість тощо)\n"
-        f"- НЕ вигадуй ціни. НЕ згадуй OLX\n"
-        f"- Якщо цін немає — поверни порожній масив []\n\n"
-        f"{search_results_filtered}"
-    )}])
-
-    try:
-        clean_json  = summary_raw.strip().replace("```json", "").replace("```", "").strip()
-        price_items = json.loads(clean_json)
-        if not isinstance(price_items, list):
-            price_items = []
-    except Exception:
-        price_items = []
-
-    if price_items:
-        seen_urls: set[str] = set()
-        unique_items = []
-        for item in price_items:
-            u = item.get("url", "").split("?")[0]
-            if u not in seen_urls:
-                seen_urls.add(u)
-                unique_items.append(item)
-
-        unique_items.sort(key=lambda x: x.get("price", 0))
-        city_note = f" у {city}" if city else ""
-        lines = [f"💰 Ціни на: {product}{city_note}\n"]
-        for i, item in enumerate(unique_items[:6]):
-            marker = " 🏆" if i == 0 else ""
-            price_val = item.get("price", "?")
-            price_str = f"{price_val:,} грн".replace(",", " ") if isinstance(price_val, int) else f"{price_val} грн"
-            lines.append(f"• {item.get('shop','?')}: {price_str}{marker}\n  🔗 {item.get('url','')}")
-        lines.append(f"\n💡 Найдешевше: {unique_items[0].get('price','?'):,} грн на {unique_items[0].get('shop','?')}".replace(",", " "))
-        if city:
-            lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
-        return "\n".join(lines)
-
-    return (
-        f"💰 Ціни на: {product}\n\n"
-        f"Не вдалось знайти конкретні ціни автоматично.\n"
-        f"Пошукай вручну:\n{links}"
-    )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Нагадування
-# ════════════════════════════════════════════════════════════════════════════
 
 def load_reminders() -> list:
     return _load_json(REMINDERS_FILE, [])
@@ -1116,10 +1045,6 @@ async def restore_reminders(bot) -> None:
     save_reminders(valid)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Стать
-# ════════════════════════════════════════════════════════════════════════════
-
 async def detect_gender_from_transcript(text: str) -> str | None:
     if not text:
         return None
@@ -1133,10 +1058,6 @@ async def detect_gender_from_transcript(text: str) -> str | None:
     except Exception:
         return None
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Спільні дії
-# ════════════════════════════════════════════════════════════════════════════
 
 async def do_generate_image(update: Update, text: str, msg):
     t      = text.lower()
@@ -1176,10 +1097,6 @@ async def _send_or_edit(msg, text: str, **kwargs):
     for chunk in chunks[1:]:
         await msg.reply_text(chunk, **kwargs)
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Команди
-# ════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1405,10 +1322,6 @@ async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Історію чату очищено! 🔄")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Диспетчер інтентів + обробники повідомлень
-# ════════════════════════════════════════════════════════════════════════════
-
 def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
     user_text = update.message.text or ""
     if update.message.chat.type not in ("group", "supergroup"):
@@ -1631,10 +1544,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"Помилка при обробці голосового: {e}")
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Запуск
-# ════════════════════════════════════════════════════════════════════════════
 
 async def post_init(app):
     await restore_reminders(app.bot)
