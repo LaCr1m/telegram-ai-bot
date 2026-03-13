@@ -534,7 +534,7 @@ def _parse_prices(text: str) -> list[int]:
     for p in raw:
         try:
             val = int(re.sub(r'[\s\xa0]', '', p))
-            if 200 < val < 500_000:
+            if 500 < val < 500_000:
                 prices.append(val)
         except ValueError:
             pass
@@ -913,8 +913,20 @@ async def do_price(query: str) -> str:
                 if not prices:
                     prices = _parse_prices(r.text)
 
-            else:  # Hotline, Price.ua
-                prices = _parse_prices(r.text)
+            elif name == "Hotline":
+                # Hotline: ціни в data-price або у spans з класом price
+                prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 1000 < int(p) < 2_000_000]
+                if not prices:
+                    # Fallback: шукаємо ціни в JSON-LD або мета-тегах
+                    prices = [int(p) for p in re.findall(r'"price"\s*:\s*"?(\d+)"?', r.text) if 1000 < int(p) < 2_000_000]
+                if not prices:
+                    prices = [p for p in _parse_prices(r.text) if p >= 1000]
+
+            elif name == "Price.ua":
+                # Price.ua: ціни в data-price або spans
+                prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 1000 < int(p) < 2_000_000]
+                if not prices:
+                    prices = [p for p in _parse_prices(r.text) if p >= 1000]
 
             if prices:
                 html_results[name] = {"min": min(prices), "max": max(prices), "url": url}
