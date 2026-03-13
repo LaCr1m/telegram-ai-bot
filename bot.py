@@ -826,9 +826,16 @@ async def do_price(query: str) -> str:
                 url     = item.get("url", "")
                 domain  = next((d for d in ("hotline.ua", "price.ua", "rozetka.com.ua", "comfy.ua") if d in url), "")
 
+                # Пропускаємо сторінки категорій (містять змішані товари)
+                # Rozetka: /videocards/c80087/ — це категорія, не конкретний товар
+                is_category_page = bool(re.search(r'/c\d{3,}/', url))
+                if is_category_page:
+                    print(f"[Price filter] Пропущено сторінку категорії: {url[:80]}")
+                    continue
+
                 # Пропускаємо нерелевантні результати
                 if not _is_relevant(title) and not _is_relevant(content[:200]):
-                    print(f"[Price filter] Пропущено: {title[:60]}")
+                    print(f"[Price filter] Пропущено нерелевантний: {title[:60]}")
                     continue
 
                 prices = _parse_prices(content + " " + title)
