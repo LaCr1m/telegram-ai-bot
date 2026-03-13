@@ -1,4 +1,163 @@
-import os
+async def do_price(query: str) -> str:
+    # ── Витягуємо товар і місто ───────────────────────────────────────────
+    if "[Контекст попереднього повідомлення" in query:
+        prompt = (
+            f"{query}\n\n"
+            "Витягни з контексту та запиту точну назву товару і місто.\n"
+            "Правила для назви: розшифруй скорочення та неповні назви:\n"
+            "  '5090' або 'відеокарта 5090' → 'GeForce RTX 5090'\n"
+            "  '4090' або 'відеокарта 4090' → 'GeForce RTX 4090'\n"
+            "  '4080' → 'GeForce RTX 4080', '4070' → 'GeForce RTX 4070'\n"
+            "  '4060' → 'GeForce RTX 4060', '3080' → 'GeForce RTX 3080'\n"
+            "  'iPhone 16' → 'Apple iPhone 16', 'MacBook' → 'Apple MacBook'\n"
+            "Відповідай ТІЛЬКИ JSON: {\"product\": \"...\", \"city\": \"...\" або null}"
+        )
+    else:
+        clean = query.split("Запит користувача:")[-1].strip()
+        prompt = (
+            f"Витягни з цього запиту точну назву товару і місто.\n"
+            f"Правила для назви — розшифруй скорочення:\n"
+            f"  '5090' або 'відеокарта 5090' → 'GeForce RTX 5090'\n"
+            f"  '4090' → 'GeForce RTX 4090', '4080' → 'GeForce RTX 4080'\n"
+            f"  '4070' → 'GeForce RTX 4070', '4060' → 'GeForce RTX 4060'\n"
+            f"  '3080' → 'GeForce RTX 3080', '3070' → 'GeForce RTX 3070'\n"
+            f"  'iPhone 16' → 'Apple iPhone 16'\n"
+            f"  'i9 14900' → 'Intel Core i9-14900'\n"
+            f"Запит: '{clean}'\n"
+            "Відповідай ТІЛЬКИ JSON: {\"product\": \"...\", \"city\": \"...\" або null}"
+        )
+    try:
+        raw     = (await call_ai([{"role": "user", "content": prompt}])).strip()
+        raw     = raw.replace("```json", "").replace("```", "")
+        parsed  = json.loads(raw)
+        product = parsed.get("product", "").strip()
+        city    = (parsed.get("city") or "").strip()
+        city    = "" if city.lower() in ("null", "none", "") else city
+    except Exception:
+        clean   = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
+        product = clean
+        city    = ""
+
+    # Резервна нормалізація якщо AI не розпізнав
+    if re.fullmatch(r'\d{4}', product.strip()):
+        product = f"GeForce RTX {product.strip()}"
+    elif re.search(r'(?:відеокарта|видеокарта)\s+(\d{4})', product.lower()):
+        num = re.search(r'\d{4}', product).group()
+        product = f"GeForce RTX {num}"
+
+    if not product:
+        return "❌ Не вдалось визначити назву товару."
+
+    encoded = product.replace(" ", "+")
+    city_str = city or "Україна"
+
+    # ── Спроба 1: Tavily — шукає реальні ціни прямо на сторінках ────────────
+    if TAVILY_API_KEY:
+        try:
+            tavily_query = f"{product} ціна купити {city_str} site:hotline.ua OR site:price.ua OR site:rozetka.com.ua OR site:comfy.ua"
+            raw_results  = await asyncio.to_thread(
+                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(
+                    query=tavily_query, max_results=8, search_depth="advanced"
+                )
+            )
+            items = _filter_results(raw_results.get("results", []))
+            if items:
+                # Витягуємо ціни з текстів результатів
+                found_prices = []
+                for item in items:
+                    text   = item.get("content", "") + " " + item.get("title", "")
+                    domain = ""
+                    url    = item.get("url", "")
+                    for d in ("hotline.ua", "price.ua", "rozetka.com.ua", "comfy.ua"):
+                        if d in url:
+                            domain = d
+                            break
+                    prices = _parse_prices(text)
+                    if prices and domain:
+                        found_prices.append({
+                            "site":  domain,
+                            "price": min(prices),
+                            "url":   url,
+                            "title": item.get("title","")[:60],
+                        })
+
+                if found_prices:
+                    found_prices.sort(key=lambda x: x["price"])
+                    city_note = f" у {city}" if city else ""
+                    lines     = [f"💰 Ціни на: {product}{city_note}\n"]
+                    seen_sites: set[str] = set()
+                    for fp in found_prices[:6]:
+                        marker = " 🏆" if not seen_sites else ""
+                        seen_sites.add(fp["site"])
+                        lines.append(
+                            f"• {fp['site']}: {fp['price']:,} грн{marker}\n"
+                            f"  {fp['title']}\n"
+                            f"  🔗 {fp['url']}"
+                        .replace(",", " "))
+                    lines.append(f"\n💡 Найдешевше: {found_prices[0]['price']:,} грн на {found_prices[0]['site']}".replace(",", " "))
+                    if city:
+                        lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
+                    return "\n".join(lines)
+        except Exception as e:
+            print(f"[Tavily price error]: {e}")
+
+    # ── Спроба 2: прямий парсинг HTML ────────────────────────────────────────
+    sites = {
+        "Hotline":  f"https://hotline.ua/search/?q={encoded}",
+        "Price.ua": f"https://price.ua/search/?text={encoded}",
+        "Rozetka":  f"https://rozetka.com.ua/ua/search/?text={encoded}",
+        "Comfy":    f"https://comfy.ua/ua/search/?q={encoded}",
+    }
+    html_results: dict[str, dict] = {}
+
+    async def _fetch_prices(name: str, url: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                r = await client.get(url, headers=_HEADERS)
+            if name == "Rozetka":
+                prices = [int(p) for p in re.findall(r'"price":(\d+)', r.text) if 50 < int(p) < 500_000]
+            elif name == "Comfy":
+                prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 50 < int(p) < 500_000]
+                if not prices:
+                    prices = _parse_prices(r.text)
+            else:
+                prices = _parse_prices(r.text)
+            if prices:
+                html_results[name] = {"min": min(prices), "max": max(prices), "url": url}
+        except Exception as e:
+            print(f"[{name} error]: {e}")
+
+    await asyncio.gather(*[_fetch_prices(n, u) for n, u in sites.items()])
+
+    if html_results:
+        cheapest  = min(html_results, key=lambda s: html_results[s]["min"])
+        city_note = f" у {city}" if city else ""
+        lines     = [f"💰 Ціни на: {product}{city_note}\n"]
+        for site, data in html_results.items():
+            tag       = " 🏆" if site == cheapest else ""
+            price_str = (
+                f"{data['min']:,} грн".replace(",", " ")
+                if data["min"] == data["max"]
+                else f"{data['min']:,} – {data['max']:,} грн".replace(",", " ")
+            )
+            lines.append(f"• {site}: {price_str}{tag}\n  🔗 {data['url']}")
+        lines.append(f"\n💡 Найдешевше на {cheapest}: {html_results[cheapest]['min']:,} грн".replace(",", " "))
+        if city:
+            lines.append(f"📍 Наявність у {city} — уточнюй безпосередньо в магазині.")
+        return "\n".join(lines)
+
+    # ── Спроба 3: загальний пошук + посилання ────────────────────────────────
+    search_results = await search_web(f"{product} купити ціна {city_str}")
+    links = (
+        f"• https://hotline.ua/search/?q={encoded}\n"
+        f"• https://price.ua/search/?text={encoded}\n"
+        f"• https://rozetka.com.ua/ua/search/?text={encoded}\n"
+        f"• https://comfy.ua/ua/search/?q={encoded}"
+    )
+    if not search_results:
+        return f"❌ Не вдалось знайти ціни на «{product}».\n\nПошукай вручну:\n{links}"
+
+    summary = import os
 import re
 import httpx
 import base64
