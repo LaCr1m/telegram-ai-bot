@@ -302,34 +302,22 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Утиліти
 # ════════════════════════════════════════════════════════════════════════════
 
-def resolve_text_with_context(user_id: int, text: str) -> str:
-    """Якщо є збережений контекст і текст схожий на продовження — підставляємо його."""
+async def resolve_text_with_context(user_id: int, text: str) -> str:
+    """AI визначає чи повідомлення відноситься до попереднього контексту."""
     ctx = last_context.get(user_id)
     if not ctx:
         return text
 
-    t = text.lower().strip()
+    check = await call_ai([{"role": "user", "content": (
+        f"Попередній контекст розмови — {ctx['type']}: «{ctx['description'][:300]}»\n"
+        f"Нове повідомлення: «{text}»\n\n"
+        "Чи це нове повідомлення стосується попереднього контексту? "
+        "Відповідай ТІЛЬКИ 'yes' або 'no'."
+    )}])
 
-    # Короткі повідомлення (до 8 слів) майже завжди відносяться до попереднього контексту
-    is_short = len(t.split()) <= 8
-
-    context_hints = [
-        "це", "цей", "цю", "цього", "той", "те", "таке",
-        "на фото", "на зображенні", "на картинці", "з фото", "з картинки",
-        "у відео", "з відео", "цей товар", "ця річ", "цей продукт", "цей предмет",
-        "знайди", "знайти", "пошукай", "пошукати", "шукай",
-        "скільки коштує", "скільки вартує", "яка ціна", "яка вартість", "якаартикул",
-        "де купити", "де придбати", "де знайти", "де продається", "де замовити",
-        "що це таке", "що це", "розкажи більше", "докладніше",
-        "ще про це", "більше інфо", "більше інформації",
-        "переклади це", "підсумуй це", "що думаєш про це",
-        "як використовувати", "як готувати", "рецепт з цим",
-        "купити", "придбати", "замовити", "ціна", "вартість", "ціну", "артикул",
-    ]
-
-    if is_short or any(hint in t for hint in context_hints):
+    if "yes" in check.lower():
         return (
-            f"[Контекст попереднього повідомлення — {ctx['type']}: {ctx['description']}]\n\n"
+            f"[Контекст попереднього повідомлення — {ctx['type']}: {ctx['description'][:500]}]\n\n"
             f"Запит користувача: {text}"
         )
     return text
@@ -1111,8 +1099,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not addressed:
         return
     user_id  = update.message.from_user.id
-    # Підставляємо контекст якщо є логічний зв'язок з попереднім повідомленням
-    enriched = resolve_text_with_context(user_id, user_text)
+    enriched = await resolve_text_with_context(user_id, user_text)
     intent   = await detect_intent(enriched)
 
     if intent == "image":
