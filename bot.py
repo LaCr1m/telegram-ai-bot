@@ -407,6 +407,8 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r'__(.*?)__',     r'\1', text)
     text = re.sub(r'_(.*?)_',       r'\1', text)
     text = re.sub(r'`(.*?)`',       r'\1', text)
+    # Конвертуємо markdown посилання [текст](url) → просто url
+    text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1: \2', text)
     return text
 
 def get_history(user_id: int) -> list:
