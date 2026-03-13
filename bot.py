@@ -791,17 +791,33 @@ async def do_price(query: str) -> str:
     if not product:
         return "❌ Не вдалось визначити назву товару."
 
+    # ── Визначаємо чи це продукт харчування ──────────────────────────────
+    food_check = await call_ai([{"role": "user", "content": (
+        f"Чи є '{product}' продуктом харчування або напоєм? "
+        "Відповідай ТІЛЬКИ 'yes' або 'no'."
+    )}])
+    is_food = "yes" in food_check.strip().lower()
+
     encoded  = product.replace(" ", "+")
     city_str = city or "Україна"
-    links    = (
-        f"• https://hotline.ua/search/?q={encoded}\n"
-        f"• https://price.ua/search/?text={encoded}\n"
-        f"• https://rozetka.com.ua/ua/search/?text={encoded}\n"
-        f"• https://comfy.ua/ua/search/?q={encoded}"
-    )
+    if is_food:
+        links = (
+            f"• https://silpo.ua/search?search={encoded}\n"
+            f"• https://metro.ua/uk/search?query={encoded}\n"
+            f"• https://fozzyshop.ua/ua/search?controller=search&s={encoded}\n"
+            f"• https://www.atbmarket.com/catalog/search?query={encoded}"
+        )
+    else:
+        links    = (
+            f"• https://hotline.ua/search/?q={encoded}\n"
+            f"• https://rozetka.com.ua/ua/search/?text={encoded}\n"
+            f"• https://comfy.ua/ua/search/?q={encoded}\n"
+            f"• https://www.ktc.ua/ua/search/?q={encoded}"
+        )
 
-    # ── Ключові слова для фільтрації нерелевантних результатів ─────────────
-    product_keywords = [w.lower() for w in re.split(r'\s+', product) if len(w) > 2]
+    # Ключові слова для фільтрації нерелевантних результатів
+    # Числа та слова довжиною > 2 символи
+    product_keywords = [w.lower() for w in re.split(r'[\s\-/]+', product) if len(w) > 2]
 
     def _is_relevant(title: str) -> bool:
         t = title.lower()
@@ -810,10 +826,17 @@ async def do_price(query: str) -> str:
     # ── Спроба 1: Tavily advanced ─────────────────────────────────────────
     if TAVILY_API_KEY:
         try:
-            tavily_query = (
-                f'"{product}" ціна купити {city_str} '
-                "site:hotline.ua OR site:price.ua OR site:rozetka.com.ua OR site:comfy.ua"
-            )
+            if is_food:
+                tavily_query = (
+                    f'"{product}" ціна купити {city_str} '
+                    "site:silpo.ua OR site:metro.ua OR site:fozzyshop.ua OR site:atbmarket.com"
+                )
+                food_domains = ("silpo.ua", "metro.ua", "fozzyshop.ua", "atbmarket.com")
+            else:
+                tavily_query = (
+                    f'"{product}" ціна купити {city_str} '
+                    "site:hotline.ua OR site:rozetka.com.ua OR site:comfy.ua OR site:ktc.ua"
+                )
             raw_results = await asyncio.to_thread(
                 lambda: TavilyClient(api_key=TAVILY_API_KEY).search(
                     query=tavily_query, max_results=8, search_depth="advanced"
@@ -874,12 +897,20 @@ async def do_price(query: str) -> str:
             print(f"[Tavily price error]: {e}")
 
     # ── Спроба 2: прямий парсинг HTML ────────────────────────────────────
-    sites = {
-        "Hotline":  f"https://hotline.ua/search/?q={encoded}",
-        "Price.ua": f"https://price.ua/search/?text={encoded}",
-        "Rozetka":  f"https://rozetka.com.ua/ua/search/?text={encoded}",
-        "Comfy":    f"https://comfy.ua/ua/search/?q={encoded}",
-    }
+    if is_food:
+        sites = {
+            "Сільпо":     f"https://silpo.ua/search?search={encoded}",
+            "Metro":      f"https://metro.ua/uk/search?query={encoded}",
+            "Fozzy":      f"https://fozzyshop.ua/ua/search?controller=search&s={encoded}",
+            "АТБ":        f"https://www.atbmarket.com/catalog/search?query={encoded}",
+        }
+    else:
+        sites = {
+            "Hotline": f"https://hotline.ua/search/?q={encoded}",
+            "Rozetka": f"https://rozetka.com.ua/ua/search/?text={encoded}",
+            "Comfy":   f"https://comfy.ua/ua/search/?q={encoded}",
+            "KTC":     f"https://www.ktc.ua/ua/search/?q={encoded}",
+        }
     html_results: dict[str, dict] = {}
 
     async def _fetch_prices(name: str, url: str) -> None:
@@ -912,6 +943,30 @@ async def do_price(query: str) -> str:
                 prices = [int(p) for p in re.findall(r'data-price="(\d+)"', r.text) if 200 < int(p) < 1_000_000]
                 if not prices:
                     prices = _parse_prices(r.text)
+
+            if name in ("Сільпо", "Metro", "Fozzy", "АТБ"):
+                # Продуктові магазини — ціни зазвичай в JSON або data-атрибутах
+                prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 1 < int(p) < 100_000]
+                if not prices:
+                    prices = [int(p) for p in re.findall(r'"price"\s*:\s*"?(\d+\.?\d*)"?', r.text)
+                              if 1 < float(p) < 100_000]
+                if not prices:
+                    # Для продуктів нижня межа менша (можуть бути товари по 10-20 грн)
+                    raw = re.findall(r'[\s>](\d[\d\s\xa0]{0,5})\s*(?:грн|₴)', r.text)
+                    for p in raw:
+                        try:
+                            val = int(re.sub(r'[\s\xa0]', '', p))
+                            if 5 < val < 100_000:
+                                prices.append(val)
+                        except ValueError:
+                            pass
+
+            elif name == "KTC":
+                prices = [int(p) for p in re.findall(r'data-price=["\'](\d+)["\']', r.text) if 500 < int(p) < 2_000_000]
+                if not prices:
+                    prices = [int(p) for p in re.findall(r'"price"\s*:\s*"?(\d+)"?', r.text) if 500 < int(p) < 2_000_000]
+                if not prices:
+                    prices = [p for p in _parse_prices(r.text) if p >= 500]
 
             elif name == "Hotline":
                 # Hotline: ціни в data-price або у spans з класом price
