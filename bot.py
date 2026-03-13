@@ -302,6 +302,20 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Утиліти
 # ════════════════════════════════════════════════════════════════════════════
 
+def detect_intent_local(text: str) -> str | None:
+    t = text.lower()
+    if any(kw in t for kw in IMAGE_KEYWORDS):    return "image"
+    if any(kw in t for kw in REMIND_KEYWORDS):   return "reminder"
+    if any(kw in t for kw in NEWS_KEYWORDS):     return "news"
+    if any(kw in t for kw in TRANSLATE_KEYWORDS):return "translate"
+    if any(kw in t for kw in RECIPE_KEYWORDS):   return "recipe"
+    if any(kw in t for kw in GENERATE_KEYWORDS): return "generate"
+    if any(kw in t for kw in TASK_KEYWORDS):     return "task"
+    if any(kw in t for kw in SUMMARIZE_KEYWORDS):return "summarize"
+    if any(kw in t for kw in SEARCH_KEYWORDS):   return "search"
+    if re.search(r'https?://\S+', text):         return "summarize"
+    return None
+
 async def resolve_text_with_context(user_id: int, text: str) -> str:
     """Визначає чи повідомлення відноситься до попереднього контексту."""
     ctx = last_context.get(user_id)
@@ -380,8 +394,10 @@ async def detect_intent_ai(text: str) -> str:
     return result.strip().lower().strip("'\"")
 
 async def detect_intent(text: str) -> str:
-    local = detect_intent_local(text)
-    return local if local else await detect_intent_ai(text)
+    # Прибираємо префікс контексту перед перевіркою ключових слів
+    clean = text.split("Запит користувача:")[-1].strip() if "Запит користувача:" in text else text
+    local = detect_intent_local(clean)
+    return local if local else await detect_intent_ai(clean)
 
 def clean_markdown(text: str) -> str:
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
