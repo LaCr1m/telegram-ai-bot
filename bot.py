@@ -568,14 +568,41 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 async def search_web(query: str) -> str:
+    # Спроба 1: Tavily
+    if TAVILY_API_KEY:
+        try:
+            results = await asyncio.to_thread(tavily_client.search, query=query, max_results=3)
+            output  = ""
+            for item in results.get("results", []):
+                output += f"{item['title']}\n{item['content'][:300]}\n{item['url']}\n\n"
+            if output:
+                return output
+        except Exception as e:
+            pass  # Переходимо до fallback
+
+    # Спроба 2: DuckDuckGo через httpx (без API ключа)
     try:
-        results = await asyncio.to_thread(tavily_client.search, query=query, max_results=3)
-        output  = ""
-        for item in results.get("results", []):
-            output += f"{item['title']}\n{item['content'][:300]}\n{item['url']}\n\n"
-        return output or "Нічого не знайдено."
-    except Exception as e:
-        return f"Помилка пошуку: {e}"
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(
+                "https://api.duckduckgo.com/",
+                params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            data    = r.json()
+            output  = ""
+            # AbstractText
+            if data.get("AbstractText"):
+                output += f"{data['AbstractText']}\n{data.get('AbstractURL','')}\n\n"
+            # RelatedTopics
+            for topic in data.get("RelatedTopics", [])[:3]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    output += f"{topic['Text']}\n{topic.get('FirstURL','')}\n\n"
+            if output:
+                return output
+    except Exception:
+        pass
+
+    return ""  # Порожній рядок — AI відповість зі своїх знань
 
 async def fetch_url_text(url: str) -> str:
     """Завантажує текст сторінки за посиланням."""
@@ -1205,10 +1232,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg     = await update.message.reply_text("🌐 Шукаю в інтернеті...")
         results = await search_web(enriched)
         try:
-            reply = await call_ai([
-                SYSTEM_PROMPT,
-                {"role": "user", "content": f"Запит: '{enriched}'\n\nРезультати:\n{results}\n\nДай корисну відповідь українською."}
-            ])
+            content = f"Запит: '{enriched}'\n\nРезультати пошуку:\n{results}\n\nДай корисну відповідь українською." \
+                      if results else \
+                      f"Запит: '{enriched}'\n\nВідповідай з власних знань українською. Якщо не знаєш точної інформації — скажи що краще перевірити на офіційних сайтах."
+            reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}])
             append_and_trim(user_id, "user", user_text)
             append_and_trim(user_id, "assistant", reply)
             await msg.edit_text(clean_markdown(reply))
