@@ -24,31 +24,14 @@ CF_API_TOKEN       = os.environ.get("CF_API_TOKEN")
 CF_ACCOUNT_ID      = os.environ.get("CF_ACCOUNT_ID")
 NEWS_API_KEY       = os.environ.get("NEWS_API_KEY")
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-CF_IMAGE_URL   = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-
-# ── Моделі (пріоритет зверху вниз) ───────────────────────────────────────────
-# Основний чат і більшість задач
-MODELS_CHAT = [
-    "google/gemini-2.0-flash-exp:free",   # найрозумніша безкоштовна, vision
-    "deepseek/deepseek-r1:free",           # сильне мислення
-    "meta-llama/llama-3.3-70b-instruct:free",  # надійний fallback
-]
-# Складні задачі: generate, summarize, recipe, news
-MODELS_PRO = [
-    "google/gemini-2.0-flash-exp:free",
-    "deepseek/deepseek-r1:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-]
-# Vision (аналіз зображень/відео)
-MODELS_VISION = [
-    "google/gemini-2.0-flash-exp:free",   # підтримує vision
-    "google/gemini-flash-1.5:free",        # fallback vision
-    "meta-llama/llama-3.2-11b-vision-instruct:free",
-]
-
-PRO_INTENTS = {"generate", "summarize", "recipe", "news"}
+OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
+GROQ_URL                  = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_WHISPER_URL          = "https://api.groq.com/openai/v1/audio/transcriptions"
+OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"
+OPENROUTER_MODEL_FALLBACK = "openrouter/free"
+GROQ_MODEL                = "llama-3.3-70b-versatile"
+VISION_MODEL              = "openrouter/auto"
+CF_IMAGE_URL              = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
 
 MAX_HISTORY_MESSAGES = 20
 SUMMARY_THRESHOLD    = 16
@@ -56,7 +39,13 @@ REMINDERS_FILE       = "reminders.json"
 MEMORY_FILE          = "memory.json"
 TASKS_FILE           = "tasks.json"
 HISTORY_FILE         = "history.json"
-_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+BLOCKED_DOMAINS      = {"olx.ua", "olx.com.ua"}
+
+UA_NEWS_DOMAINS = [
+    "ukrinform.ua", "ukrinform.net", "pravda.com.ua", "epravda.com.ua",
+    "suspilne.media", "radiosvoboda.org", "unian.ua", "unian.net",
+    "interfax.com.ua", "zn.ua", "tsn.ua", "liga.net", "nv.ua", "hromadske.ua", "lb.ua",
+]
 
 SYSTEM_PROMPT = {
     "role": "system",
@@ -87,20 +76,15 @@ RECIPE_KEYWORDS    = ["що приготувати","що зробити з","р
 NEWS_KEYWORDS      = ["новини про","новини щодо","що нового про","останні новини про","news about","що відбувається з","новини на тему"]
 TASK_KEYWORDS      = ["додай задачу","додай до списку","запам'ятай задачу","нова задача","видали задачу","видалити задачу","покажи задачі","мої задачі","список задач","виконано","задачу виконано"]
 
-UA_NEWS_DOMAINS = [
-    "ukrinform.ua","ukrinform.net","pravda.com.ua","epravda.com.ua",
-    "suspilne.media","radiosvoboda.org","unian.ua","unian.net",
-    "interfax.com.ua","zn.ua","tsn.ua","liga.net","nv.ua","hromadske.ua","lb.ua",
-]
-
 chat_histories:     dict[int, list] = {}
 user_personalities: dict[int, str]  = {}
 last_context:       dict[int, dict] = {}
+or_requests = {"count": 0, "date": date.today()}
+OR_DAILY_LIMIT = 190
+_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 
-# ── JSON helpers ──────────────────────────────────────────────────────────────
-
-def _load_json(path, default):
+def _load_json(path: str, default):
     if not os.path.exists(path):
         return default
     try:
@@ -109,97 +93,18 @@ def _load_json(path, default):
     except Exception:
         return default
 
-def _save_json(path, data):
+def _save_json(path: str, data) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-
-# ── OpenRouter API ────────────────────────────────────────────────────────────
-
-async def _or_call(messages: list, models: list, retries: int = 2) -> str:
-    """Перебирає моделі по черзі з retry, повертає першу успішну відповідь."""
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://t.me/jarvis_bot",
-    }
-    last_err = None
-    # Будуємо чергу: кожна модель спробується `retries` разів перед переходом до наступної
-    for model in models:
-        for attempt in range(retries):
-            try:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    r = await client.post(
-                        OPENROUTER_URL, headers=headers,
-                        json={"model": model, "messages": messages}
-                    )
-                if r.status_code in (429, 503, 529):
-                    last_err = f"{model}: HTTP {r.status_code}"
-                    wait = 3 * (attempt + 1)   # 3с → 6с між спробами
-                    await asyncio.sleep(wait)
-                    continue
-                if r.status_code == 404:
-                    last_err = f"{model}: not found"
-                    break                       # цю модель більше не пробуємо
-                r.raise_for_status()
-                content = r.json()["choices"][0]["message"]["content"]
-                if content:
-                    return content
-                last_err = f"{model}: empty response"
-            except Exception as e:
-                last_err = str(e)
-                await asyncio.sleep(2)
-    raise RuntimeError(f"Всі моделі недоступні. Остання помилка: {last_err}")
-
-async def _groq_fallback(messages: list) -> str:
-    """Groq як останній резерв коли всі OpenRouter моделі недоступні."""
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY не налаштовано")
-    # Groq не підтримує vision-контент — фільтруємо складні повідомлення
-    simple = []
-    for m in messages:
-        if isinstance(m.get("content"), list):
-            text_parts = [p["text"] for p in m["content"] if p.get("type") == "text"]
-            simple.append({"role": m["role"], "content": " ".join(text_parts)})
-        else:
-            simple.append(m)
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(GROQ_CHAT_URL, headers=headers,
-                              json={"model": GROQ_CHAT_MODEL, "messages": simple})
-        r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
-
-async def call_ai(messages: list, intent: str = "chat") -> str:
-    models = MODELS_PRO if intent in PRO_INTENTS else MODELS_CHAT
-    try:
-        return await _or_call(messages, models)
-    except RuntimeError:
-        # Всі OpenRouter моделі впали — пробуємо Groq
-        return await _groq_fallback(messages)
-
-async def call_vision(messages: list) -> str:
-    return await _or_call(messages, MODELS_VISION)
-
-async def transcribe_voice(audio_bytes: bytes) -> str:
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    files   = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
-    data    = {"model": "whisper-large-v3", "language": "uk", "response_format": "text"}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(GROQ_WHISPER_URL, headers=headers, files=files, data=data)
-        r.raise_for_status()
-    return r.text.strip()
-
-
-# ── Memory ────────────────────────────────────────────────────────────────────
 
 def get_user_memory(user_id: int) -> dict:
     return _load_json(MEMORY_FILE, {}).get(str(user_id), {})
 
 def update_user_memory(user_id: int, data: dict) -> None:
-    mem = _load_json(MEMORY_FILE, {})
-    mem.setdefault(str(user_id), {}).update(data)
-    _save_json(MEMORY_FILE, mem)
+    memory = _load_json(MEMORY_FILE, {})
+    memory.setdefault(str(user_id), {}).update(data)
+    _save_json(MEMORY_FILE, memory)
 
 async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> None:
     try:
@@ -209,15 +114,15 @@ async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> N
             "Відповідай ТІЛЬКИ у форматі JSON: {\"name\": \"...\", \"facts\": [\"факт1\"]} "
             "або {} якщо нічого важливого немає. Нічого більше не пиши."
         )}])
-        data = json.loads(result.strip().replace("```json","").replace("```",""))
+        data = json.loads(result.strip().replace("```json", "").replace("```", ""))
         if not data:
             return
-        m = get_user_memory(user_id)
-        if "name" not in m and data.get("name"):
-            m["name"] = data["name"]
+        mem = get_user_memory(user_id)
+        if "name" not in mem and data.get("name"):
+            mem["name"] = data["name"]
         if data.get("facts"):
-            m["facts"] = list(set(m.get("facts", [])) | set(data["facts"]))
-        update_user_memory(user_id, m)
+            mem["facts"] = list(set(mem.get("facts", [])) | set(data["facts"]))
+        update_user_memory(user_id, mem)
     except Exception:
         pass
 
@@ -236,18 +141,17 @@ def get_system_prompt(user_id: int) -> dict:
     return {"role": "system", "content": p["prompt"] + gender_suffix(user_id)}
 
 
-# ── History ───────────────────────────────────────────────────────────────────
-
-def save_histories():
+def save_histories() -> None:
     to_save = {}
-    for uid, h in chat_histories.items():
-        msgs = [m for m in h if m.get("role") != "system"]
+    for uid, history in chat_histories.items():
+        msgs = [m for m in history if m.get("role") != "system"]
         if msgs:
             to_save[str(uid)] = msgs[-MAX_HISTORY_MESSAGES:]
     _save_json(HISTORY_FILE, to_save)
 
-def restore_histories():
-    for uid_str, msgs in _load_json(HISTORY_FILE, {}).items():
+def restore_histories() -> None:
+    data = _load_json(HISTORY_FILE, {})
+    for uid_str, msgs in data.items():
         uid = int(uid_str)
         chat_histories[uid] = [get_system_prompt(uid)] + msgs
 
@@ -256,14 +160,15 @@ def get_history(user_id: int) -> list:
         chat_histories[user_id] = [get_system_prompt(user_id)]
     return chat_histories[user_id]
 
-async def _compress_history(user_id: int):
+async def _compress_history(user_id: int) -> None:
     history = chat_histories.get(user_id, [])
     msgs    = [m for m in history if m.get("role") != "system"]
     if len(msgs) < 8:
         return
-    old, fresh = msgs[:-6], msgs[-6:]
+    old   = msgs[:-6]
+    fresh = msgs[-6:]
     old_text = "\n".join(
-        f"{'Користувач' if m['role']=='user' else 'Бот'}: "
+        f"{'Користувач' if m['role'] == 'user' else 'Бот'}: "
         f"{m['content'] if isinstance(m['content'], str) else '[медіа]'}"
         for m in old
     )
@@ -277,13 +182,15 @@ async def _compress_history(user_id: int):
 
     async def _save_topic():
         try:
-            topic = (await call_ai([{"role": "user", "content": (
+            topic = await call_ai([{"role": "user", "content": (
                 f"Визнач головну тему цього діалогу одним реченням до 10 слів. "
                 f"Відповідай ТІЛЬКИ темою.\n\n{old_text[:1000]}"
-            )}])).strip()
+            )}])
+            topic = topic.strip()
             if topic:
-                m = get_user_memory(user_id)
-                update_user_memory(user_id, {"topics": ([topic] + m.get("topics", []))[:10]})
+                mem    = get_user_memory(user_id)
+                topics = ([topic] + mem.get("topics", []))[:10]
+                update_user_memory(user_id, {"topics": topics})
         except Exception:
             pass
     asyncio.create_task(_save_topic())
@@ -294,27 +201,26 @@ async def _compress_history(user_id: int):
         + fresh
     )
 
-async def append_and_trim(user_id: int, role: str, content):
+async def append_and_trim(user_id: int, role: str, content) -> None:
     get_history(user_id).append({"role": role, "content": content})
     msgs = [m for m in chat_histories[user_id] if m.get("role") != "system"]
     if len(msgs) >= SUMMARY_THRESHOLD:
         await _compress_history(user_id)
     elif len(chat_histories[user_id]) > MAX_HISTORY_MESSAGES + 1:
         chat_histories[user_id] = (
-            [get_system_prompt(user_id)] + chat_histories[user_id][-MAX_HISTORY_MESSAGES:]
+            [get_system_prompt(user_id)]
+            + chat_histories[user_id][-MAX_HISTORY_MESSAGES:]
         )
     save_histories()
 
 
-# ── Tasks ─────────────────────────────────────────────────────────────────────
-
 def get_user_tasks(user_id: int) -> list:
     return _load_json(TASKS_FILE, {}).get(str(user_id), [])
 
-def set_user_tasks(user_id: int, tasks: list):
-    t = _load_json(TASKS_FILE, {})
-    t[str(user_id)] = tasks
-    _save_json(TASKS_FILE, t)
+def set_user_tasks(user_id: int, tasks: list) -> None:
+    all_tasks = _load_json(TASKS_FILE, {})
+    all_tasks[str(user_id)] = tasks
+    _save_json(TASKS_FILE, all_tasks)
 
 async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -332,13 +238,13 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     cmd = args[0].lower()
     if cmd == "add":
-        text = " ".join(args[1:])
-        if not text:
+        task_text = " ".join(args[1:])
+        if not task_text:
             await update.message.reply_text("Вкажи текст задачі: /tasks add Купити молоко")
             return
-        tasks.append({"text": text, "done": False})
+        tasks.append({"text": task_text, "done": False})
         set_user_tasks(user_id, tasks)
-        await update.message.reply_text(f"✅ Задачу додано: {text}")
+        await update.message.reply_text(f"✅ Задачу додано: {task_text}")
     elif cmd in ("done", "del"):
         if len(args) < 2 or not args[1].isdigit():
             await update.message.reply_text(f"Вкажи номер: /tasks {cmd} 1")
@@ -362,8 +268,6 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❓ Невідома команда. Використай: add / done / del / clear")
 
 
-# ── Intent detection ──────────────────────────────────────────────────────────
-
 def detect_intent_local(text: str) -> str | None:
     t = text.lower()
     if any(kw in t for kw in IMAGE_KEYWORDS):     return "image"
@@ -375,7 +279,7 @@ def detect_intent_local(text: str) -> str | None:
     if any(kw in t for kw in TASK_KEYWORDS):      return "task"
     if any(kw in t for kw in SUMMARIZE_KEYWORDS): return "summarize"
     if any(kw in t for kw in SEARCH_KEYWORDS):    return "search"
-    if re.search(r'https?://\S+', text):           return "summarize"
+    if re.search(r'https?://\S+', text):          return "summarize"
     return None
 
 async def detect_intent_ai(text: str) -> str:
@@ -407,11 +311,14 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
     t     = text.lower().strip()
     words = t.split()
     if len(words) > 12:
-        if not any(h in t for h in ["розкажи про","що таке ","поясни ","напиши про","хто такий"]):
+        if not any(h in t for h in ["розкажи про", "що таке ", "поясни ", "напиши про", "хто такий"]):
             return text
     strong_hints = [
         "це","цей","цю","цього","на фото","з фото","на зображенні",
-        "з відео","у відео","що він продає","що вона продає","що там є",
+        "знайди","пошукай","що це","розкажи більше","докладніше","ще про",
+        "як використовувати","рецепт з","з відео","у відео",
+        "цей магазин","цей сайт","ця компанія","цей товар","цей продукт",
+        "що він продає","що вона продає","що там є","що там продають",
         "яка адреса","який графік","як туди","контакти","телефон магазину",
         "що ще","що інше","а ще","і ще","також розкажи",
     ]
@@ -444,14 +351,59 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1: \2', text)
     return text
 
-def _set_ctx(user_id: int, user_text: str, reply: str):
+def _set_ctx(user_id: int, user_text: str, reply: str) -> None:
     last_context[user_id] = {
         "type": "текст",
         "description": f"Запит: {user_text}\nВідповідь: {reply[:400]}"
     }
 
 
-# ── Image generation ──────────────────────────────────────────────────────────
+def get_text_provider() -> str:
+    today = date.today()
+    if or_requests["date"] != today:
+        or_requests["date"]  = today
+        or_requests["count"] = 0
+    return "openrouter" if or_requests["count"] < OR_DAILY_LIMIT else "groq"
+
+async def call_ai(messages: list) -> str:
+    provider = get_text_provider()
+    if provider == "openrouter":
+        for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
+            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(OPENROUTER_URL, headers=headers, json={"model": model, "messages": messages})
+            if r.status_code == 404:
+                continue
+            if r.status_code == 429:
+                # Переключаємось на Groq без рекурсії
+                or_requests["count"] = OR_DAILY_LIMIT
+                break
+            r.raise_for_status()
+            or_requests["count"] += 1
+            return r.json()["choices"][0]["message"]["content"]
+        # Fallback на Groq
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
+        r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+async def call_vision(messages: list) -> str:
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(OPENROUTER_URL, headers=headers, json={"model": VISION_MODEL, "messages": messages})
+        r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+async def transcribe_voice(audio_bytes: bytes) -> str:
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    files   = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
+    data    = {"model": "whisper-large-v3", "language": "uk", "response_format": "text"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(GROQ_WHISPER_URL, headers=headers, files=files, data=data)
+        r.raise_for_status()
+    return r.text.strip()
+
 
 async def generate_image(prompt: str) -> bytes:
     url     = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
@@ -471,14 +423,12 @@ async def generate_image(prompt: str) -> bytes:
     raise last_error
 
 
-# ── Video analysis ────────────────────────────────────────────────────────────
-
 async def extract_video_audio(video_bytes: bytes) -> bytes:
     with open("/tmp/input_video.mp4", "wb") as f:
         f.write(video_bytes)
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg","-y","-i","/tmp/input_video.mp4",
-        "-vn","-ar","16000","-ac","1","-f","ogg","/tmp/output_audio.ogg",
+        "ffmpeg", "-y", "-i", "/tmp/input_video.mp4",
+        "-vn", "-ar", "16000", "-ac", "1", "-f", "ogg", "/tmp/output_audio.ogg",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     await proc.communicate()
@@ -489,11 +439,11 @@ async def extract_video_frames(video_bytes: bytes, max_frames: int = 3) -> list[
     with open("/tmp/input_video.mp4", "wb") as f:
         f.write(video_bytes)
     frames = []
-    for i, t in enumerate(["00:00:01","00:00:05","00:00:10"][:max_frames]):
+    for i, t in enumerate(["00:00:01", "00:00:05", "00:00:10"][:max_frames]):
         out_path = f"/tmp/frame_{i}.jpg"
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg","-y","-ss",t,"-i","/tmp/input_video.mp4",
-            "-frames:v","1","-q:v","2",out_path,
+            "ffmpeg", "-y", "-ss", t, "-i", "/tmp/input_video.mp4",
+            "-frames:v", "1", "-q:v", "2", out_path,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         await proc.communicate()
@@ -531,8 +481,6 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
     return f"{combined}\n\n📝 Підсумок:\n{summary}"
 
 
-# ── Web search ────────────────────────────────────────────────────────────────
-
 async def search_web(query: str) -> str:
     if TAVILY_API_KEY:
         try:
@@ -542,6 +490,7 @@ async def search_web(query: str) -> str:
             output = "".join(
                 f"{i['title']}\n{i['content'][:400]}\n{i['url']}\n\n"
                 for i in results.get("results", [])
+                if not any(bd in i.get("url", "") for bd in BLOCKED_DOMAINS)
             )
             if output:
                 return output
@@ -555,10 +504,10 @@ async def search_web(query: str) -> str:
         titles   = re.findall(r'class="result__a"[^>]*>(.*?)</a>', r.text, re.DOTALL)
         output   = ""
         for i in range(min(4, len(snippets))):
-            t = re.sub(r'<[^>]+>','',titles[i]).strip()   if i < len(titles)  else ""
-            s = re.sub(r'<[^>]+>','',snippets[i]).strip()
-            l = links[i].strip()                           if i < len(links)   else ""
-            if s:
+            t = re.sub(r'<[^>]+>', '', titles[i]).strip()   if i < len(titles)   else ""
+            s = re.sub(r'<[^>]+>', '', snippets[i]).strip()
+            l = links[i].strip()                            if i < len(links)    else ""
+            if s and not any(bd in l for bd in BLOCKED_DOMAINS):
                 output += f"{t}\n{s}\n{l}\n\n"
         if output:
             return output
@@ -575,9 +524,6 @@ async def fetch_url_text(url: str) -> str:
         return re.sub(r'\s+', ' ', text).strip()[:6000]
     except Exception as e:
         return f"Помилка завантаження: {e}"
-
-
-# ── File extraction ───────────────────────────────────────────────────────────
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     try:
@@ -617,15 +563,13 @@ def extract_word_text(docx_bytes: bytes) -> str:
         return f"Помилка читання Word: {e}"
 
 
-# ── Intent handlers ───────────────────────────────────────────────────────────
-
 async def do_translate(text: str) -> str:
     return await call_ai([{"role": "user", "content": (
         f"Визнач мову цього тексту і перекладай його. Якщо текст українською — перекладай на англійську. "
         f"Якщо іншою мовою — перекладай на українську. "
         f"Якщо у запиті вказана конкретна мова — використай її.\n\n"
         f"Текст: {text}\n\nФормат:\n🌐 Оригінал (мова): ...\n✅ Переклад: ..."
-    )}], intent="translate")
+    )}])
 
 async def do_summarize(text: str) -> str:
     url_match = re.search(r'https?://\S+', text)
@@ -646,7 +590,7 @@ async def do_summarize(text: str) -> str:
             f"Зроби стислий підсумок цього тексту українською мовою.\n\n"
             f"Текст: {text}\n\nФормат: 📌 Головна думка\n🔹 Ключові тези"
         )
-    return await call_ai([{"role": "user", "content": prompt}], intent="summarize")
+    return await call_ai([{"role": "user", "content": prompt}])
 
 async def do_generate(text: str) -> str:
     return await call_ai([SYSTEM_PROMPT, {"role": "user", "content": (
@@ -655,16 +599,16 @@ async def do_generate(text: str) -> str:
         "Якщо це резюме — додай всі стандартні розділи. "
         "Якщо лист — дотримуйся ділового або особистого стилю. "
         "Якщо пост — зроби його живим і залучальним."
-    )}], intent="generate")
+    )}])
 
 async def do_recipe(text: str) -> str:
     return await call_ai([{"role": "user", "content": (
         f"Користувач має такі інгредієнти: {text}\n\n"
         "Запропонуй 2-3 рецепти. Для кожного: назва, час приготування, короткі кроки. "
         "Відповідай українською. Будь практичним і конкретним."
-    )}], intent="recipe")
+    )}])
 
-async def do_task_nlp(update: Update, user_id: int, text: str):
+async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
     parsed = await call_ai([{"role": "user", "content": (
         f"З цього повідомлення визнач дію зі списком задач: '{text}'\n"
         "Відповідай ТІЛЬКИ у форматі JSON:\n"
@@ -672,16 +616,16 @@ async def do_task_nlp(update: Update, user_id: int, text: str):
         "Нічого більше не пиши."
     )}])
     try:
-        data   = json.loads(parsed.strip().replace("```json","").replace("```",""))
+        data   = json.loads(parsed.strip().replace("```json", "").replace("```", ""))
         action = data.get("action")
         tasks  = get_user_tasks(user_id)
         if action == "add":
-            task_text = data.get("text","")
+            task_text = data.get("text", "")
             if task_text:
                 tasks.append({"text": task_text, "done": False})
                 set_user_tasks(user_id, tasks)
                 await update.message.reply_text(f"✅ Задачу додано: {task_text}")
-        elif action in ("done","del"):
+        elif action in ("done", "del"):
             n = (data.get("number") or 1) - 1
             if 0 <= n < len(tasks):
                 if action == "done":
@@ -721,6 +665,7 @@ async def do_news(query: str) -> str:
             r = await client.get("https://newsapi.org/v2/everything", params=params)
             r.raise_for_status()
         articles = r.json().get("articles", [])
+        # Дедуплікація за нормалізованим заголовком
         seen: set[str] = set()
         unique: list[dict] = []
         for a in articles:
@@ -735,78 +680,79 @@ async def do_news(query: str) -> str:
         sources_text = ""
         lines = [f"📰 Новини за темою: {clean_query}\n"]
         for i, a in enumerate(unique, 1):
-            title       = a.get("title","Без назви")
-            source      = a.get("source",{}).get("name","")
-            published   = a.get("publishedAt","")[:10]
+            title     = a.get("title", "Без назви")
+            source    = a.get("source", {}).get("name", "")
+            published = a.get("publishedAt", "")[:10]
             sources_text += f"{title}. {a.get('description') or ''}\n"
             lines.append(f"{i}. {title}\n   📅 {published} | {source}\n")
         summary = await call_ai([{"role": "user", "content": (
             f"Ось заголовки новин за темою '{clean_query}':\n{sources_text}\n\n"
             "Зроби короткий підсумок (2-3 речення). Відповідай українською."
-        )}], intent="news")
+        )}])
         lines.insert(1, f"💡 {summary}\n")
         return "\n".join(lines)
     except Exception as e:
         return f"❌ Помилка отримання новин: {e}"
 
 
-# ── Reminders ─────────────────────────────────────────────────────────────────
-
 def load_reminders() -> list:
     return _load_json(REMINDERS_FILE, [])
 
-def save_reminders(reminders: list):
+def save_reminders(reminders: list) -> None:
     _save_json(REMINDERS_FILE, reminders)
 
-async def schedule_reminder(bot, chat_id: int, text: str, fire_at: datetime):
-    rems = load_reminders()
-    rems.append({"chat_id": chat_id, "text": text, "fire_at": fire_at.isoformat()})
-    save_reminders(rems)
+async def schedule_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> None:
+    reminders = load_reminders()
+    reminders.append({"chat_id": chat_id, "text": text, "fire_at": fire_at.isoformat()})
+    save_reminders(reminders)
     async def _run():
-        await asyncio.sleep(max(0, (fire_at - datetime.now()).total_seconds()))
+        delay = max(0, (fire_at - datetime.now()).total_seconds())
+        await asyncio.sleep(delay)
         await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
         save_reminders([r for r in load_reminders() if not (
-            r["chat_id"]==chat_id and r["text"]==text and r["fire_at"]==fire_at.isoformat()
+            r["chat_id"] == chat_id and r["text"] == text and r["fire_at"] == fire_at.isoformat()
         )])
     asyncio.create_task(_run())
 
-async def restore_reminders(bot):
+async def restore_reminders(bot) -> None:
     now, valid = datetime.now(), []
     for r in load_reminders():
-        fi = datetime.fromisoformat(r["fire_at"])
-        if fi <= now:
+        fire_at = datetime.fromisoformat(r["fire_at"])
+        if fire_at <= now:
             await bot.send_message(chat_id=r["chat_id"], text=f"🔔 Пропущене нагадування: {r['text']}")
         else:
             valid.append(r)
-            async def _run(chat_id=r["chat_id"], text=r["text"], fi=fi):
-                await asyncio.sleep(max(0, (fi - datetime.now()).total_seconds()))
+            async def _run(chat_id=r["chat_id"], text=r["text"], fi=fire_at):
+                delay = max(0, (fi - datetime.now()).total_seconds())
+                await asyncio.sleep(delay)
                 await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
                 save_reminders([x for x in load_reminders() if not (
-                    x["chat_id"]==chat_id and x["text"]==text and x["fire_at"]==fi.isoformat()
+                    x["chat_id"] == chat_id and x["text"] == text and x["fire_at"] == fi.isoformat()
                 )])
             asyncio.create_task(_run())
     save_reminders(valid)
+
 
 async def detect_gender_from_transcript(text: str) -> str | None:
     if not text:
         return None
     try:
-        g = (await call_ai([{"role": "user", "content": (
+        result = await call_ai([{"role": "user", "content": (
             f"Визнач стать мовця за граматичними формами (казав/казала тощо).\n"
             f"Текст: '{text}'\nВідповідай ТІЛЬКИ: 'male', 'female' або 'unknown'."
-        )}])).strip().lower()
-        return g if g in ("male","female") else None
+        )}])
+        g = result.strip().lower()
+        return g if g in ("male", "female") else None
     except Exception:
         return None
 
 
-# ── Telegram handlers ─────────────────────────────────────────────────────────
-
 async def do_generate_image(update: Update, text: str, msg):
-    t, prompt = text.lower(), text
+    t      = text.lower()
+    prompt = text
     for kw in IMAGE_KEYWORDS:
         if kw in t:
-            prompt = text[t.index(kw)+len(kw):].strip()
+            prompt = text[t.index(kw) + len(kw):].strip()
             break
     prompt = prompt or text
     try:
@@ -818,25 +764,27 @@ async def do_generate_image(update: Update, text: str, msg):
         await msg.edit_text(f"Помилка генерації: {e}")
 
 async def do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
-    parsed = await call_ai([{"role": "user", "content": (
-        f"Поточний час: {datetime.now().strftime('%H:%M')}. Витягни час нагадування і текст: '{text}'. "
+    now_str = datetime.now().strftime("%H:%M")
+    parsed  = await call_ai([{"role": "user", "content": (
+        f"Поточний час: {now_str}. Витягни час нагадування і текст: '{text}'. "
         "Відповідай ТІЛЬКИ JSON: {\"delay_minutes\": 5, \"text\": \"текст\"}"
     )}])
-    data      = json.loads(parsed.strip().replace("```json","").replace("```",""))
-    delay_min = int(data["delay_minutes"])
+    data        = json.loads(parsed.strip().replace("```json", "").replace("```", ""))
+    delay_min   = int(data["delay_minutes"])
     remind_text = data["text"]
     await schedule_reminder(ctx.bot, update.effective_chat.id, remind_text, datetime.now() + timedelta(minutes=delay_min))
     return delay_min, remind_text
 
 async def _send_or_edit(msg, text: str, **kwargs):
     text   = text.strip()
-    chunks = [text[i:i+4000] for i in range(0, max(len(text),1), 4000)]
+    chunks = [text[i:i+4000] for i in range(0, max(len(text), 1), 4000)]
     try:
         await msg.edit_text(chunks[0], **kwargs)
     except Exception:
         await msg.reply_text(chunks[0], **kwargs)
     for chunk in chunks[1:]:
         await msg.reply_text(chunk, **kwargs)
+
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -953,7 +901,7 @@ async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["🧠 Що я пам'ятаю:\n"]
     if mem.get("name"):   lines.append(f"👤 Ім'я: {mem['name']}")
-    if mem.get("gender"): lines.append(f"👤 Стать: {'чоловік' if mem['gender']=='male' else 'жінка'}")
+    if mem.get("gender"): lines.append(f"👤 Стать: {'чоловік' if mem['gender'] == 'male' else 'жінка'}")
     if mem.get("facts"):
         lines.append("\n📌 Факти:")
         lines += [f"  • {f}" for f in mem["facts"]]
@@ -963,9 +911,9 @@ async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 async def forget_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    mem = _load_json(MEMORY_FILE, {})
-    mem.pop(str(update.message.from_user.id), None)
-    _save_json(MEMORY_FILE, mem)
+    memory = _load_json(MEMORY_FILE, {})
+    memory.pop(str(update.message.from_user.id), None)
+    _save_json(MEMORY_FILE, memory)
     await update.message.reply_text("🗑️ Пам'ять очищено.")
 
 async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1018,7 +966,7 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg     = await update.message.reply_text(f"🌐 Шукаю: {query}...")
     results = await search_web(query)
     try:
-        reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": f"Запит: '{query}'\n\nРезультати:\n{results}\n\nСтисло підсумуй українською."}], intent="search")
+        reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": f"Запит: '{query}'\n\nРезультати:\n{results}\n\nСтисло підсумуй українською."}])
         await append_and_trim(user_id, "user", f"Пошук: {query}")
         await append_and_trim(user_id, "assistant", reply)
         await _send_or_edit(msg, f"🌐 {query}\n\n{clean_markdown(reply)}")
@@ -1026,6 +974,8 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"Помилка: {e}")
 
 async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    provider  = get_text_provider()
+    remaining = max(0, OR_DAILY_LIMIT - or_requests["count"])
     tavily_status = "❌ Не налаштовано"
     if TAVILY_API_KEY:
         try:
@@ -1033,12 +983,13 @@ async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             tavily_status = "🟢 Працює"
         except Exception as e:
             tavily_status = f"🔴 Помилка: {str(e)[:50]}"
-    models_str = " → ".join(MODELS_CHAT)
     await update.message.reply_text(
         f"📊 Статус:\n"
-        f"• Моделі (пріоритет): {models_str}\n"
+        f"• Провайдер: {'OpenRouter 🟢' if provider == 'openrouter' else 'Groq 🔵'}\n"
+        f"• OpenRouter залишилось: {remaining}/{OR_DAILY_LIMIT}\n"
         f"• Tavily пошук: {tavily_status}\n"
-        f"• Активних нагадувань: {len(load_reminders())}"
+        f"• Активних нагадувань: {len(load_reminders())}\n"
+        f"• Ліміт скидається: щодня опівночі"
     )
 
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1050,11 +1001,11 @@ async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
     user_text = update.message.text or ""
-    if update.message.chat.type not in ("group","supergroup"):
+    if update.message.chat.type not in ("group", "supergroup"):
         return True, user_text
     bot_username = ctx.bot.username
     if f"@{bot_username}" in user_text:
-        return True, user_text.replace(f"@{bot_username}","").strip()
+        return True, user_text.replace(f"@{bot_username}", "").strip()
     reply = update.message.reply_to_message
     if reply and reply.from_user and reply.from_user.id == ctx.bot.id:
         return True, user_text
@@ -1069,7 +1020,8 @@ async def _dispatch_intent(
 
     if intent == "image":
         msg = voice_msg or await update.message.reply_text("🎨 Перекладаю та генерую зображення...")
-        if voice_msg: await msg.edit_text(f"{prefix}🎨 Генерую зображення...")
+        if voice_msg:
+            await msg.edit_text(f"{prefix}🎨 Генерую зображення...")
         await do_generate_image(update, enriched, msg)
         return True
 
@@ -1086,13 +1038,15 @@ async def _dispatch_intent(
         return True
 
     if intent == "task":
-        if voice_msg: await voice_msg.edit_text(f"{prefix}⏳ Обробляю задачу...")
+        if voice_msg:
+            await voice_msg.edit_text(f"{prefix}⏳ Обробляю задачу...")
         await do_task_nlp(update, user_id, enriched)
         return True
 
     if intent == "search":
         msg = voice_msg or await update.message.reply_text("🌐 Шукаю в інтернеті...")
-        if voice_msg: await msg.edit_text(f"{prefix}🌐 Шукаю в інтернеті...")
+        if voice_msg:
+            await msg.edit_text(f"{prefix}🌐 Шукаю в інтернеті...")
         try:
             search_query = enriched
             if "[Контекст попереднього повідомлення" in enriched:
@@ -1105,7 +1059,7 @@ async def _dispatch_intent(
                 if results else
                 f"Запит: '{enriched}'\n\nВідповідай з власних знань українською."
             )
-            reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}], intent="search")
+            reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}])
             await append_and_trim(user_id, "user", user_text)
             await append_and_trim(user_id, "assistant", reply)
             _set_ctx(user_id, user_text, reply)
@@ -1115,16 +1069,17 @@ async def _dispatch_intent(
         return True
 
     INTENT_MAP = {
-        "translate": ("🌐 Перекладаю...",   do_translate),
-        "summarize": ("📰 Опрацьовую...",    do_summarize),
-        "generate":  ("✍️ Генерую текст...", do_generate),
-        "recipe":    ("🍳 Шукаю рецепти...", do_recipe),
-        "news":      ("📰 Шукаю новини...",  do_news),
+        "translate": ("🌐 Перекладаю...",       do_translate),
+        "summarize": ("📰 Опрацьовую...",        do_summarize),
+        "generate":  ("✍️ Генерую текст...",     do_generate),
+        "recipe":    ("🍳 Шукаю рецепти...",     do_recipe),
+        "news":      ("📰 Шукаю новини...",      do_news),
     }
     if intent in INTENT_MAP:
         status_text, fn = INTENT_MAP[intent]
         msg = voice_msg or await update.message.reply_text(status_text)
-        if voice_msg: await msg.edit_text(f"{prefix}{status_text}")
+        if voice_msg:
+            await msg.edit_text(f"{prefix}{status_text}")
         try:
             result = await fn(enriched)
         except Exception as e:
@@ -1149,13 +1104,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Помилка обробки запиту: {e}")
         return
+
     if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent):
         return
+
     try:
         await append_and_trim(user_id, "user", enriched)
-        reply  = await call_ai(get_history(user_id), intent="chat")
+        reply  = await call_ai(get_history(user_id))
         await append_and_trim(user_id, "assistant", reply)
-        for chunk in [reply[i:i+4000] for i in range(0, max(len(reply),1), 4000)]:
+        chunks = [reply[i:i+4000] for i in range(0, max(len(reply), 1), 4000)]
+        for chunk in chunks:
             await update.message.reply_text(clean_markdown(chunk))
         _set_ctx(user_id, user_text, reply)
         asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
@@ -1204,23 +1162,26 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fname   = doc.file_name.lower()
     user_id = update.message.from_user.id
     caption = update.message.caption or "Стисло підсумуй цей документ українською."
+
     if   fname.endswith(".pdf"):             msg = await update.message.reply_text("📄 Читаю PDF...")
-    elif fname.endswith((".xlsx",".xls")):  msg = await update.message.reply_text("📊 Читаю Excel...")
-    elif fname.endswith((".docx",".doc")):  msg = await update.message.reply_text("📝 Читаю Word...")
+    elif fname.endswith((".xlsx", ".xls")): msg = await update.message.reply_text("📊 Читаю Excel...")
+    elif fname.endswith((".docx", ".doc")): msg = await update.message.reply_text("📝 Читаю Word...")
     else:
         await update.message.reply_text("📄 Підтримуються: PDF, Excel (.xlsx), Word (.docx)")
         return
+
     raw = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
-    if   fname.endswith(".pdf"):            text = extract_pdf_text(raw)
-    elif fname.endswith((".xlsx",".xls")): text = extract_excel_text(raw)
-    else:                                   text = extract_word_text(raw)
+    if   fname.endswith(".pdf"):             text = extract_pdf_text(raw)
+    elif fname.endswith((".xlsx", ".xls")): text = extract_excel_text(raw)
+    else:                                    text = extract_word_text(raw)
+
     try:
         if not text or text.startswith("Помилка"):
             await msg.edit_text(f"❌ {text}")
             return
         text_preview = text[:4000] + ("..." if len(text) > 4000 else "")
         await append_and_trim(user_id, "user", f"{caption}\n\nВміст документу:\n{text_preview}")
-        reply = await call_ai(get_history(user_id), intent="summarize")
+        reply = await call_ai(get_history(user_id))
         await append_and_trim(user_id, "assistant", reply)
         last_context[user_id] = {"type": "документ", "description": reply[:500]}
         await _send_or_edit(msg, f"📄 {doc.file_name}\n\n{clean_markdown(reply)}")
@@ -1238,30 +1199,33 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await msg.edit_text(f"🎤 Ти сказав: {text}\n\n⏳ Обробляю...")
         user_id = update.message.from_user.id
+
         if get_gender(user_id) is None:
             gender = await detect_gender_from_transcript(text)
             if gender:
                 update_user_memory(user_id, {"gender": gender})
                 if user_id in chat_histories:
                     chat_histories[user_id][0] = get_system_prompt(user_id)
+
         enriched = await resolve_text_with_context(user_id, text)
         intent   = await detect_intent(enriched)
+
         if await _dispatch_intent(update, ctx, user_id, text, enriched, intent, voice_msg=msg):
             return
+
         await append_and_trim(user_id, "user", enriched)
-        reply = await call_ai(get_history(user_id), intent="chat")
+        reply = await call_ai(get_history(user_id))
         await append_and_trim(user_id, "assistant", reply)
         await _send_or_edit(msg, f"🎤 Ти сказав: {text}\n\n{clean_markdown(reply)}")
     except Exception as e:
         await msg.edit_text(f"Помилка при обробці голосового: {e}")
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
-
 async def post_init(app):
     await restore_reminders(app.bot)
     restore_histories()
-    for uid, data in _load_json(MEMORY_FILE, {}).items():
+    memory = _load_json(MEMORY_FILE, {})
+    for uid, data in memory.items():
         if data.get("mode"):
             user_personalities[int(uid)] = data["mode"]
 
