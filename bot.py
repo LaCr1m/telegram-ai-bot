@@ -116,41 +116,67 @@ def _save_json(path, data):
 
 # ── OpenRouter API ────────────────────────────────────────────────────────────
 
-async def _or_call(messages: list, models: list) -> str:
-    """Перебирає моделі по черзі, повертає першу успішну відповідь."""
+async def _or_call(messages: list, models: list, retries: int = 2) -> str:
+    """Перебирає моделі по черзі з retry, повертає першу успішну відповідь."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type":  "application/json",
         "HTTP-Referer":  "https://t.me/jarvis_bot",
     }
     last_err = None
+    # Будуємо чергу: кожна модель спробується `retries` разів перед переходом до наступної
     for model in models:
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.post(
-                    OPENROUTER_URL, headers=headers,
-                    json={"model": model, "messages": messages}
-                )
-            if r.status_code in (429, 503, 529):   # rate-limit / overload
-                last_err = f"{model}: HTTP {r.status_code}"
+        for attempt in range(retries):
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    r = await client.post(
+                        OPENROUTER_URL, headers=headers,
+                        json={"model": model, "messages": messages}
+                    )
+                if r.status_code in (429, 503, 529):
+                    last_err = f"{model}: HTTP {r.status_code}"
+                    wait = 3 * (attempt + 1)   # 3с → 6с між спробами
+                    await asyncio.sleep(wait)
+                    continue
+                if r.status_code == 404:
+                    last_err = f"{model}: not found"
+                    break                       # цю модель більше не пробуємо
+                r.raise_for_status()
+                content = r.json()["choices"][0]["message"]["content"]
+                if content:
+                    return content
+                last_err = f"{model}: empty response"
+            except Exception as e:
+                last_err = str(e)
                 await asyncio.sleep(2)
-                continue
-            if r.status_code == 404:               # модель не знайдена
-                last_err = f"{model}: not found"
-                continue
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-            if content:
-                return content
-            last_err = f"{model}: empty response"
-        except Exception as e:
-            last_err = str(e)
-            continue
     raise RuntimeError(f"Всі моделі недоступні. Остання помилка: {last_err}")
+
+async def _groq_fallback(messages: list) -> str:
+    """Groq як останній резерв коли всі OpenRouter моделі недоступні."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY не налаштовано")
+    # Groq не підтримує vision-контент — фільтруємо складні повідомлення
+    simple = []
+    for m in messages:
+        if isinstance(m.get("content"), list):
+            text_parts = [p["text"] for p in m["content"] if p.get("type") == "text"]
+            simple.append({"role": m["role"], "content": " ".join(text_parts)})
+        else:
+            simple.append(m)
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(GROQ_CHAT_URL, headers=headers,
+                              json={"model": GROQ_CHAT_MODEL, "messages": simple})
+        r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
 async def call_ai(messages: list, intent: str = "chat") -> str:
     models = MODELS_PRO if intent in PRO_INTENTS else MODELS_CHAT
-    return await _or_call(messages, models)
+    try:
+        return await _or_call(messages, models)
+    except RuntimeError:
+        # Всі OpenRouter моделі впали — пробуємо Groq
+        return await _groq_fallback(messages)
 
 async def call_vision(messages: list) -> str:
     return await _or_call(messages, MODELS_VISION)
