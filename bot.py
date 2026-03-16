@@ -375,13 +375,12 @@ async def call_ai(messages: list) -> str:
             if r.status_code == 404:
                 continue
             if r.status_code == 429:
-                # Переключаємось на Groq без рекурсії
                 or_requests["count"] = OR_DAILY_LIMIT
                 break
             r.raise_for_status()
             or_requests["count"] += 1
             return r.json()["choices"][0]["message"]["content"]
-        # Fallback на Groq
+    # Fallback на Groq
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
@@ -658,7 +657,7 @@ async def do_news(query: str) -> str:
             "domains":  ",".join(UA_NEWS_DOMAINS),
             "language": "uk",
             "sortBy":   "publishedAt",
-            "pageSize": 20,
+            "pageSize": 50,
             "apiKey":   NEWS_API_KEY,
         }
         async with httpx.AsyncClient(timeout=15) as client:
@@ -673,7 +672,7 @@ async def do_news(query: str) -> str:
             if norm and norm not in seen:
                 seen.add(norm)
                 unique.append(a)
-            if len(unique) == 5:
+            if len(unique) == 10:
                 break
         if not unique:
             return f"📰 Новин за темою «{clean_query}» не знайдено на українських ресурсах."
