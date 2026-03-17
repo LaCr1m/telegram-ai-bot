@@ -521,12 +521,19 @@ def detect_intent_local(text: str) -> str | None:
         if kw in t: scores["search"] += 1
     if re.search(r'https?://\S+', text):
         scores["summarize"] += 3
-    if re.search(r'\b(через|о|в)\s+\d+\s*(хв|год|хвилин|годин)\b', t):
+
+    # Нагадування тільки якщо є явний часовий маркер
+    has_time = bool(
+        re.search(r'\b(через|о|в)\s+\d+\s*(хв|год|хвилин|годин)\b', t) or
+        re.search(r'\b\d{1,2}[:.]\d{2}\b', t) or
+        re.search(r'\b(завтра|післязавтра|сьогодні)\b', t) or
+        re.search(r'\b\d+\s*(хв|год|хвилин|годин)\b', t)
+    )
+    if has_time:
         scores["reminder"] += 2
-    if re.search(r'\b\d{1,2}[:.]\d{2}\b', t):
-        scores["reminder"] += 1
-    if re.search(r'\b(завтра|післязавтра)\b', t):
-        scores["reminder"] += 1
+    else:
+        scores["reminder"] = 0  # без часу — не нагадування
+
     best       = max(scores, key=lambda k: scores[k])
     best_score = scores[best]
     if best_score == 0:
@@ -541,7 +548,18 @@ async def detect_intent_ai(text: str, ctx_hint: str = "") -> str:
     result = await call_ai([{"role": "user", "content": (
         f"Визнач намір повідомлення: '{text}'{ctx_block}\n"
         "Відповідай ТІЛЬКИ одним словом:\n"
-        "image / reminder / news / search / translate / summarize / generate / edit / recipe / task / chat"
+        "- 'reminder' — ТІЛЬКИ якщо є конкретний час або дата (через X хвилин, о 14:00, завтра тощо)\n"
+        "- 'image'    — згенерувати зображення\n"
+        "- 'news'     — новини за темою\n"
+        "- 'search'   — знайти інформацію в інтернеті\n"
+        "- 'translate'— перекласти текст\n"
+        "- 'summarize'— підсумувати текст або статтю\n"
+        "- 'generate' — написати резюме/лист/пост з нуля\n"
+        "- 'edit'     — відредагувати або покращити текст\n"
+        "- 'recipe'   — рецепт за інгредієнтами\n"
+        "- 'task'     — керування списком задач\n"
+        "- 'chat'     — все інше, включаючи запитання, розмову, 'ти пам'ятаєш'\n"
+        "Відповідь — ТІЛЬКИ одне слово."
     )}])
     return result.strip().lower().strip("'\"")
 
