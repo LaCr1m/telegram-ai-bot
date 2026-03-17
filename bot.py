@@ -598,17 +598,29 @@ async def detect_intent(text: str) -> str:
     return detect_intent_local(clean) or await detect_intent_ai(clean)
 
 async def preprocess_query(user_id: int, text: str) -> str:
-    """Розкриває займенники спираючись на останні повідомлення в історії."""
-    t           = text.lower().strip()
-    pronouns    = {"він","вона","воно","вони","його","її","їх","там","це","той","та","те"}
-    is_short    = len(text.split()) <= 6
-    has_pronoun = bool(pronouns & set(t.split()))
-    if not (is_short or has_pronoun):
+    """Розкриває займенники лише якщо вони явно посилаються на попередній об'єкт розмови."""
+    t = text.lower().strip()
+
+    # Соціальні фрази — не чіпаємо взагалі
+    if t in _SOCIAL_PHRASES or any(t.startswith(s) for s in _SOCIAL_PHRASES):
         return text
 
-    # Беремо останні 4 повідомлення як контекст
-    history  = chat_histories.get(user_id, [])
-    recent   = [m for m in history if m.get("role") != "system"][-4:]
+    # Займенники що стосуються ЛЮДЕЙ/БОТА — не розкриваємо
+    person_pronouns = {"тебе","тобі","ти","вас","вам","ви","мене","мені","я"}
+    words = set(t.split())
+    if words & person_pronouns and not (words & {"він","вона","воно","вони","його","її","їх","цей","ця","це","той","та","те"}):
+        return text
+
+    # Розкриваємо лише предметні займенники при короткому запиті
+    obj_pronouns = {"він","вона","воно","вони","його","її","їх","цей","ця","це","той","та","те","там"}
+    has_obj_pronoun = bool(obj_pronouns & words)
+    is_short        = len(text.split()) <= 6
+
+    if not (is_short and has_obj_pronoun):
+        return text
+
+    history = chat_histories.get(user_id, [])
+    recent  = [m for m in history if m.get("role") != "system"][-4:]
     if not recent:
         return text
 
@@ -619,9 +631,9 @@ async def preprocess_query(user_id: int, text: str) -> str:
     )
     try:
         expanded = (await call_ai([{"role": "user", "content": (
-            f"Контекст розмови:\n{context_text}\n\n"
-            f"Розкрий займенники у запиті: '{text}'\n"
-            "Поверни ТІЛЬКИ уточнений запит без пояснень і лапок."
+            f"Контекст:\n{context_text}\n\n"
+            f"Розкрий предметний займенник у запиті: '{text}'\n"
+            "Поверни ТІЛЬКИ уточнений запит. Якщо займенник стосується людини або бота — поверни оригінал."
         )}])).strip()
         if not expanded or len(expanded) < 3 or expanded.lower() in ("none", "null", "-", "—"):
             return text
@@ -962,13 +974,16 @@ async def do_news(query: str) -> str:
     clean_query = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
     query_words = [w.lower() for w in re.split(r'\s+', clean_query.strip()) if len(w) > 2]
 
-    def is_relevant(a: dict) -> bool:
-        return any(w in ((a.get("title") or "") + " " + (a.get("description") or "")).lower() for w in query_words)
+    def relevance_score(a: dict) -> float:
+        haystack = ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
+        matches  = sum(1 for w in query_words if w in haystack)
+        if not matches or matches < max(1, len(query_words) // 2):
+            return 0.0
+        # Українські домени отримують бонус +1.0
+        ua_bonus = 1.0 if any(d in (a.get("url") or "") for d in UA_DOMAINS) else 0.0
+        return matches + ua_bonus
 
-    def is_ukrainian(a: dict) -> bool:
-        return any(d in (a.get("url") or "") for d in UA_DOMAINS)
-
-    def deduplicate(arts: list) -> list:
+    def deduplicate_scored(arts: list) -> list:
         seen, result = set(), []
         for a in arts:
             norm = re.sub(r'[^a-zа-яіїєґ0-9]', '', (a.get("title") or "").lower())
@@ -979,7 +994,7 @@ async def do_news(query: str) -> str:
                 break
         return result
 
-    unique = []
+    all_articles: list[dict] = []
 
     if NEWS_API_KEY:
         try:
@@ -992,51 +1007,86 @@ async def do_news(query: str) -> str:
                     r.raise_for_status()
                 return r.json().get("articles", [])
 
-            params   = {"q": clean_query, "domains": ",".join(domains), "sortBy": "publishedAt", "pageSize": NEWS_PAGE_SIZE, "apiKey": NEWS_API_KEY}
-            relevant = [a for a in await fetch_articles(params) if is_relevant(a)]
-            unique   = deduplicate([a for a in relevant if is_ukrainian(a)] + [a for a in relevant if not is_ukrainian(a)])
+            params = {
+                "q": clean_query, "domains": ",".join(domains),
+                "sortBy": "publishedAt", "pageSize": NEWS_PAGE_SIZE, "apiKey": NEWS_API_KEY,
+            }
+            all_articles = await fetch_articles(params)
 
-            if not unique and category != "general":
+            # Якщо мало результатів — додаємо general домени
+            if len([a for a in all_articles if relevance_score(a) > 0]) < 5 and category != "general":
                 params["domains"] = ",".join(NEWS_DOMAINS_BY_CATEGORY["general"])
-                relevant = [a for a in await fetch_articles(params) if is_relevant(a)]
-                unique   = deduplicate([a for a in relevant if is_ukrainian(a)] + [a for a in relevant if not is_ukrainian(a)])
+                all_articles += await fetch_articles(params)
 
-            if not unique:
+            # Якщо все ще мало — прибираємо обмеження доменів
+            if len([a for a in all_articles if relevance_score(a) > 0]) < 3:
                 params.pop("domains", None)
-                unique = deduplicate((await fetch_articles(params))[:NEWS_PAGE_SIZE])
+                all_articles += await fetch_articles(params)
+
         except Exception as e:
             log.warning("do_news NewsAPI: %s", e)
 
-    if not unique:
+    # Fallback: Tavily/DuckDuckGo
+    if len([a for a in all_articles if relevance_score(a) > 0]) < 3:
         try:
             sr = await search_web(f"новини {clean_query}")
             if sr:
-                fake = []
                 for block in sr.split("\n\n"):
                     lines = block.strip().splitlines()
                     title = lines[0].replace("Джерело: ", "").strip() if lines else ""
                     url   = lines[2].strip() if len(lines) > 2 else ""
                     if title and url:
-                        fake.append({"title": title, "description": lines[1].strip() if len(lines) > 1 else "", "url": url, "publishedAt": "", "source": {"name": ""}})
-                unique = fake[:MAX_NEWS_RESULTS]
+                        all_articles.append({
+                            "title": title,
+                            "description": lines[1].strip() if len(lines) > 1 else "",
+                            "url": url,
+                            "publishedAt": "",
+                            "source": {"name": ""},
+                        })
         except Exception as e:
             log.warning("do_news fallback: %s", e)
+
+    # Сортуємо: спочатку за score (UA отримує бонус), потім за датою
+    scored = [(a, relevance_score(a)) for a in all_articles if relevance_score(a) > 0]
+    scored.sort(key=lambda x: (
+        -x[1],                                          # вищий score — вище
+        -(1 if any(d in (x[0].get("url") or "") for d in UA_DOMAINS) else 0),  # UA вище
+        -(x[0].get("publishedAt") or ""),               # свіжіше — вище
+    ))
+
+    # Дедублікуємо після сортування щоб зберегти пріоритет UA
+    unique = deduplicate_scored([a for a, _ in scored])
 
     if not unique:
         return f"📰 Новин за темою «{clean_query}» не знайдено."
 
+    # Підсумок від AI
     sources_text = "\n".join(f"{a.get('title','Без назви')}. {a.get('description') or ''}" for a in unique)
     try:
-        summary = await call_ai([{"role": "user", "content": f"Заголовки новин за темою '{clean_query}':\n{sources_text}\n\nКороткий підсумок (2-3 речення). Українською."}])
+        summary = await call_ai([{"role": "user", "content": (
+            f"Заголовки новин за темою '{clean_query}':\n{sources_text}\n\n"
+            "Короткий підсумок (2-3 речення). Українською."
+        )}])
     except Exception:
         summary = ""
 
+    # Формуємо відповідь: 10 лінків з пріоритетом UA
     lines = [f"📰 Новини: {clean_query}\n"]
     if summary:
         lines.append(f"💡 {summary}\n")
-    for i, a in enumerate(unique, 1):
-        date_str = f"📅 {a['publishedAt'][:10]} | " if a.get("publishedAt") else ""
-        lines.append(f"{i}. {a.get('title','Без назви')}\n   {date_str}{a.get('source',{}).get('name','')}\n   🔗 {a.get('url','')}\n")
+
+    ua_articles    = [a for a in unique if any(d in (a.get("url") or "") for d in UA_DOMAINS)]
+    intl_articles  = [a for a in unique if not any(d in (a.get("url") or "") for d in UA_DOMAINS)]
+    ordered        = ua_articles + intl_articles  # UA спочатку
+
+    for i, a in enumerate(ordered[:MAX_NEWS_RESULTS], 1):
+        title      = a.get("title", "Без назви")
+        url        = a.get("url", "")
+        date_str   = f"📅 {a['publishedAt'][:10]} • " if a.get("publishedAt") else ""
+        source     = a.get("source", {}).get("name", "")
+        ua_flag    = "🇺🇦 " if any(d in url for d in UA_DOMAINS) else "🌐 "
+        lines.append(f"{i}. {ua_flag}{title}\n   {date_str}{source}\n   🔗 {url}\n")
+
     return "\n".join(lines)
 
 # ── Intent handlers ───────────────────────────────────────────────────────────
