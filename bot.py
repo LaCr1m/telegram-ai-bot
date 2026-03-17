@@ -562,6 +562,10 @@ async def preprocess_query(user_id: int, text: str) -> str:
     t = text.lower().strip()
     if t in _SOCIAL_PHRASES or any(t.startswith(s) for s in _SOCIAL_PHRASES):
         return text
+    # Питання про час/дату — ніколи не додаємо контекст
+    _TIME_PHRASES = {"який рік", "який час", "котра година", "яка дата", "яке число", "який день", "який місяць"}
+    if any(p in t for p in _TIME_PHRASES):
+        return text
     person_pronouns = {"тебе","тобі","ти","вас","вам","ви","мене","мені","я"}
     words = set(t.split())
     if words & person_pronouns and not (words & {"він","вона","воно","вони","його","її","їх","цей","ця","це","той","та","те"}):
@@ -748,11 +752,12 @@ async def generate_image(prompt: str) -> bytes:
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=180) as client:
-                r = await client.post(url, headers=headers, json={"prompt": prompt, "num_steps": 8})
+                r = await client.post(url, headers=headers, json={"prompt": prompt, "num_steps": 20})
                 r.raise_for_status()
             if "image" in r.headers.get("content-type", ""):
                 return r.content
             return base64.b64decode(r.json().get("result", {}).get("image", ""))
+
         except Exception as e:
             last_error = e
             log.warning("generate_image attempt %d failed: %s", attempt + 1, e)
@@ -1180,16 +1185,16 @@ async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
     try:
         if ctx_desc:
             translation = (await call_ai([{"role": "user", "content": (
-                f"You are an image generation prompt engineer.\n"
-                f"Base image description: {ctx_desc}\n"
-                f"User request: {prompt}\n\n"
-                f"Write a precise image generation prompt in English that depicts EXACTLY the same subject "
-                f"from the base description, but applies the style/modification from the user request. "
-                f"Keep the subject faithful. Return ONLY the prompt, no explanation."
+                f"Write a short image generation prompt (max 60 words) in English.\n"
+                f"Subject (keep exactly): {ctx_desc[:300]}\n"
+                f"Apply this style/change: {prompt}\n"
+                f"Rules: describe only visual elements, be specific, no explanations.\n"
+                f"Return ONLY the prompt."
             )}])).strip()
         else:
             translation = (await call_ai([{"role": "user", "content": (
-                f"Translate to English for image generation, return ONLY the prompt: {prompt}"
+                f"Write a short image generation prompt in English (max 60 words). "
+                f"Return ONLY the prompt: {prompt}"
             )}])).strip()
         img_bytes = await generate_image(translation)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt[:200]}")
