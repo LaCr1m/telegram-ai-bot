@@ -370,10 +370,11 @@ def gender_suffix(user_id: int) -> str:
     if g == "female": return " Звертайся до користувача як до жінки."
     return ""
 
-def get_system_prompt(user_id: int) -> dict:
-    mode = user_personalities.get(user_id, "normal")
-    p    = PERSONALITIES.get(mode, PERSONALITIES["normal"])
-    return {"role": "system", "content": p["prompt"] + gender_suffix(user_id)}
+def get_active_system_prompt(user_id: int = 0) -> dict:
+    """Повертає актуальний системний промпт з урахуванням режиму юзера."""
+    if user_id and user_id in user_personalities:
+        return get_system_prompt(user_id)
+    return SYSTEM_PROMPT
 
 # ── Communication style ───────────────────────────────────────────────────────
 
@@ -407,6 +408,15 @@ def build_dynamic_prompt(user_id: int, emotion: str) -> dict:
         parts.append(f"Ім'я користувача: {mem['name']}. Можеш іноді звертатись на ім'я — але не в кожному реченні.")
     if mem.get("topics"):
         parts.append(f"Попередні теми розмов: {', '.join(mem['topics'][:3])}. Якщо контекст підходить — можеш згадати.")
+
+    # Контекст поточної розмови для логічних зв'язків
+    ctx = conversation_context.get(user_id, {})
+    if ctx.get("topic"):
+        parts.append(f"Поточна тема розмови: {ctx['topic']}. Враховуй її при відповіді — не починай з нуля.")
+    if ctx.get("entities"):
+        parts.append(f"Згадані об'єкти в розмові: {', '.join(ctx['entities'][:5])}. Використовуй як контекст.")
+    if ctx.get("last_intent") and ctx["last_intent"] != "chat":
+        parts.append(f"Попередня дія в розмові: {ctx['last_intent']}.")
 
     return {"role": "system", "content": " ".join(parts)}
 
@@ -1710,7 +1720,7 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg     = await update.message.reply_text(f"🌐 Шукаю: {query}...")
     results = await search_web(query)
     try:
-        reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": (
+        reply = await call_ai([get_active_system_prompt(user_id), {"role": "user", "content": (
             f"Запит: '{query}'\n\nРезультати пошуку:\n{results}\n\n"
             "Дай корисну відповідь українською. Вказуй джерела. Не вигадуй факти."
         )}])
@@ -1796,7 +1806,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file    = await ctx.bot.get_file(photo.file_id)
         img_b64 = base64.b64encode(await file.download_as_bytearray()).decode()
         caption = update.message.caption or "Що зображено на цьому фото? Опиши детально українською."
-        reply   = await call_vision([SYSTEM_PROMPT, {"role": "user", "content": [
+        reply   = await call_vision([get_active_system_prompt(user_id), {"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
             {"type": "text", "text": caption},
         ]}])
