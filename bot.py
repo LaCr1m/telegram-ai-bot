@@ -1059,16 +1059,14 @@ async def do_news(query: str) -> str:
 
     def sort_key(item: tuple) -> tuple:
         a, s = item
-        # Інвертуємо дату посимвольно щоб свіжіші йшли першими при лексикографічному сортуванні
         date_inv = "".join(chr(0x10FFFF - ord(c)) for c in (a.get("publishedAt") or ""))
-        return (-s, -(1 if is_ua(a) else 0), date_inv)
+        return (-s, -(1 if _news_is_ua(a) else 0), date_inv)
 
     scored.sort(key=sort_key)
 
-    # Дедублікуємо після сортування — спочатку суворий фільтр, потім м'який
-    unique = deduplicate([a for a, _ in scored], strict=True)
+    unique = _news_deduplicate([a for a, _ in scored], strict=True)
     if len(unique) < 3:
-        unique = deduplicate([a for a, _ in scored], strict=False)
+        unique = _news_deduplicate([a for a, _ in scored], strict=False)
 
     # ── AI підсумок ───────────────────────────────────────────────────────────
     sources_text = "\n".join(f"{a.get('title','Без назви')}. {a.get('description') or ''}" for a in unique)
@@ -1081,8 +1079,8 @@ async def do_news(query: str) -> str:
         summary = ""
 
     # ── Формуємо відповідь: UA першими ───────────────────────────────────────
-    ua_list   = [a for a in unique if is_ua(a)]
-    intl_list = [a for a in unique if not is_ua(a)]
+    ua_list   = [a for a in unique if _news_is_ua(a)]
+    intl_list = [a for a in unique if not _news_is_ua(a)]
     ordered   = (ua_list + intl_list)[:MAX_NEWS_RESULTS]
 
     lines = [f"📰 Новини: {clean_query}\n"]
