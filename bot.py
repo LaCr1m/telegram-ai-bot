@@ -1051,11 +1051,13 @@ async def do_news(query: str) -> str:
     if not scored:
         return f"📰 Новин за темою «{clean_query}» не знайдено."
 
-    scored.sort(key=lambda x: (
-        -x[1],                                    # вищий score — вище
-        -(1 if is_ua(x[0]) else 0),               # UA вище при рівному score
-        -(x[0].get("publishedAt") or "0"),        # свіжіше — вище (рядковий sort, "" → "0")
-    ))
+    def sort_key(item: tuple) -> tuple:
+        a, s = item
+        # Інвертуємо дату посимвольно щоб свіжіші йшли першими при лексикографічному сортуванні
+        date_inv = "".join(chr(0x10FFFF - ord(c)) for c in (a.get("publishedAt") or ""))
+        return (-s, -(1 if is_ua(a) else 0), date_inv)
+
+    scored.sort(key=sort_key)
 
     unique = deduplicate([a for a, _ in scored])
 
