@@ -1561,55 +1561,69 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # Базова обробка — не може впасти
+    # Крок 1: preprocess
     try:
-        preprocessed = await preprocess_query(user_id, user_text)
-        enriched     = await resolve_text_with_context(user_id, preprocessed)
-        intent       = await detect_intent(enriched, user_id)
+        preprocessed = await asyncio.wait_for(preprocess_query(user_id, user_text), timeout=15)
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Помилка обробки запиту: {e}")
-        return
+        print(f"[preprocess error] {e}")
+        preprocessed = user_text
 
-    # Емоція — безпечно, при помилці використовуємо neutral
+    # Крок 2: resolve context
     try:
-        emotion = await detect_emotion(user_text)
-    except Exception:
+        enriched = await asyncio.wait_for(resolve_text_with_context(user_id, preprocessed), timeout=15)
+    except Exception as e:
+        print(f"[resolve_context error] {e}")
+        enriched = preprocessed
+
+    # Крок 3: detect intent
+    try:
+        intent = await asyncio.wait_for(detect_intent(enriched, user_id), timeout=15)
+    except Exception as e:
+        print(f"[detect_intent error] {e}")
+        intent = "chat"
+
+    # Крок 4: detect emotion
+    try:
+        emotion = await asyncio.wait_for(detect_emotion(user_text), timeout=10)
+    except Exception as e:
+        print(f"[detect_emotion error] {e}")
         emotion = "neutral"
 
-    # Підтримка при стресі — тільки для chat intent
+    # Крок 5: підтримка при стресі
     if intent == "chat" and needs_support_first(emotion, user_text):
         try:
             support_prompt = build_dynamic_prompt(user_id, emotion)
-            support = await call_ai([
+            support = await asyncio.wait_for(call_ai([
                 support_prompt,
                 {"role": "user", "content": (
                     f"{user_text}\n\n"
                     "Відповідь: спочатку одним-двома реченнями визнай почуття людини. "
                     "Потім м'яко запитай чим можеш допомогти або запропонуй допомогу."
                 )}
-            ])
+            ]), timeout=30)
             await update.message.reply_text(clean_markdown(support))
             _set_ctx(user_id, user_text, support)
             asyncio.create_task(update_conversation_context(user_id, user_text, support, intent))
             return
-        except Exception:
-            pass  # Якщо підтримка впала — продовжуємо звичайну відповідь
+        except Exception as e:
+            print(f"[support error] {e}")
 
+    # Крок 6: dispatch intent
     if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent):
         return
 
-    # Основна відповідь
+    # Крок 7: основна відповідь
     try:
-        # Динамічний промпт — при помилці fallback на звичайний
         try:
             dynamic_prompt = build_dynamic_prompt(user_id, emotion)
-        except Exception:
+        except Exception as e:
+            print(f"[dynamic_prompt error] {e}")
             dynamic_prompt = get_system_prompt(user_id)
 
         history  = get_history(user_id)
         messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
         await append_and_trim(user_id, "user", enriched)
-        reply = await call_ai(messages)
+        reply = await asyncio.wait_for(call_ai(messages), timeout=60)
         await append_and_trim(user_id, "assistant", reply)
         for chunk in [reply[i:i+4000] for i in range(0, max(len(reply), 1), 4000)]:
             await update.message.reply_text(clean_markdown(chunk))
@@ -1620,6 +1634,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(user_msgs) % STYLE_UPDATE_INTERVAL == 0:
             asyncio.create_task(update_communication_style(user_id))
     except Exception as e:
+        print(f"[main reply error] {e}")
         await update.message.reply_text(f"⚠️ Помилка відповіді: {e}")
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
