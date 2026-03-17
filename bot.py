@@ -1048,28 +1048,33 @@ async def do_news(query: str) -> str:
         return True
 
     # ── Оцінка, сортування, дедублікація ─────────────────────────────────────
-        # Домени що повертають лише головні/категорійні сторінки — фільтруємо повністю
-    _CAT_ONLY_DOMAINS = {"pravda.com.ua", "unian.ua", "nv.ua", "tsn.ua", "suspilne.media"}
+        # Домени що часто дають категорійні URL — приймаємо лише конкретні статті
+    _STRICT_DOMAINS = {"pravda.com.ua", "unian.ua", "nv.ua", "tsn.ua", "suspilne.media"}
 
     def is_real_article(a: dict) -> bool:
-        url    = (a.get("url") or "")
-        domain = url.split("//", 1)[-1].split("/")[0].lstrip("www.")
-        if domain in _CAT_ONLY_DOMAINS:
+        url    = (a.get("url") or "").rstrip("/")
+        if not url:
             return False
+        domain = url.split("//", 1)[-1].split("/")[0].lstrip("www.")
+        path   = url.split("//", 1)[-1].split("?")[0]
+        parts  = [p for p in path.split("/") if p]
+        if len(parts) <= 1:
+            return False  # тільки домен
+        last = parts[-1]
+        if domain in _STRICT_DOMAINS:
+            # Для цих доменів — приймаємо лише якщо є числовий ID або slug з 3+ дефісами
+            return bool(re.search(r'\d{4,}', last) or last.count('-') >= 3)
         return is_specific_article(a)
 
-    # Фільтруємо _CAT_ONLY_DOMAINS з усіх джерел (NewsAPI + Tavily/DDG)
     filtered_articles = [a for a in all_articles if is_real_article(a)]
+    scored = [(a, relevance_score(a)) for a in filtered_articles]
+    scored = [(a, s) for a, s in scored if s > 0]
 
-    specific = [(a, relevance_score(a)) for a in filtered_articles]
-    specific = [(a, s) for a, s in specific if s > 0]
-    if len(specific) >= 3:
-        scored = specific
-    else:
-        # Якщо після фільтрації мало — додаємо відфільтровані але без _CAT_ONLY_DOMAINS
-        all_scored = [(a, relevance_score(a)) for a in filtered_articles]
-        all_scored = [(a, s) for a, s in all_scored if s > 0]
-        scored = all_scored if all_scored else specific
+    if not scored:
+        # Останній резерв — без фільтра статей, але хоча б не головні сторінки
+        scored = [(a, relevance_score(a)) for a in all_articles
+                  if len([p for p in (a.get("url") or "").split("//", 1)[-1].split("/") if p]) > 1]
+        scored = [(a, s) for a, s in scored if s > 0]
 
     if not scored:
         return f"📰 Новин за темою «{clean_query}» не знайдено."
