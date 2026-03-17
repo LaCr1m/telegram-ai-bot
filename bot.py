@@ -985,19 +985,21 @@ async def do_news(query: str) -> str:
         return float(matches) + (1.0 if is_ua(a) else 0.0)
 
     def is_specific_article(a: dict) -> bool:
-        """Фільтрує головні сторінки та категорійні URL — залишає лише конкретні статті."""
-        url  = (a.get("url") or "").rstrip("/")
-        path = url.split("//")[-1].split("/", 1)[-1] if "//" in url else url
-        # Відкидаємо URL без шляху або з надто коротким шляхом (головна/категорія)
-        if not path or "/" not in path:
+        """Відкидає лише очевидні головні сторінки без конкретного матеріалу."""
+        url = (a.get("url") or "").rstrip("/")
+        if not url:
             return False
-        # Відкидаємо відомі шаблони категорійних сторінок
-        skip_patterns = ["/news/", "/novini/", "/novyny/", "/category/", "/tag/", "/topics/", "/section/"]
-        if any(url.endswith(p.rstrip("/")) or url.endswith(p) for p in skip_patterns):
-            return False
-        # Має бути конкретний slug — хоча б 10 символів після останнього /
-        slug = url.rsplit("/", 1)[-1]
-        return len(slug) >= 8
+        # URL без будь-якого шляху після домену — точно головна
+        path = url.split("//", 1)[-1]  # domain/path
+        parts = [p for p in path.split("/") if p]
+        if len(parts) <= 1:
+            return False  # тільки домен або домен + одна коротка частина
+        # Відомі суфікси категорійних сторінок
+        lower = url.lower()
+        for bad in ("/news/", "/novyny/", "/novini/", "/category/", "/tag/", "/topics/"):
+            if lower.endswith(bad.rstrip("/")):
+                return False
+        return True
 
     all_articles: list[dict] = []
 
@@ -1063,7 +1065,10 @@ async def do_news(query: str) -> str:
 
     scored.sort(key=sort_key)
 
-    unique = deduplicate([a for a, _ in scored])
+    # Дедублікуємо після сортування — спочатку суворий фільтр, потім м'який
+    unique = deduplicate([a for a, _ in scored], strict=True)
+    if len(unique) < 3:
+        unique = deduplicate([a for a, _ in scored], strict=False)
 
     # ── AI підсумок ───────────────────────────────────────────────────────────
     sources_text = "\n".join(f"{a.get('title','Без назви')}. {a.get('description') or ''}" for a in unique)
