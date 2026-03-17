@@ -730,8 +730,6 @@ def clean_markdown(text: str) -> str:
             continue
 
         # Рядок цілком **жирний** або просто короткий жирний заголовок без ##
-        solo_bold = re.match(r'^\*\*(.+?)\*\*\s*
-
 def _set_ctx(user_id: int, user_text: str, reply: str) -> None:
     last_context[user_id] = {
         "type": "текст",
