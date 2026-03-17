@@ -1017,8 +1017,32 @@ async def do_news(query: str) -> str:
     except Exception as e:
         log.warning("do_news search fallback: %s", e)
 
+    def is_specific_article(a: dict) -> bool:
+        url = (a.get("url") or "").rstrip("/")
+        if not url:
+            return False
+        path  = url.split("//", 1)[-1]
+        parts = [p for p in path.split("/") if p]
+        if len(parts) <= 1:
+            return False
+        lower = url.lower()
+        # Категорійні суфікси
+        for bad in ("/news/", "/novyny/", "/novini/", "/category/", "/tag/", "/topics/", "/lite/"):
+            if bad.rstrip("/") in lower.split("?")[0] and lower.rstrip("/").endswith(bad.rstrip("/")):
+                return False
+        # URL закінчується на /tag/щось або /lite/щось — категорія
+        for segment in ("/tag/", "/lite/", "/rubric/", "/section/", "/topic/"):
+            if segment in lower:
+                # якщо після сегменту немає більше шляху — категорія
+                after = lower.split(segment, 1)[-1].rstrip("/")
+                if "/" not in after:
+                    return False
+        return True
+
     # ── Оцінка, сортування, дедублікація ─────────────────────────────────────
-    scored = [(a, relevance_score(a)) for a in all_articles]
+    scored = [(a, relevance_score(a)) for a in all_articles if is_specific_article(a)]
+    if len(scored) < 3:  # якщо конкретних статей мало — беремо всі
+        scored = [(a, relevance_score(a)) for a in all_articles]
     scored = [(a, s) for a, s in scored if s > 0]
 
     if not scored:
@@ -1056,7 +1080,7 @@ async def do_news(query: str) -> str:
     for i, a in enumerate(ordered, 1):
         url      = a.get("url", "")
         title    = a.get("title", "Без назви")
-        desc     = a.get("description") or ""
+        desc     = re.sub(r'#{1,3}\s*', '', a.get("description") or "").strip()
         if len(desc) > 120:
             desc = desc[:117].rsplit(" ", 1)[0] + "..."
         date_str  = f"📅 {a['publishedAt'][:10]} • " if a.get("publishedAt") else ""
