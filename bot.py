@@ -370,10 +370,18 @@ def gender_suffix(user_id: int) -> str:
     if g == "female": return " Звертайся до користувача як до жінки."
     return ""
 
+def get_system_prompt(user_id: int) -> dict:
+    mode = user_personalities.get(user_id, "normal")
+    p    = PERSONALITIES.get(mode, PERSONALITIES["normal"])
+    return {"role": "system", "content": p["prompt"] + gender_suffix(user_id)}
+
 def get_active_system_prompt(user_id: int = 0) -> dict:
     """Повертає актуальний системний промпт з урахуванням режиму юзера."""
-    if user_id and user_id in user_personalities:
-        return get_system_prompt(user_id)
+    try:
+        if user_id:
+            return get_system_prompt(user_id)
+    except Exception as e:
+        log.warning("get_active_system_prompt fallback: %s", e)
     return SYSTEM_PROMPT
 
 # ── Communication style ───────────────────────────────────────────────────────
