@@ -1506,7 +1506,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "✏️ /edit інструкція: текст — редагування\n"
         "🍳 /recipe інгредієнти — рецепти\n"
         "📋 /tasks — список задач\n\n"
-        "⚙️ Налаштування:\n"
+        "⚙️ Налаштування:\n\n"
         "🎭 /mode — стиль бота\n"
         "🧠 /memory — що бот пам'ятає\n"
         "🗑️ /forget — очистити пам'ять\n"
