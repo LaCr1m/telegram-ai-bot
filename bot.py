@@ -790,12 +790,13 @@ async def call_ai(messages: list) -> str:
                 {"role": "user",      "content": "Перефразуй свою попередню відповідь виключно українською мовою. Жодних іноземних слів."},
             ]
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": fix_messages})
                 r.raise_for_status()
             result = r.json()["choices"][0]["message"]["content"]
         except Exception as e:
             log.warning("Retranslation failed: %s", e)
+            # Повертаємо оригінал якщо retranslate впав
 
     return result
 
@@ -1801,13 +1802,34 @@ def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[b
         return True, user_text
     return False, user_text
 
+async def _keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
+    """Повторює 'typing' кожні 4 секунди поки не зупинять."""
+    while not stop_event.is_set():
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        await asyncio.sleep(4)
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addressed, user_text = _is_bot_addressed(update, ctx)
     if not addressed:
         return
-    user_id = update.message.from_user.id
-    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    await _process_message(update, ctx, user_id, user_text)
+    user_id   = update.message.from_user.id
+    chat_id   = update.effective_chat.id
+    stop_evt  = asyncio.Event()
+    typing_task = asyncio.create_task(_keep_typing(ctx.bot, chat_id, stop_evt))
+    try:
+        await asyncio.wait_for(_process_message(update, ctx, user_id, user_text), timeout=90)
+    except asyncio.TimeoutError:
+        log.error("handle_message timeout for user %s", user_id)
+        await update.message.reply_text("Щось затяглось — спробуй ще раз.")
+    except Exception as e:
+        log.error("handle_message error for user %s: %s", user_id, e)
+        await update.message.reply_text("Виникла помилка. Спробуй ще раз.")
+    finally:
+        stop_evt.set()
+        typing_task.cancel()
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg     = await update.message.reply_text("🔍 Аналізую зображення...")
