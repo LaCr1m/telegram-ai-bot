@@ -1173,14 +1173,24 @@ async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
 
     # Якщо є контекст попереднього фото/відео — додаємо його опис до промпту
     ctx = last_context.get(user_id)
+    ctx_desc = ""
     if ctx and ctx.get("type") in ("фото", "відео"):
-        prompt = f"{ctx['description'][:300]}. Style: {prompt}"
+        ctx_desc = ctx["description"][:400]
 
     try:
-        translation = (await call_ai([{"role": "user", "content": (
-            f"Create a detailed image generation prompt in English based on this description. "
-            f"Return ONLY the prompt, no explanation:\n{prompt}"
-        )}])).strip()
+        if ctx_desc:
+            translation = (await call_ai([{"role": "user", "content": (
+                f"You are an image generation prompt engineer.\n"
+                f"Base image description: {ctx_desc}\n"
+                f"User request: {prompt}\n\n"
+                f"Write a precise image generation prompt in English that depicts EXACTLY the same subject "
+                f"from the base description, but applies the style/modification from the user request. "
+                f"Keep the subject faithful. Return ONLY the prompt, no explanation."
+            )}])).strip()
+        else:
+            translation = (await call_ai([{"role": "user", "content": (
+                f"Translate to English for image generation, return ONLY the prompt: {prompt}"
+            )}])).strip()
         img_bytes = await generate_image(translation)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt[:200]}")
         await msg.delete()
