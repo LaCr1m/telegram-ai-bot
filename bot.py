@@ -498,7 +498,7 @@ def detect_intent_local(text: str) -> str | None:
     for kw in REMIND_KEYWORDS:
         if kw in t: scores["reminder"] += 2
     for kw in NEWS_KEYWORDS:
-        if kw in t: scores["news"] += 2
+        if kw in t: scores["news"] += 3  # вимагаємо вищий поріг для news
     for kw in TRANSLATE_KEYWORDS:
         if kw in t: scores["translate"] += 2
     for kw in RECIPE_KEYWORDS:
@@ -568,10 +568,15 @@ async def preprocess_query(user_id: int, text: str) -> str:
     if not ctx:
         return text
     t = text.lower().strip()
-    pronouns   = ["він","вона","воно","вони","його","її","їх","там","це","той","та","те"]
-    is_short   = len(text.split()) <= 6
+    # Розкриваємо ТІЛЬКИ явні займенники у коротких запитах
+    pronouns    = ["він","вона","воно","вони","його","її","їх"]
     has_pronoun = any(p in t.split() for p in pronouns)
-    if not (is_short or has_pronoun):
+    is_short    = len(text.split()) <= 4
+    # Якщо запит містить дієслово дії — це новий запит, не уточнення
+    action_verbs = ["інтегрував","зробив","додав","видалив","написав","запустив",
+                    "налаштував","створив","оновив","виправив","перевірив"]
+    has_action = any(v in t for v in action_verbs)
+    if has_action or not (is_short and has_pronoun):
         return text
     entities = ctx.get("entities", [])
     topic    = ctx.get("topic", "")
@@ -579,10 +584,8 @@ async def preprocess_query(user_id: int, text: str) -> str:
         return text
     try:
         hint = ""
-        if topic:
-            hint += f"Тема: {topic}. "
-        if entities:
-            hint += f"Об'єкти: {', '.join(entities)}. "
+        if topic:    hint += f"Тема: {topic}. "
+        if entities: hint += f"Об'єкти: {', '.join(entities)}. "
         expanded = await call_ai([{"role": "user", "content": (
             f"{hint}\nРозкрий займенники у запиті спираючись на контекст.\n"
             f"Запит: '{text}'\nПоверни ТІЛЬКИ уточнений запит."
