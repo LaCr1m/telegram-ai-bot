@@ -977,10 +977,14 @@ async def do_news(query: str) -> str:
     def is_ua(a: dict) -> bool:
         return any(d in (a.get("url") or "") for d in UA_DOMAINS)
 
+    en_query_words = [w.lower() for w in re.split(r'\s+', en_query.strip()) if len(w) > 2]
+
     def relevance_score(a: dict) -> float:
-        haystack = ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
-        matches  = sum(1 for w in query_words if w in haystack)
-        if not matches or matches < max(1, len(query_words) // 2):
+        haystack   = ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
+        all_words  = list(dict.fromkeys(query_words + en_query_words))
+        matches    = sum(1 for w in all_words if w in haystack)
+        min_needed = 1 if len(query_words) <= 2 else max(1, len(query_words) // 2)
+        if not matches or matches < min_needed:
             return 0.0
         return float(matches) + (1.0 if is_ua(a) else 0.0)
 
