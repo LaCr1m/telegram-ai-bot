@@ -353,15 +353,22 @@ async def update_communication_style(user_id: int) -> None:
 # ── Emotion ───────────────────────────────────────────────────────────────────
 
 async def detect_emotion(text: str) -> str:
-    try:
-        result = await call_ai([{"role": "user", "content": (
-            f"Визнач емоційний стан автора: '{text}'\n"
-            "Відповідай ТІЛЬКИ одним словом: sad / angry / anxious / happy / neutral"
-        )}])
-        emotion = result.strip().lower().strip("'\"")
-        return emotion if emotion in EMOTION_TONES else "neutral"
-    except Exception:
+    # Короткі повідомлення або питання — завжди neutral
+    t = text.lower().strip()
+    if len(text.split()) <= 8:
         return "neutral"
+    if t.endswith("?"):
+        return "neutral"
+    # Явні емоційні маркери — визначаємо локально без AI
+    sad_markers     = ["мені погано","мені сумно","я в розпачі","серце болить","я плачу","хочу плакати","дуже боляче","все погано","все жахливо"]
+    angry_markers   = ["я злий","я зла","мене дістало","мене бісить","я в люті","ненавиджу","до біса","це жах"]
+    anxious_markers = ["я боюсь","мені страшно","я хвилююсь","не можу заспокоїтись","паніка","тривога","серце калатає"]
+    happy_markers   = ["я радий","я рада","чудово","супер","відмінно","круто","я щасливий","я щаслива","неймовірно"]
+    if any(m in t for m in sad_markers):     return "sad"
+    if any(m in t for m in angry_markers):   return "angry"
+    if any(m in t for m in anxious_markers): return "anxious"
+    if any(m in t for m in happy_markers):   return "happy"
+    return "neutral"
 
 def needs_support_first(emotion: str, text: str) -> bool:
     if emotion not in ("sad", "angry", "anxious"):
