@@ -551,8 +551,11 @@ def detect_intent_local(text: str) -> str | None:
     has_time = bool(
         re.search(r'\b(через|о|в)\s+\d+\s*(хв|год|хвилин|годин)\b', t) or
         re.search(r'\b\d{1,2}[:.]\d{2}\b', t) or
-        re.search(r'\b(завтра|післязавтра|сьогодні)\b', t) or
-        re.search(r'\b\d+\s*(хв|год|хвилин|годин)\b', t)
+        re.search(r'\bзавтра\b', t) or
+        re.search(r'\bпіслязавтра\b', t) or
+        re.search(r'\b\d+\s*(хв|год|хвилин|годин)\b', t) or
+        re.search(r'\bсьогодні\s+о\s+\d', t) or   # "сьогодні о 15:00" — так
+        re.search(r'\bо\s+\d{1,2}[:.]\d{2}\b', t)  # "о 9:30" — так
     )
     if has_time:
         scores["reminder"] += 2
@@ -613,30 +616,32 @@ async def update_conversation_context(user_id: int, user_text: str, reply: str, 
         pass
 
 async def preprocess_query(user_id: int, text: str) -> str:
-    ctx = conversation_context.get(user_id, {})
-    if not ctx:
-        return text
+    # Не чіпаємо довгі повідомлення або питання без займенників
     t = text.lower().strip()
-    pronouns   = ["він","вона","воно","вони","його","її","їх","там","це","той","та","те"]
-    is_short   = len(text.split()) <= 6
+    pronouns    = ["він","вона","воно","вони","його","її","їх","там","це","той","та","те","твій","твоя","твоє","твоєму","твоїм"]
+    is_short    = len(text.split()) <= 6
     has_pronoun = any(p in t.split() for p in pronouns)
     if not (is_short or has_pronoun):
         return text
+
+    ctx = conversation_context.get(user_id, {})
     entities = ctx.get("entities", [])
     topic    = ctx.get("topic", "")
     if not entities and not topic:
         return text
+
     try:
         hint = ""
-        if topic:
-            hint += f"Тема: {topic}. "
-        if entities:
-            hint += f"Об'єкти: {', '.join(entities)}. "
-        expanded = await call_ai([{"role": "user", "content": (
+        if topic:    hint += f"Тема: {topic}. "
+        if entities: hint += f"Об'єкти: {', '.join(entities)}. "
+        expanded = (await call_ai([{"role": "user", "content": (
             f"{hint}\nРозкрий займенники у запиті спираючись на контекст.\n"
-            f"Запит: '{text}'\nПоверни ТІЛЬКИ уточнений запит."
-        )}])
-        return expanded.strip() or text
+            f"Запит: '{text}'\nПоверни ТІЛЬКИ уточнений запит, без пояснень і лапок."
+        )}])).strip()
+        # Повертаємо оригінал якщо результат порожній, занадто короткий або схожий на помилку
+        if not expanded or len(expanded) < 3 or expanded.lower() in ("none", "null", "-", "—"):
+            return text
+        return expanded
     except Exception:
         return text
 
@@ -825,12 +830,19 @@ async def search_web(query: str) -> str:
             results = await asyncio.to_thread(
                 lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query=query, max_results=7)
             )
-            output = "".join(
-                f"{i['title']}\n{i['content'][:400]}\n{i['url']}\n\n"
-                for i in results.get("results", [])
+            items = [
+                i for i in results.get("results", [])
                 if not any(bd in i.get("url", "") for bd in BLOCKED_DOMAINS)
-            )
-            if output:
+            ]
+            if items:
+                output = ""
+                for i in items:
+                    title   = i.get("title", "").strip()
+                    content = i.get("content", "")[:400].strip()
+                    url     = i.get("url", "").strip()
+                    date    = i.get("published_date", "")
+                    date_str = f" ({date[:10]})" if date else ""
+                    output += f"Джерело: {title}{date_str}\n{content}\n{url}\n\n"
                 return output
         except Exception as e:
             print(f"[Tavily error]: {e}")
@@ -846,7 +858,7 @@ async def search_web(query: str) -> str:
             s = re.sub(r'<[^>]+>', '', snippets[i]).strip()
             l = links[i].strip()                           if i < len(links)   else ""
             if s and not any(bd in l for bd in BLOCKED_DOMAINS):
-                output += f"{t}\n{s}\n{l}\n\n"
+                output += f"Джерело: {t}\n{s}\n{l}\n\n"
         if output:
             return output
     except Exception as e:
@@ -1403,7 +1415,14 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg     = await update.message.reply_text(f"🌐 Шукаю: {query}...")
     results = await search_web(query)
     try:
-        reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": f"Запит: '{query}'\n\nРезультати:\n{results}\n\nСтисло підсумуй українською."}])
+        reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": (
+            f"Запит: '{query}'\n\nРезультати пошуку:\n{results}\n\n"
+            "Дай корисну відповідь українською. ПРАВИЛА:\n"
+            "- Використовуй тільки інформацію з результатів\n"
+            "- Вказуй джерела у форматі: Джерело: назва — посилання\n"
+            "- Не вигадуй факти яких немає в результатах\n"
+            "- Відповідай виключно українською, без іноземних слів"
+        )}])
         await append_and_trim(user_id, "user", f"Пошук: {query}")
         await append_and_trim(user_id, "assistant", reply)
         await _send_or_edit(msg, f"🌐 {query}\n\n{clean_markdown(reply)}")
@@ -1496,9 +1515,14 @@ async def _dispatch_intent(
                 )}])).strip()
             results = await search_web(search_query)
             content = (
-                f"Запит: '{enriched}'\n\nРезультати пошуку:\n{results}\n\nДай корисну відповідь українською з посиланнями."
+                f"Запит: '{enriched}'\n\nРезультати пошуку:\n{results}\n\n"
+                "Дай корисну відповідь українською. ПРАВИЛА:\n"
+                "- Використовуй тільки інформацію з результатів пошуку\n"
+                "- Вказуй джерела у форматі: Джерело: назва — посилання\n"
+                "- Не вигадуй факти яких немає в результатах\n"
+                "- Відповідай виключно українською мовою, без іноземних слів"
                 if results else
-                f"Запит: '{enriched}'\n\nВідповідай з власних знань українською."
+                f"Запит: '{enriched}'\n\nВідповідай з власних знань українською мовою."
             )
             reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}])
             await append_and_trim(user_id, "user", user_text)
@@ -1593,7 +1617,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await append_and_trim(user_id, "user", enriched)
         reply = await asyncio.wait_for(call_ai(messages), timeout=60)
         if not reply or not reply.strip():
-            reply = "Вибач, не вдалось сформувати відповідь. Спробуй ще раз."
+            reply = "Вибач, не вдалося сформувати відповідь. Спробуй ще раз."
         await append_and_trim(user_id, "assistant", reply)
         for chunk in [reply[i:i+4000] for i in range(0, max(len(reply), 1), 4000)]:
             await update.message.reply_text(clean_markdown(chunk))
