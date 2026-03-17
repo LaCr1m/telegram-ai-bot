@@ -1401,10 +1401,11 @@ async def _process_message(
 
     try:
         reply = await asyncio.wait_for(call_ai(messages), timeout=60)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, RuntimeError) as e:
+        log.error("call_ai failed: %s", e)
         reply = ""
     if not reply or not reply.strip():
-        reply = "Вибач, не вдалося сформувати відповідь. Спробуй ще раз."
+        reply = "Щось пішло не так на рівні AI. Спробуй ще раз."
 
     await append_and_trim(user_id, "assistant", reply)
 
