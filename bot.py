@@ -1162,7 +1162,7 @@ async def _process_message(
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
-async def _do_generate_image(update: Update, text: str, msg):
+async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
     t      = text.lower()
     prompt = text
     for kw in IMAGE_KEYWORDS:
@@ -1170,10 +1170,19 @@ async def _do_generate_image(update: Update, text: str, msg):
             prompt = text[t.index(kw) + len(kw):].strip()
             break
     prompt = prompt or text
+
+    # Якщо є контекст попереднього фото/відео — додаємо його опис до промпту
+    ctx = last_context.get(user_id)
+    if ctx and ctx.get("type") in ("фото", "відео"):
+        prompt = f"{ctx['description'][:300]}. Style: {prompt}"
+
     try:
-        translation = (await call_ai([{"role": "user", "content": f"Translate to English, return ONLY translation: {prompt}"}])).strip()
-        img_bytes   = await generate_image(translation)
-        await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
+        translation = (await call_ai([{"role": "user", "content": (
+            f"Create a detailed image generation prompt in English based on this description. "
+            f"Return ONLY the prompt, no explanation:\n{prompt}"
+        )}])).strip()
+        img_bytes = await generate_image(translation)
+        await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt[:200]}")
         await msg.delete()
     except Exception as e:
         log.error("_do_generate_image: %s", e)
@@ -1204,7 +1213,7 @@ async def _dispatch_intent(
     if intent == "image":
         msg = voice_msg or await update.message.reply_text("🎨 Генерую зображення...")
         if voice_msg: await msg.edit_text(f"{prefix}🎨 Генерую зображення...")
-        await _do_generate_image(update, enriched, msg)
+        await _do_generate_image(update, enriched, msg, user_id=user_id)
         return True
 
     if intent == "reminder":
