@@ -1095,7 +1095,7 @@ async def do_news(query: str) -> str:
             desc = desc[:117].rsplit(" ", 1)[0] + "..."
         date_str = f"📅 {a['publishedAt'][:10]} • " if a.get("publishedAt") else ""
         source   = a.get("source", {}).get("name", "")
-        flag     = "🇺🇦" if is_ua(a) else "🌐"
+        flag     = "🇺🇦" if _news_is_ua(a) else "🌐"
         desc_line = f"\n   {desc}" if desc else ""
         lines.append(f"{i}. {flag} {title}{desc_line}\n   {date_str}{source}\n   🔗 {url}\n")
 
@@ -1495,12 +1495,25 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📋 Команди:\n"
-        "/image опис | /remind 30m текст | /news тема\n"
-        "/search запит | /translate текст | /summarize url\n"
-        "/generate тип | /edit текст | /recipe інгредієнти\n"
-        "/tasks | /mode | /memory | /forget | /status | /reset\n\n"
-        "💡 Або пиши природною мовою!"
+        "📋 Команди:\n\n"
+        "🎨 /image опис — генерація зображення\n"
+        "🔔 /remind 30m текст — нагадування\n"
+        "📰 /news тема — новини за темою\n"
+        "🔍 /search запит — пошук в інтернеті\n"
+        "🌐 /translate текст — переклад\n"
+        "📄 /summarize посилання або текст — підсумок\n"
+        "✍️ /generate резюме/лист/пост — генерація тексту\n"
+        "✏️ /edit інструкція: текст — редагування\n"
+        "🍳 /recipe інгредієнти — рецепти\n"
+        "📋 /tasks — список задач\n\n"
+        "⚙️ Налаштування:\n"
+        "🎭 /mode — стиль бота\n"
+        "🧠 /memory — що бот пам'ятає\n"
+        "🗑️ /forget — очистити пам'ять\n"
+        "🔄 /reset — очистити історію чату\n\n"
+        "📊 /status — статус бота\n"
+        "❓ /help — ця довідка\n\n"
+        "💡 Або просто пиши природною мовою!"
     )
 
 async def news_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
