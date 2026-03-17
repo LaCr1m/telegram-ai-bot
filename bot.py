@@ -923,8 +923,9 @@ async def extract_video_frames(video_bytes: bytes, max_frames: int = 3) -> list[
                 frames.append(f.read())
     return frames
 
-async def analyze_video(video_bytes: bytes, caption: str) -> str:
+async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> str:
     results = []
+    sys_prompt = get_active_system_prompt(user_id)
     try:
         transcript = await transcribe_voice(await extract_video_audio(video_bytes))
         if transcript:
@@ -937,7 +938,7 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
             descs = []
             for i, frame in enumerate(frames):
                 b64  = base64.b64encode(frame).decode()
-                desc = await call_vision([SYSTEM_PROMPT, {"role": "user", "content": [
+                desc = await call_vision([sys_prompt, {"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                     {"type": "text", "text": f"Опиши кадр {i+1}. Коротко, 1-2 речення."},
                 ]}])
@@ -948,7 +949,7 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
     if not results:
         return "❌ Не вдалось проаналізувати відео."
     combined = "\n\n".join(results)
-    summary  = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": (
+    summary  = await call_ai([sys_prompt, {"role": "user", "content": (
         f"Запит: {caption}\n\nДані відео:\n{combined}\n\nВідповідай українською."
     )}])
     return f"{combined}\n\n📝 Підсумок:\n{summary}"
@@ -1501,7 +1502,7 @@ async def _dispatch_intent(
                 if results else
                 f"Запит: '{enriched}'\n\nВідповідай з власних знань українською мовою."
             )
-            reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}])
+            reply = await call_ai([get_active_system_prompt(user_id), {"role": "user", "content": content}])
             await append_and_trim(user_id, "user", user_text)
             await append_and_trim(user_id, "assistant", reply)
             _set_ctx(user_id, user_text, reply)
@@ -1828,7 +1829,7 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("❌ Відео занадто велике. Максимум 20MB.")
             return
         video_bytes = bytes(await (await ctx.bot.get_file(video.file_id)).download_as_bytearray())
-        result      = await analyze_video(video_bytes, caption)
+        result      = await analyze_video(video_bytes, caption, user_id)
         last_context[user_id] = {"type": "відео", "description": result[:CTX_DESCRIPTION_LEN]}
         await append_and_trim(user_id, "user", f"[Відео] {caption}")
         await append_and_trim(user_id, "assistant", result)
