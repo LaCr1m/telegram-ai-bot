@@ -1017,33 +1017,48 @@ async def do_news(query: str) -> str:
     except Exception as e:
         log.warning("do_news search fallback: %s", e)
 
+    # Сегменти URL що вказують на категорійну/тегову сторінку, а не статтю
+    _CAT_SEGMENTS = {
+        "tag", "tags", "lite", "rubric", "rubrics", "section", "sections",
+        "topic", "topics", "category", "categories", "news", "novyny",
+        "novini", "kino", "sport", "politics", "tech", "business",
+    }
+
     def is_specific_article(a: dict) -> bool:
         url = (a.get("url") or "").rstrip("/")
         if not url:
             return False
-        path  = url.split("//", 1)[-1]
+        # Беремо лише path (без домену і query)
+        path  = url.split("//", 1)[-1].split("?")[0]
         parts = [p for p in path.split("/") if p]
+        # Лише домен — точно головна
         if len(parts) <= 1:
             return False
-        lower = url.lower()
-        # Категорійні суфікси
-        for bad in ("/news/", "/novyny/", "/novini/", "/category/", "/tag/", "/topics/", "/lite/"):
-            if bad.rstrip("/") in lower.split("?")[0] and lower.rstrip("/").endswith(bad.rstrip("/")):
+        # Останній сегмент path — ключова ознака
+        last = parts[-1].lower()
+        # Якщо останній сегмент є відомою категорією — не стаття
+        if last in _CAT_SEGMENTS:
+            return False
+        # Якщо передостанній сегмент — категорія, а останній теж схожий — не стаття
+        # (напр. /rubric/novosti-kino або /tag/kino)
+        if len(parts) >= 2 and parts[-2].lower() in _CAT_SEGMENTS:
+            # Стаття зазвичай має цифри або довгий slug з дефісами
+            if not re.search(r'\d{4,}', last) and last.count('-') < 2:
                 return False
-        # URL закінчується на /tag/щось або /lite/щось — категорія
-        for segment in ("/tag/", "/lite/", "/rubric/", "/section/", "/topic/"):
-            if segment in lower:
-                # якщо після сегменту немає більше шляху — категорія
-                after = lower.split(segment, 1)[-1].rstrip("/")
-                if "/" not in after:
-                    return False
         return True
 
     # ── Оцінка, сортування, дедублікація ─────────────────────────────────────
-    scored = [(a, relevance_score(a)) for a in all_articles if is_specific_article(a)]
-    if len(scored) < 3:  # якщо конкретних статей мало — беремо всі
-        scored = [(a, relevance_score(a)) for a in all_articles]
-    scored = [(a, s) for a, s in scored if s > 0]
+    specific   = [(a, relevance_score(a)) for a in all_articles if is_specific_article(a)]
+    specific   = [(a, s) for a, s in specific if s > 0]
+    if len(specific) >= 5:
+        scored = specific
+    else:
+        # Конкретних мало — беремо всі, але конкретні йдуть першими
+        all_scored = [(a, relevance_score(a)) for a in all_articles]
+        all_scored = [(a, s) for a, s in all_scored if s > 0]
+        specific_urls = {a.get("url") for a, _ in specific}
+        rest   = [(a, s) for a, s in all_scored if a.get("url") not in specific_urls]
+        scored = specific + rest
 
     if not scored:
         return f"📰 Новин за темою «{clean_query}» не знайдено."
