@@ -984,16 +984,20 @@ async def do_news(query: str) -> str:
             return 0.0
         return float(matches) + (1.0 if is_ua(a) else 0.0)
 
-    def deduplicate(arts: list) -> list:
-        seen, result = set(), []
-        for a in arts:
-            norm = re.sub(r'[^a-zа-яіїєґ0-9]', '', (a.get("title") or "").lower())
-            if norm and norm not in seen:
-                seen.add(norm)
-                result.append(a)
-            if len(result) == MAX_NEWS_RESULTS:
-                break
-        return result
+    def is_specific_article(a: dict) -> bool:
+        """Фільтрує головні сторінки та категорійні URL — залишає лише конкретні статті."""
+        url  = (a.get("url") or "").rstrip("/")
+        path = url.split("//")[-1].split("/", 1)[-1] if "//" in url else url
+        # Відкидаємо URL без шляху або з надто коротким шляхом (головна/категорія)
+        if not path or "/" not in path:
+            return False
+        # Відкидаємо відомі шаблони категорійних сторінок
+        skip_patterns = ["/news/", "/novini/", "/novyny/", "/category/", "/tag/", "/topics/", "/section/"]
+        if any(url.endswith(p.rstrip("/")) or url.endswith(p) for p in skip_patterns):
+            return False
+        # Має бути конкретний slug — хоча б 10 символів після останнього /
+        slug = url.rsplit("/", 1)[-1]
+        return len(slug) >= 8
 
     all_articles: list[dict] = []
 
@@ -1081,10 +1085,16 @@ async def do_news(query: str) -> str:
         lines.append(f"💡 {summary}\n")
     for i, a in enumerate(ordered, 1):
         url      = a.get("url", "")
+        title    = a.get("title", "Без назви")
+        desc     = a.get("description") or ""
+        # Скорочуємо опис до 120 символів
+        if len(desc) > 120:
+            desc = desc[:117].rsplit(" ", 1)[0] + "..."
         date_str = f"📅 {a['publishedAt'][:10]} • " if a.get("publishedAt") else ""
         source   = a.get("source", {}).get("name", "")
         flag     = "🇺🇦" if is_ua(a) else "🌐"
-        lines.append(f"{i}. {flag} {a.get('title', 'Без назви')}\n   {date_str}{source}\n   🔗 {url}\n")
+        desc_line = f"\n   {desc}" if desc else ""
+        lines.append(f"{i}. {flag} {title}{desc_line}\n   {date_str}{source}\n   🔗 {url}\n")
 
     return "\n".join(lines)
 
