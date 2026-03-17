@@ -1048,13 +1048,13 @@ async def do_news(query: str) -> str:
         return True
 
     # ── Оцінка, сортування, дедублікація ─────────────────────────────────────
-    # Домени що майже завжди дають категорійні URL замість статей
-    _ALWAYS_CAT_DOMAINS = {"pravda.com.ua", "unian.ua", "nv.ua", "tsn.ua", "suspilne.media"}
+        # Домени що повертають лише головні/категорійні сторінки — фільтруємо повністю
+    _CAT_ONLY_DOMAINS = {"pravda.com.ua", "unian.ua", "nv.ua", "tsn.ua", "suspilne.media"}
 
     def is_real_article(a: dict) -> bool:
-        url = (a.get("url") or "")
+        url    = (a.get("url") or "")
         domain = url.split("//", 1)[-1].split("/")[0].lstrip("www.")
-        if domain in _ALWAYS_CAT_DOMAINS and not re.search(r'\d{5,}|[-]{3,}', url.split("//", 1)[-1].split("?")[0].split("/")[-1] or ""):
+        if domain in _CAT_ONLY_DOMAINS:
             return False
         return is_specific_article(a)
 
