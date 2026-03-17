@@ -1237,23 +1237,28 @@ async def detect_gender_from_transcript(text: str) -> str | None:
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
-async def _send_or_edit(msg, text: str, parse_mode: str = "MarkdownV2", **kwargs):
+async def _send_or_edit(msg, text: str, parse_mode: str | None = "MarkdownV2", **kwargs):
     text   = text.strip() or "—"
     chunks = [text[i:i + MSG_CHUNK_SIZE] for i in range(0, len(text), MSG_CHUNK_SIZE)]
     for i, chunk in enumerate(chunks):
+        pm_kwargs = {"parse_mode": parse_mode} if parse_mode else {}
         try:
             if i == 0:
-                try:    await msg.edit_text(chunk, parse_mode=parse_mode, **kwargs)
-                except Exception: await msg.reply_text(chunk, parse_mode=parse_mode, **kwargs)
+                try:    await msg.edit_text(chunk, **pm_kwargs, **kwargs)
+                except Exception: await msg.reply_text(chunk, **pm_kwargs, **kwargs)
             else:
-                await msg.reply_text(chunk, parse_mode=parse_mode, **kwargs)
+                await msg.reply_text(chunk, **pm_kwargs, **kwargs)
         except Exception:
-            plain = re.sub(r'[\\*_`\[\]()]', '', chunk)
-            if i == 0:
-                try:    await msg.edit_text(plain, **kwargs)
-                except Exception: await msg.reply_text(plain, **kwargs)
-            else:
-                await msg.reply_text(plain, **kwargs)
+            # Fallback без форматування
+            try:
+                plain = re.sub(r'[\\*_`\[\]()]', '', chunk) if parse_mode else chunk
+                if i == 0:
+                    try:    await msg.edit_text(plain, **kwargs)
+                    except Exception: await msg.reply_text(plain, **kwargs)
+                else:
+                    await msg.reply_text(plain, **kwargs)
+            except Exception as e:
+                log.error("_send_or_edit fallback failed: %s", e)
 
 async def _send_chunk(update: Update, chunk: str, voice_msg=None):
     try:
@@ -1433,15 +1438,15 @@ async def _dispatch_intent(
         return True
 
     INTENT_MAP = {
-        "translate": ("🌐 Перекладаю...",   do_translate),
-        "summarize": ("📰 Опрацьовую...",    do_summarize),
-        "generate":  ("✍️ Генерую текст...", do_generate),
-        "edit":      ("✏️ Редагую...",        do_edit),
-        "recipe":    ("🍳 Рецепти...",         do_recipe),
-        "news":      ("📰 Шукаю новини...",   do_news),
+        "translate": ("🌐 Перекладаю...",   do_translate,  True),
+        "summarize": ("📰 Опрацьовую...",    do_summarize,  True),
+        "generate":  ("✍️ Генерую текст...", do_generate,   True),
+        "edit":      ("✏️ Редагую...",        do_edit,       True),
+        "recipe":    ("🍳 Рецепти...",         do_recipe,     True),
+        "news":      ("📰 Шукаю новини...",   do_news,       False),  # plain text
     }
     if intent in INTENT_MAP:
-        status_text, fn = INTENT_MAP[intent]
+        status_text, fn, use_markdown = INTENT_MAP[intent]
         msg = voice_msg or await update.message.reply_text(status_text)
         if voice_msg: await msg.edit_text(f"{prefix}{status_text}")
         try:
@@ -1450,8 +1455,10 @@ async def _dispatch_intent(
             log.error("intent %s: %s", intent, e)
             await msg.edit_text(f"{prefix}⚠️ Помилка. Спробуй ще раз.")
             return True
+        text   = clean_markdown(f"{prefix}{result}".strip()) if use_markdown else f"{prefix}{result}".strip()
         kwargs = {"disable_web_page_preview": True} if intent == "news" else {}
-        await _send_or_edit(msg, clean_markdown(f"{prefix}{result}".strip()), **kwargs)
+        pm     = "MarkdownV2" if use_markdown else None
+        await _send_or_edit(msg, text, parse_mode=pm, **kwargs)
         _set_ctx(user_id, user_text, result)
         return True
 
@@ -1487,7 +1494,12 @@ async def news_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Використання: /news тема")
         return
     msg = await update.message.reply_text(f"📰 Шукаю новини про «{query}»...")
-    await _send_or_edit(msg, clean_markdown(await do_news(query)), disable_web_page_preview=True)
+    try:
+        result = await do_news(query)
+        await _send_or_edit(msg, result, parse_mode=None, disable_web_page_preview=True)
+    except Exception as e:
+        log.error("news_cmd: %s", e, exc_info=True)
+        await msg.edit_text("Помилка отримання новин. Спробуй ще раз.")
 
 async def translate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = " ".join(ctx.args)
