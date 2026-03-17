@@ -41,7 +41,6 @@ GROQ_API_KEY       = _require_env("GROQ_API_KEY")
 TAVILY_API_KEY     = _require_env("TAVILY_API_KEY")
 CF_API_TOKEN       = _require_env("CF_API_TOKEN")
 CF_ACCOUNT_ID      = _require_env("CF_ACCOUNT_ID")
-NEWS_API_KEY       = _require_env("NEWS_API_KEY")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is required")
@@ -62,15 +61,12 @@ CF_IMAGE_URL              = "https://api.cloudflare.com/client/v4/accounts/{acco
 MAX_HISTORY_MESSAGES  = 20
 SUMMARY_THRESHOLD     = 16
 STYLE_UPDATE_INTERVAL = 10
-OR_DAILY_LIMIT        = 190
 MSG_CHUNK_SIZE        = 4000
 MAX_VIDEO_SIZE        = 20 * 1024 * 1024
 MAX_ARTICLE_CHARS     = 6000
 MAX_DOC_PREVIEW_CHARS = 4000
 CTX_DESCRIPTION_LEN   = 500
 SEARCH_RESULTS        = 7
-NEWS_PAGE_SIZE        = 50
-MAX_NEWS_RESULTS      = 10
 
 REMINDERS_FILE = "reminders.json"
 MEMORY_FILE    = "memory.json"
@@ -84,8 +80,6 @@ TZ = ZoneInfo("Europe/Kyiv")
 
 def now_kyiv() -> datetime:
     return datetime.now(TZ)
-
-or_requests: dict = {"count": 0, "date": date.today()}
 
 # ── Emotion tones ─────────────────────────────────────────────────────────────
 
@@ -203,44 +197,12 @@ SUMMARIZE_KEYWORDS = ["підсумуй","скороти","стисло","кор
 GENERATE_KEYWORDS  = ["напиши резюме","створи резюме","напиши лист","створи лист","напиши пост","створи пост","напиши оголошення","створи оголошення","напиши текст для","згенеруй текст"]
 EDIT_KEYWORDS      = ["відредагуй текст","відредагуй цей текст","покращ текст","покращ цей текст","виправ текст","перепиши текст","переформулюй текст","зроби офіційніше","зроби діловіше","зроби простіше","скороти текст","розшир текст","адаптуй текст","зміни стиль тексту","виправ помилки в тексті"]
 RECIPE_KEYWORDS    = ["що приготувати","що зробити з","рецепт з","рецепти з","є такі продукти","є такі інгредієнти","що можна приготувати","що приготувати з","є дома"]
-NEWS_KEYWORDS      = ["новини про","новини щодо","що нового про","останні новини про","news about","що відбувається з","новини на тему"]
 TASK_KEYWORDS      = ["додай задачу","додай до списку","запам'ятай задачу","нова задача","видали задачу","видалити задачу","покажи задачі","мої задачі","список задач","виконано","задачу виконано"]
 
 _SOCIAL_PHRASES = {
     "привіт","хай","хей","добрий день","добрий ранок","добрий вечір",
     "доброго ранку","доброго вечора","вітаю","салют","як справи",
     "як ти","як твої справи","що нового","як діла","yo","hi","hello",
-}
-
-# ── News domains ──────────────────────────────────────────────────────────────
-
-NEWS_DOMAINS_BY_CATEGORY = {
-    "politics": ["pravda.com.ua","epravda.com.ua","ukrinform.ua","unian.ua","interfax.com.ua","zn.ua","lb.ua","radiosvoboda.org","hromadske.ua","reuters.com","apnews.com","bbc.com","bbc.co.uk","politico.eu","theguardian.com","france24.com","dw.com","aljazeera.com","foreignpolicy.com"],
-    "tech":     ["ain.ua","itc.ua","dev.ua","techcrunch.com","theverge.com","wired.com","arstechnica.com","engadget.com","venturebeat.com","zdnet.com","9to5google.com","macrumors.com","tomshardware.com"],
-    "sport":    ["sport.ua","footboom.com","ua-football.com","tribuna.com","espn.com","skysports.com","goal.com","marca.com","as.com","bleacherreport.com","theathletic.com","eurosport.com","sportingnews.com"],
-    "business": ["mind.ua","epravda.com.ua","forbes.ua","businessviews.com.ua","bloomberg.com","ft.com","wsj.com","forbes.com","businessinsider.com","cnbc.com","economist.com","fortune.com"],
-    "science":  ["nature.com","science.org","scientificamerican.com","newscientist.com","phys.org","sciencedaily.com","livescience.com","space.com","nationalgeographic.com"],
-    "health":   ["who.int","webmd.com","healthline.com","medicalnewstoday.com","mayoclinic.org","health.harvard.edu","nih.gov","bmj.com","thelancet.com"],
-    "culture":  ["suspilne.media","hromadske.ua","ukrinform.ua","theguardian.com","nytimes.com","rollingstone.com","variety.com","hollywoodreporter.com"],
-    "general":  ["ukrinform.ua","ukrinform.net","pravda.com.ua","unian.ua","suspilne.media","tsn.ua","liga.net","nv.ua","reuters.com","apnews.com","bbc.com","theguardian.com","euronews.com","dw.com","france24.com"],
-}
-
-CATEGORY_KEYWORDS = {
-    "politics": ["політик","вибори","парламент","уряд","президент","міністр","закон","партія","санкції","нато","євросоюз","оон","війна","зеленський","путін","трамп","конгрес","верховна рада"],
-    "tech":     ["технолог","штучний інтелект","ai","іт","it","програмуванн","стартап","apple","google","microsoft","tesla","openai","чіп","процесор","смартфон","кібер","криптовалют"],
-    "sport":    ["футбол","баскетбол","теніс","бокс","спорт","олімпіад","чемпіонат","матч","турнір","гравець","тренер","клуб","fifa","uefa","nba","nfl","формула 1"],
-    "business": ["бізнес","економік","фінанс","банк","інвестиц","акції","ввп","інфляці","валют","долар","євро","бюджет","ринок","компанія","корпорац"],
-    "science":  ["наук","дослідженн","відкритт","фізик","хімі","біолог","астроном","космос","клімат","екологі","генетик","днк","вакцин","квантов"],
-    "health":   ["здоров","медицин","лікар","хвороб","лікуванн","рак","серце","діабет","ковід","covid","грип","психологі","дієт","фітнес"],
-    "culture":  ["кіно","фільм","музик","концерт","театр","виставк","книг","роман","художник","мистецтв","культур","серіал","netflix","оскар"],
-}
-
-UA_DOMAINS = {
-    "pravda.com.ua","ukrinform.ua","ukrinform.net","unian.ua","suspilne.media",
-    "radiosvoboda.org","interfax.com.ua","zn.ua","tsn.ua","liga.net","nv.ua",
-    "hromadske.ua","lb.ua","epravda.com.ua","ain.ua","itc.ua","dev.ua",
-    "sport.ua","footboom.com","ua-football.com","tribuna.com",
-    "mind.ua","forbes.ua","businessviews.com.ua",
 }
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
@@ -542,12 +504,11 @@ _URL_RE = re.compile(r'https?://\S+')
 
 def detect_intent_local(text: str) -> str | None:
     t = text.lower()
-    scores: dict[str, int] = {k: 0 for k in ("image","reminder","news","translate","recipe","generate","edit","task","summarize","search")}
+    scores: dict[str, int] = {k: 0 for k in ("image","reminder","translate","recipe","generate","edit","task","summarize","search")}
 
     for intent, keywords, weight in [
         ("image",     IMAGE_KEYWORDS,     2),
         ("reminder",  REMIND_KEYWORDS,    2),
-        ("news",      NEWS_KEYWORDS,      2),
         ("translate", TRANSLATE_KEYWORDS, 2),
         ("recipe",    RECIPE_KEYWORDS,    2),
         ("edit",      EDIT_KEYWORDS,      2),
@@ -587,7 +548,7 @@ async def detect_intent_ai(text: str) -> str:
     result = await call_ai([{"role": "user", "content": (
         f"Визнач намір повідомлення: '{text}'\n"
         "Відповідай ТІЛЬКИ одним словом:\n"
-        "reminder|image|news|search|translate|summarize|generate|edit|recipe|task|chat\n"
+        "reminder|image|search|translate|summarize|generate|edit|recipe|task|chat\n"
         "- reminder: ТІЛЬКИ якщо є конкретний час або дата\n"
         "- chat: все інше, включаючи питання і розмову"
     )}])
@@ -606,9 +567,7 @@ async def preprocess_query(user_id: int, text: str) -> str:
     if words & person_pronouns and not (words & {"він","вона","воно","вони","його","її","їх","цей","ця","це","той","та","те"}):
         return text
     obj_pronouns = {"він","вона","воно","вони","його","її","їх","цей","ця","це","той","та","те","там"}
-    has_obj_pronoun = bool(obj_pronouns & words)
-    is_short        = len(text.split()) <= 6
-    if not (is_short and has_obj_pronoun):
+    if not (len(text.split()) <= 6 and bool(obj_pronouns & words)):
         return text
     history = chat_histories.get(user_id, [])
     recent  = [m for m in history if m.get("role") != "system"][-4:]
@@ -938,190 +897,6 @@ def extract_word_text(docx_bytes: bytes) -> str:
     except Exception as e:
         return f"Помилка читання Word: {e}"
 
-# ── News ──────────────────────────────────────────────────────────────────────
-
-def detect_news_category(query: str) -> str:
-    q      = query.lower()
-    scores = {cat: sum(1 for kw in kws if kw in q) for cat, kws in CATEGORY_KEYWORDS.items()}
-    best   = max(scores, key=lambda c: scores[c])
-    return best if scores[best] > 0 else "general"
-
-def _news_is_ua(a: dict) -> bool:
-    return any(d in (a.get("url") or "") for d in UA_DOMAINS)
-
-def _news_deduplicate(articles: list, strict: bool = True) -> list:
-    seen, result = set(), []
-    for a in articles:
-        title = (a.get("title") or "").lower().strip()
-        url   = (a.get("url") or "").strip()
-        key   = title[:40] if strict else url
-        if key and key not in seen:
-            seen.add(key)
-            result.append(a)
-    return result
-
-async def do_news(query: str) -> str:
-    clean_query = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
-    query_words = [w.lower() for w in re.split(r'\s+', clean_query.strip()) if len(w) > 2]
-
-    def relevance_score(a: dict) -> float:
-        haystack   = ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
-        matches    = sum(1 for w in query_words if w in haystack)
-        min_needed = 1 if len(query_words) <= 2 else max(1, len(query_words) // 2)
-        if not matches or matches < min_needed:
-            return 0.0
-        return float(matches) + (1.0 if _news_is_ua(a) else 0.0)
-
-    all_articles: list[dict] = []
-
-    # ── NewsAPI ────────────────────────────────────────────────────────────────
-    if NEWS_API_KEY:
-        try:
-            category = detect_news_category(clean_query)
-
-            async def fetch_articles(p: dict) -> list:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    r = await client.get("https://newsapi.org/v2/everything", params=p)
-                    r.raise_for_status()
-                return r.json().get("articles", [])
-
-            base_params = {"q": clean_query, "sortBy": "publishedAt", "pageSize": NEWS_PAGE_SIZE, "apiKey": NEWS_API_KEY}
-
-            p = {**base_params, "domains": ",".join(NEWS_DOMAINS_BY_CATEGORY.get(category, NEWS_DOMAINS_BY_CATEGORY["general"]))}
-            all_articles = await fetch_articles(p)
-
-            if sum(1 for a in all_articles if relevance_score(a) > 0) < 3 and category != "general":
-                p = {**base_params, "domains": ",".join(NEWS_DOMAINS_BY_CATEGORY["general"])}
-                all_articles += await fetch_articles(p)
-
-            if sum(1 for a in all_articles if relevance_score(a) > 0) < 3:
-                all_articles += await fetch_articles(base_params)
-
-        except Exception as e:
-            log.warning("do_news NewsAPI: %s", e)
-
-    # ── Tavily / DuckDuckGo fallback ──────────────────────────────────────────
-    try:
-        sr = await search_web(f"{clean_query} новини")
-        if sr:
-            for block in sr.split("\n\n"):
-                lines = block.strip().splitlines()
-                title = lines[0].replace("Джерело: ", "").strip() if lines else ""
-                url   = lines[2].strip() if len(lines) > 2 else ""
-                if title and url:
-                    all_articles.append({
-                        "title": title,
-                        "description": lines[1].strip() if len(lines) > 1 else "",
-                        "url": url, "publishedAt": "", "source": {"name": ""},
-                    })
-    except Exception as e:
-        log.warning("do_news search fallback: %s", e)
-
-    # Сегменти URL що вказують на категорійну/тегову сторінку, а не статтю
-    _CAT_SEGMENTS = {
-        "tag", "tags", "lite", "rubric", "rubrics", "section", "sections",
-        "topic", "topics", "category", "categories", "news", "novyny",
-        "novini", "kino", "sport", "politics", "tech", "business",
-    }
-
-    def is_specific_article(a: dict) -> bool:
-        url = (a.get("url") or "").rstrip("/")
-        if not url:
-            return False
-        # Беремо лише path (без домену і query)
-        path  = url.split("//", 1)[-1].split("?")[0]
-        parts = [p for p in path.split("/") if p]
-        # Лише домен — точно головна
-        if len(parts) <= 1:
-            return False
-        # Останній сегмент path — ключова ознака
-        last = parts[-1].lower()
-        # Якщо останній сегмент є відомою категорією — не стаття
-        if last in _CAT_SEGMENTS:
-            return False
-        # Якщо передостанній сегмент — категорія, а останній теж схожий — не стаття
-        # (напр. /rubric/novosti-kino або /tag/kino)
-        if len(parts) >= 2 and parts[-2].lower() in _CAT_SEGMENTS:
-            # Стаття зазвичай має цифри або довгий slug з дефісами
-            if not re.search(r'\d{4,}', last) and last.count('-') < 2:
-                return False
-        return True
-
-    # ── Оцінка, сортування, дедублікація ─────────────────────────────────────
-        # Домени що часто дають категорійні URL — приймаємо лише конкретні статті
-    _STRICT_DOMAINS = {"pravda.com.ua", "unian.ua", "nv.ua", "tsn.ua", "suspilne.media"}
-
-    def is_real_article(a: dict) -> bool:
-        url    = (a.get("url") or "").rstrip("/")
-        if not url:
-            return False
-        domain = url.split("//", 1)[-1].split("/")[0].lstrip("www.")
-        path   = url.split("//", 1)[-1].split("?")[0]
-        parts  = [p for p in path.split("/") if p]
-        if len(parts) <= 1:
-            return False  # тільки домен
-        last = parts[-1]
-        if domain in _STRICT_DOMAINS:
-            # Для цих доменів — приймаємо лише якщо є числовий ID або slug з 3+ дефісами
-            return bool(re.search(r'\d{4,}', last) or last.count('-') >= 3)
-        return is_specific_article(a)
-
-    filtered_articles = [a for a in all_articles if is_real_article(a)]
-    scored = [(a, relevance_score(a)) for a in filtered_articles]
-    scored = [(a, s) for a, s in scored if s > 0]
-
-    if not scored:
-        # Останній резерв — без фільтра статей, але хоча б не головні сторінки
-        scored = [(a, relevance_score(a)) for a in all_articles
-                  if len([p for p in (a.get("url") or "").split("//", 1)[-1].split("/") if p]) > 1]
-        scored = [(a, s) for a, s in scored if s > 0]
-
-    if not scored:
-        return f"📰 Новин за темою «{clean_query}» не знайдено."
-
-    def sort_key(item: tuple) -> tuple:
-        a, s = item
-        date_inv = "".join(chr(0x10FFFF - ord(c)) for c in (a.get("publishedAt") or ""))
-        return (-s, -(1 if _news_is_ua(a) else 0), date_inv)
-
-    scored.sort(key=sort_key)
-
-    unique = _news_deduplicate([a for a, _ in scored], strict=True)
-    if len(unique) < 3:
-        unique = _news_deduplicate([a for a, _ in scored], strict=False)
-
-    # ── AI підсумок ───────────────────────────────────────────────────────────
-    sources_text = "\n".join(f"{a.get('title','Без назви')}. {a.get('description') or ''}" for a in unique)
-    try:
-        summary = await call_ai([{"role": "user", "content": (
-            f"Заголовки новин за темою '{clean_query}':\n{sources_text}\n\n"
-            "Короткий підсумок (2-3 речення). Українською."
-        )}])
-    except Exception:
-        summary = ""
-
-    # ── Формуємо відповідь: UA першими ───────────────────────────────────────
-    ua_list   = [a for a in unique if _news_is_ua(a)]
-    intl_list = [a for a in unique if not _news_is_ua(a)]
-    ordered   = (ua_list + intl_list)[:MAX_NEWS_RESULTS]
-
-    lines = [f"📰 Новини: {clean_query}\n"]
-    if summary:
-        lines.append(f"💡 {summary}\n")
-    for i, a in enumerate(ordered, 1):
-        url      = a.get("url", "")
-        title    = a.get("title", "Без назви")
-        desc     = re.sub(r'#{1,3}\s*', '', a.get("description") or "").strip()
-        if len(desc) > 120:
-            desc = desc[:117].rsplit(" ", 1)[0] + "..."
-        date_str  = f"📅 {a['publishedAt'][:10]} • " if a.get("publishedAt") else ""
-        source    = a.get("source", {}).get("name", "")
-        flag      = "🇺🇦" if _news_is_ua(a) else "🌐"
-        desc_line = f"\n   {desc}" if desc else ""
-        lines.append(f"{i}. {flag} {title}{desc_line}\n   {date_str}{source}\n   🔗 {url}\n")
-
-    return "\n".join(lines)
-
 # ── Intent handlers ───────────────────────────────────────────────────────────
 
 async def do_translate(text: str) -> str:
@@ -1148,15 +923,15 @@ async def do_summarize(text: str) -> str:
     return await call_ai([{"role": "user", "content": prompt}])
 
 TEXT_GENRES = {
-    "лист": "діловий лист — вступ, суть, підпис",
-    "резюме": "резюме — контакти, досвід, освіта, навички",
-    "пост": "пост для соцмереж — живий, із закликом до дії",
-    "оголошення": "оголошення — заголовок, суть, контакти",
-    "стаття": "стаття — заголовок, вступ, підзаголовки, висновок",
-    "опис": "опис — образний, деталізований",
-    "оповідання": "оповідання — зав'язка, кульмінація, розв'язка",
-    "есе": "есе — теза, аргументи, висновок",
-    "слоган": "слоган — короткий, запам'ятовуваний",
+    "лист":      "діловий лист — вступ, суть, підпис",
+    "резюме":    "резюме — контакти, досвід, освіта, навички",
+    "пост":      "пост для соцмереж — живий, із закликом до дії",
+    "оголошення":"оголошення — заголовок, суть, контакти",
+    "стаття":    "стаття — заголовок, вступ, підзаголовки, висновок",
+    "опис":      "опис — образний, деталізований",
+    "оповідання":"оповідання — зав'язка, кульмінація, розв'язка",
+    "есе":       "есе — теза, аргументи, висновок",
+    "слоган":    "слоган — короткий, запам'ятовуваний",
     "біографія": "біографія — хронологічний виклад",
 }
 
@@ -1218,7 +993,10 @@ async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
             if not tasks:
                 await update.message.reply_text("📋 Список порожній.")
                 return
-            lines = ["📋 Задачі:\n"] + [f"{'✅' if t.get('done') else '⬜'} {i}. {t['text']}" for i, t in enumerate(tasks, 1)]
+            lines = ["📋 Задачі:\n"] + [
+                f"{'✅' if t.get('done') else '⬜'} {i}. {t['text']}"
+                for i, t in enumerate(tasks, 1)
+            ]
             await update.message.reply_text("\n".join(lines))
     except Exception as e:
         log.warning("do_task_nlp: %s", e)
@@ -1238,7 +1016,10 @@ async def _fire_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> Non
         await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
     except Exception as e:
         log.warning("_fire_reminder: %s", e)
-    save_reminders([r for r in load_reminders() if not (r["chat_id"] == chat_id and r["text"] == text and r["fire_at"] == fire_at.isoformat())])
+    save_reminders([
+        r for r in load_reminders()
+        if not (r["chat_id"] == chat_id and r["text"] == text and r["fire_at"] == fire_at.isoformat())
+    ])
 
 async def schedule_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> None:
     reminders = load_reminders()
@@ -1266,7 +1047,9 @@ async def detect_gender_from_transcript(text: str) -> str | None:
     if not text:
         return None
     try:
-        g = (await call_ai([{"role": "user", "content": f"Визнач стать мовця (казав/казала).\nТекст: '{text}'\nТІЛЬКИ: 'male', 'female' або 'unknown'."}])).strip().lower()
+        g = (await call_ai([{"role": "user", "content": (
+            f"Визнач стать мовця (казав/казала).\nТекст: '{text}'\nТІЛЬКИ: 'male', 'female' або 'unknown'."
+        )}])).strip().lower()
         return g if g in ("male", "female") else None
     except Exception:
         return None
@@ -1314,19 +1097,24 @@ async def _process_message(
     user_id: int, user_text: str, voice_msg=None,
 ) -> None:
     prefix = f"🎤 Ти сказав: {user_text}\n\n" if voice_msg else ""
+
     try:
         preprocessed = await asyncio.wait_for(preprocess_query(user_id, user_text), timeout=15)
     except Exception:
         preprocessed = user_text
+
     try:
         enriched = await asyncio.wait_for(resolve_text_with_context(user_id, preprocessed), timeout=15)
     except Exception:
         enriched = preprocessed
+
     try:
         intent = await asyncio.wait_for(detect_intent(enriched), timeout=15)
     except Exception:
         intent = "chat"
+
     emotion = detect_emotion(user_text)
+
     if intent == "chat" and needs_support_first(emotion, user_text) and not voice_msg:
         try:
             support = await asyncio.wait_for(call_ai([
@@ -1338,27 +1126,36 @@ async def _process_message(
             return
         except Exception as e:
             log.warning("support reply: %s", e)
+
     if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent, voice_msg=voice_msg):
         return
+
     await append_and_trim(user_id, "user", enriched)
+
     try:
         dynamic_prompt = build_dynamic_prompt(user_id, emotion)
     except Exception:
         dynamic_prompt = get_system_prompt(user_id)
+
     history  = get_history(user_id)
     messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
+
     try:
         reply = await asyncio.wait_for(call_ai(messages), timeout=60)
     except (asyncio.TimeoutError, RuntimeError) as e:
         log.error("call_ai failed: %s", e)
         reply = "Щось пішло не так. Спробуй ще раз."
+
     await append_and_trim(user_id, "assistant", reply)
+
     full_reply = clean_markdown(f"{prefix}{reply}".strip())
     chunks     = [full_reply[i:i + MSG_CHUNK_SIZE] for i in range(0, max(len(full_reply), 1), MSG_CHUNK_SIZE)]
     for j, chunk in enumerate(chunks):
         await _send_chunk(update, chunk, voice_msg=voice_msg if j == 0 else None)
+
     _set_ctx(user_id, user_text, reply)
     asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
+
     user_msgs = [m for m in get_history(user_id) if m.get("role") == "user"]
     if len(user_msgs) % STYLE_UPDATE_INTERVAL == 0:
         asyncio.create_task(update_communication_style(user_id))
@@ -1366,7 +1163,7 @@ async def _process_message(
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
 async def _do_generate_image(update: Update, text: str, msg):
-    t = text.lower()
+    t      = text.lower()
     prompt = text
     for kw in IMAGE_KEYWORDS:
         if kw in t:
@@ -1413,9 +1210,9 @@ async def _dispatch_intent(
     if intent == "reminder":
         try:
             remind_text, fire_at = await _do_reminder(update, ctx, enriched)
-            text = f"{prefix}✅ Нагадаю {fire_at.strftime('%d.%m.%Y о %H:%M')}: {remind_text}"
-            if voice_msg: await voice_msg.edit_text(text)
-            else:         await update.message.reply_text(text)
+            reply_text = f"{prefix}✅ Нагадаю {fire_at.strftime('%d.%m.%Y о %H:%M')}: {remind_text}"
+            if voice_msg: await voice_msg.edit_text(reply_text)
+            else:         await update.message.reply_text(reply_text)
         except Exception as e:
             log.warning("reminder dispatch: %s", e)
             err = f"{prefix}Не вдалось встановити нагадування."
@@ -1434,7 +1231,9 @@ async def _dispatch_intent(
         try:
             search_query = enriched
             if "[Контекст" in enriched:
-                search_query = (await call_ai([{"role": "user", "content": f"{enriched}\n\nКороткий пошуковий запит (до 10 слів). ТІЛЬКИ запит."}])).strip()
+                search_query = (await call_ai([{"role": "user", "content": (
+                    f"{enriched}\n\nКороткий пошуковий запит (до 10 слів). ТІЛЬКИ запит."
+                )}])).strip()
             results = await search_web(search_query)
             content = (
                 f"Запит: '{enriched}'\n\nРезультати:\n{results}\n\nВідповідь українською. Вказуй джерела."
@@ -1452,12 +1251,11 @@ async def _dispatch_intent(
         return True
 
     INTENT_MAP = {
-        "translate": ("🌐 Перекладаю...",   do_translate,  True),
-        "summarize": ("📰 Опрацьовую...",    do_summarize,  True),
-        "generate":  ("✍️ Генерую текст...", do_generate,   True),
-        "edit":      ("✏️ Редагую...",        do_edit,       True),
-        "recipe":    ("🍳 Рецепти...",         do_recipe,     True),
-        "news":      ("📰 Шукаю новини...",   do_news,       False),
+        "translate": ("🌐 Перекладаю...",    do_translate, True),
+        "summarize": ("📰 Опрацьовую...",     do_summarize, True),
+        "generate":  ("✍️ Генерую текст...",  do_generate,  True),
+        "edit":      ("✏️ Редагую...",         do_edit,      True),
+        "recipe":    ("🍳 Рецепти...",          do_recipe,    True),
     }
     if intent in INTENT_MAP:
         status_text, fn, use_markdown = INTENT_MAP[intent]
@@ -1469,10 +1267,8 @@ async def _dispatch_intent(
             log.error("intent %s: %s", intent, e)
             await msg.edit_text(f"{prefix}⚠️ Помилка. Спробуй ще раз.")
             return True
-        text   = clean_markdown(f"{prefix}{result}".strip()) if use_markdown else f"{prefix}{result}".strip()
-        kwargs = {"disable_web_page_preview": True} if intent == "news" else {}
-        pm     = "MarkdownV2" if use_markdown else None
-        await _send_or_edit(msg, text, parse_mode=pm, **kwargs)
+        text = clean_markdown(f"{prefix}{result}".strip()) if use_markdown else f"{prefix}{result}".strip()
+        await _send_or_edit(msg, text, parse_mode="MarkdownV2" if use_markdown else None)
         _set_ctx(user_id, user_text, result)
         return True
 
@@ -1488,7 +1284,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Редагую тексти ✏️\n• Рецепти за інгредієнтами 🍳\n"
         "• Список задач 📋\n• Аналізую фото та відео 🎬\n"
         "• Генерую зображення 🎨\n• Голосові повідомлення 🎤\n"
-        "• Шукаю в інтернеті 🔍\n• Читаю PDF, Excel, Word 📄\n• Нагадування 🔔\n\n"
+        "• Шукаю в інтернеті 🔍\n• Читаю PDF, Excel, Word 📄\n"
+        "• Нагадування 🔔\n\n"
         "Просто пиши!\n/help — команди"
     )
 
@@ -1497,7 +1294,6 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📋 Команди:\n\n"
         "🎨 /image опис — генерація зображення\n"
         "🔔 /remind 30m текст — нагадування\n"
-        "📰 /news тема — новини за темою\n"
         "🔍 /search запит — пошук в інтернеті\n"
         "🌐 /translate текст — переклад\n"
         "📄 /summarize посилання або текст — підсумок\n"
@@ -1514,19 +1310,6 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "❓ /help — ця довідка\n\n"
         "💡 Або просто пиши природною мовою!"
     )
-
-async def news_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = " ".join(ctx.args)
-    if not query:
-        await update.message.reply_text("Використання: /news тема")
-        return
-    msg = await update.message.reply_text(f"📰 Шукаю новини про «{query}»...")
-    try:
-        result = await do_news(query)
-        await _send_or_edit(msg, result, parse_mode=None, disable_web_page_preview=True)
-    except Exception as e:
-        log.error("news_cmd: %s", e, exc_info=True)
-        await msg.edit_text("Помилка отримання новин. Спробуй ще раз.")
 
 async def translate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = " ".join(ctx.args)
@@ -1860,7 +1643,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("status",    handle_status))
     app.add_handler(CommandHandler("remind",    handle_remind))
     app.add_handler(CommandHandler("image",     handle_image))
-    app.add_handler(CommandHandler("news",      news_cmd))
     app.add_handler(CommandHandler("translate", translate_cmd))
     app.add_handler(CommandHandler("summarize", summarize_cmd))
     app.add_handler(CommandHandler("generate",  generate_cmd))
