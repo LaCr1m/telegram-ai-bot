@@ -197,7 +197,7 @@ _BENDER_CORE = (
 
 PERSONALITIES = {
     "normal": {
-        "name": "Звичайний", "emoji": "🤖",
+        "name": "Звичайний", "emoji": "🧠",
         "prompt": (
             "Ти J.A.R.V.I.S. — цифрова особистість з характером.\n"
             + _CHARACTER_CORE
