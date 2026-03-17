@@ -1048,12 +1048,21 @@ async def do_news(query: str) -> str:
         return True
 
     # ── Оцінка, сортування, дедублікація ─────────────────────────────────────
-    specific   = [(a, relevance_score(a)) for a in all_articles if is_specific_article(a)]
+    # Домени що майже завжди дають категорійні URL замість статей
+    _ALWAYS_CAT_DOMAINS = {"pravda.com.ua", "unian.ua", "nv.ua", "tsn.ua", "suspilne.media"}
+
+    def is_real_article(a: dict) -> bool:
+        url = (a.get("url") or "")
+        domain = url.split("//", 1)[-1].split("/")[0].lstrip("www.")
+        if domain in _ALWAYS_CAT_DOMAINS and not re.search(r'\d{5,}|[-]{3,}', url.split("//", 1)[-1].split("?")[0].split("/")[-1] or ""):
+            return False
+        return is_specific_article(a)
+
+    specific   = [(a, relevance_score(a)) for a in all_articles if is_real_article(a)]
     specific   = [(a, s) for a, s in specific if s > 0]
-    if len(specific) >= 5:
+    if len(specific) >= 3:
         scored = specific
     else:
-        # Конкретних мало — беремо всі, але конкретні йдуть першими
         all_scored = [(a, relevance_score(a)) for a in all_articles]
         all_scored = [(a, s) for a, s in all_scored if s > 0]
         specific_urls = {a.get("url") for a, _ in specific}
