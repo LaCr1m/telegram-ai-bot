@@ -1560,6 +1560,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.message.from_user.id
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    # Базова обробка — не може впасти
     try:
         preprocessed = await preprocess_query(user_id, user_text)
         enriched     = await resolve_text_with_context(user_id, preprocessed)
@@ -1568,19 +1570,55 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Помилка обробки запиту: {e}")
         return
 
+    # Емоція — безпечно, при помилці використовуємо neutral
+    try:
+        emotion = await detect_emotion(user_text)
+    except Exception:
+        emotion = "neutral"
+
+    # Підтримка при стресі — тільки для chat intent
+    if intent == "chat" and needs_support_first(emotion, user_text):
+        try:
+            support_prompt = build_dynamic_prompt(user_id, emotion)
+            support = await call_ai([
+                support_prompt,
+                {"role": "user", "content": (
+                    f"{user_text}\n\n"
+                    "Відповідь: спочатку одним-двома реченнями визнай почуття людини. "
+                    "Потім м'яко запитай чим можеш допомогти або запропонуй допомогу."
+                )}
+            ])
+            await update.message.reply_text(clean_markdown(support))
+            _set_ctx(user_id, user_text, support)
+            asyncio.create_task(update_conversation_context(user_id, user_text, support, intent))
+            return
+        except Exception:
+            pass  # Якщо підтримка впала — продовжуємо звичайну відповідь
+
     if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent):
         return
 
+    # Основна відповідь
     try:
+        # Динамічний промпт — при помилці fallback на звичайний
+        try:
+            dynamic_prompt = build_dynamic_prompt(user_id, emotion)
+        except Exception:
+            dynamic_prompt = get_system_prompt(user_id)
+
+        history  = get_history(user_id)
+        messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
         await append_and_trim(user_id, "user", enriched)
-        reply  = await call_ai(get_history(user_id))
+        reply = await call_ai(messages)
         await append_and_trim(user_id, "assistant", reply)
-        chunks = [reply[i:i+4000] for i in range(0, max(len(reply), 1), 4000)]
-        for chunk in chunks:
+        for chunk in [reply[i:i+4000] for i in range(0, max(len(reply), 1), 4000)]:
             await update.message.reply_text(clean_markdown(chunk))
         _set_ctx(user_id, user_text, reply)
         asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
         asyncio.create_task(update_conversation_context(user_id, user_text, reply, intent))
+        user_msgs = [m for m in history if m.get("role") == "user"]
+        if len(user_msgs) % STYLE_UPDATE_INTERVAL == 0:
+            asyncio.create_task(update_communication_style(user_id))
     except Exception as e:
         await update.message.reply_text(f"⚠️ Помилка відповіді: {e}")
 
@@ -1674,12 +1712,23 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         preprocessed = await preprocess_query(user_id, text)
         enriched     = await resolve_text_with_context(user_id, preprocessed)
         intent       = await detect_intent(enriched, user_id)
+        try:
+            emotion = await detect_emotion(text)
+        except Exception:
+            emotion = "neutral"
 
         if await _dispatch_intent(update, ctx, user_id, text, enriched, intent, voice_msg=msg):
             return
 
+        try:
+            dynamic_prompt = build_dynamic_prompt(user_id, emotion)
+        except Exception:
+            dynamic_prompt = get_system_prompt(user_id)
+
+        history  = get_history(user_id)
+        messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
         await append_and_trim(user_id, "user", enriched)
-        reply = await call_ai(get_history(user_id))
+        reply = await call_ai(messages)
         await append_and_trim(user_id, "assistant", reply)
         await _send_or_edit(msg, f"🎤 Ти сказав: {text}\n\n{clean_markdown(reply)}")
         asyncio.create_task(update_conversation_context(user_id, text, reply, intent))
