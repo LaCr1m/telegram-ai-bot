@@ -598,32 +598,22 @@ async def detect_intent(text: str) -> str:
     return detect_intent_local(clean) or await detect_intent_ai(clean)
 
 async def preprocess_query(user_id: int, text: str) -> str:
-    """Розкриває займенники лише якщо вони явно посилаються на попередній об'єкт розмови."""
     t = text.lower().strip()
-
-    # Соціальні фрази — не чіпаємо взагалі
     if t in _SOCIAL_PHRASES or any(t.startswith(s) for s in _SOCIAL_PHRASES):
         return text
-
-    # Займенники що стосуються ЛЮДЕЙ/БОТА — не розкриваємо
     person_pronouns = {"тебе","тобі","ти","вас","вам","ви","мене","мені","я"}
     words = set(t.split())
     if words & person_pronouns and not (words & {"він","вона","воно","вони","його","її","їх","цей","ця","це","той","та","те"}):
         return text
-
-    # Розкриваємо лише предметні займенники при короткому запиті
     obj_pronouns = {"він","вона","воно","вони","його","її","їх","цей","ця","це","той","та","те","там"}
     has_obj_pronoun = bool(obj_pronouns & words)
     is_short        = len(text.split()) <= 6
-
     if not (is_short and has_obj_pronoun):
         return text
-
     history = chat_histories.get(user_id, [])
     recent  = [m for m in history if m.get("role") != "system"][-4:]
     if not recent:
         return text
-
     context_text = "\n".join(
         f"{'Юзер' if m['role'] == 'user' else 'Бот'}: "
         f"{m['content'] if isinstance(m['content'], str) else '[медіа]'}"
@@ -642,17 +632,12 @@ async def preprocess_query(user_id: int, text: str) -> str:
         return text
 
 async def resolve_text_with_context(user_id: int, text: str) -> str:
-    """Додає контекст з останнього медіа/пошуку якщо повідомлення явно на нього посилається."""
     ctx = last_context.get(user_id)
     if not ctx:
         return text
-
     t = text.lower().strip()
-
-    # Соціальні фрази — ніколи не додаємо контекст
     if t in _SOCIAL_PHRASES or any(t.startswith(s) for s in _SOCIAL_PHRASES):
         return text
-
     strong_hints = [
         "це","цей","цю","цього","на фото","з фото","на зображенні","знайди","пошукай",
         "що це","розкажи більше","докладніше","ще про","як використовувати","рецепт з",
@@ -666,7 +651,6 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
     )
     if len(t.split()) <= 10 or any(h in t for h in strong_hints):
         return ctx_block
-
     try:
         check = await call_ai([{"role": "user", "content": (
             f"Контекст: {ctx['type']} — «{ctx['description'][:200]}»\n"
@@ -740,8 +724,6 @@ _NON_UA_RE = re.compile(
 
 async def call_ai(messages: list) -> str:
     result = None
-
-    # Groq — основний (краще дотримується характеру)
     if GROQ_API_KEY:
         try:
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
@@ -751,8 +733,6 @@ async def call_ai(messages: list) -> str:
             result = r.json()["choices"][0]["message"]["content"]
         except Exception as e:
             log.warning("Groq failed, trying OpenRouter: %s", e)
-
-    # OpenRouter — резерв
     if result is None and OPENROUTER_API_KEY:
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
@@ -766,11 +746,8 @@ async def call_ai(messages: list) -> str:
                 break
             except Exception as e:
                 log.warning("OpenRouter %s failed: %s", model, e)
-
     if not result or not result.strip():
         raise RuntimeError("All AI providers failed")
-
-    # Retranslate якщо відповідь не українська
     if _NON_UA_RE.search(result):
         log.warning("Non-Ukrainian response, retranslating")
         try:
@@ -785,7 +762,6 @@ async def call_ai(messages: list) -> str:
             result = r.json()["choices"][0]["message"]["content"]
         except Exception as e:
             log.warning("Retranslation failed: %s", e)
-
     return result
 
 async def call_vision(messages: list) -> str:
@@ -970,40 +946,31 @@ def detect_news_category(query: str) -> str:
     best   = max(scores, key=lambda c: scores[c])
     return best if scores[best] > 0 else "general"
 
+def _news_is_ua(a: dict) -> bool:
+    return any(d in (a.get("url") or "") for d in UA_DOMAINS)
+
+def _news_deduplicate(articles: list, strict: bool = True) -> list:
+    seen, result = set(), []
+    for a in articles:
+        title = (a.get("title") or "").lower().strip()
+        url   = (a.get("url") or "").strip()
+        key   = title[:40] if strict else url
+        if key and key not in seen:
+            seen.add(key)
+            result.append(a)
+    return result
+
 async def do_news(query: str) -> str:
     clean_query = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
     query_words = [w.lower() for w in re.split(r'\s+', clean_query.strip()) if len(w) > 2]
 
-    def is_ua(a: dict) -> bool:
-        return any(d in (a.get("url") or "") for d in UA_DOMAINS)
-
-    en_query_words = [w.lower() for w in re.split(r'\s+', en_query.strip()) if len(w) > 2]
-
     def relevance_score(a: dict) -> float:
         haystack   = ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
-        all_words  = list(dict.fromkeys(query_words + en_query_words))
-        matches    = sum(1 for w in all_words if w in haystack)
+        matches    = sum(1 for w in query_words if w in haystack)
         min_needed = 1 if len(query_words) <= 2 else max(1, len(query_words) // 2)
         if not matches or matches < min_needed:
             return 0.0
-        return float(matches) + (1.0 if is_ua(a) else 0.0)
-
-    def is_specific_article(a: dict) -> bool:
-        """Відкидає лише очевидні головні сторінки без конкретного матеріалу."""
-        url = (a.get("url") or "").rstrip("/")
-        if not url:
-            return False
-        # URL без будь-якого шляху після домену — точно головна
-        path = url.split("//", 1)[-1]  # domain/path
-        parts = [p for p in path.split("/") if p]
-        if len(parts) <= 1:
-            return False  # тільки домен або домен + одна коротка частина
-        # Відомі суфікси категорійних сторінок
-        lower = url.lower()
-        for bad in ("/news/", "/novyny/", "/novini/", "/category/", "/tag/", "/topics/"):
-            if lower.endswith(bad.rstrip("/")):
-                return False
-        return True
+        return float(matches) + (1.0 if _news_is_ua(a) else 0.0)
 
     all_articles: list[dict] = []
 
@@ -1020,16 +987,13 @@ async def do_news(query: str) -> str:
 
             base_params = {"q": clean_query, "sortBy": "publishedAt", "pageSize": NEWS_PAGE_SIZE, "apiKey": NEWS_API_KEY}
 
-            # Спроба 1: тематичні домени
             p = {**base_params, "domains": ",".join(NEWS_DOMAINS_BY_CATEGORY.get(category, NEWS_DOMAINS_BY_CATEGORY["general"]))}
             all_articles = await fetch_articles(p)
 
-            # Спроба 2: general домени
             if sum(1 for a in all_articles if relevance_score(a) > 0) < 3 and category != "general":
                 p = {**base_params, "domains": ",".join(NEWS_DOMAINS_BY_CATEGORY["general"])}
                 all_articles += await fetch_articles(p)
 
-            # Спроба 3: без обмеження доменів
             if sum(1 for a in all_articles if relevance_score(a) > 0) < 3:
                 all_articles += await fetch_articles(base_params)
 
@@ -1037,7 +1001,6 @@ async def do_news(query: str) -> str:
             log.warning("do_news NewsAPI: %s", e)
 
     # ── Tavily / DuckDuckGo fallback ──────────────────────────────────────────
-    # Використовуємо завжди як доповнення для кращого покриття
     try:
         sr = await search_web(f"{clean_query} новини")
         if sr:
@@ -1094,12 +1057,11 @@ async def do_news(query: str) -> str:
         url      = a.get("url", "")
         title    = a.get("title", "Без назви")
         desc     = a.get("description") or ""
-        # Скорочуємо опис до 120 символів
         if len(desc) > 120:
             desc = desc[:117].rsplit(" ", 1)[0] + "..."
-        date_str = f"📅 {a['publishedAt'][:10]} • " if a.get("publishedAt") else ""
-        source   = a.get("source", {}).get("name", "")
-        flag     = "🇺🇦" if _news_is_ua(a) else "🌐"
+        date_str  = f"📅 {a['publishedAt'][:10]} • " if a.get("publishedAt") else ""
+        source    = a.get("source", {}).get("name", "")
+        flag      = "🇺🇦" if _news_is_ua(a) else "🌐"
         desc_line = f"\n   {desc}" if desc else ""
         lines.append(f"{i}. {flag} {title}{desc_line}\n   {date_str}{source}\n   🔗 {url}\n")
 
@@ -1268,7 +1230,6 @@ async def _send_or_edit(msg, text: str, parse_mode: str | None = "MarkdownV2", *
             else:
                 await msg.reply_text(chunk, **pm_kwargs, **kwargs)
         except Exception:
-            # Fallback без форматування
             try:
                 plain = re.sub(r'[\\*_`\[\]()]', '', chunk) if parse_mode else chunk
                 if i == 0:
@@ -1298,28 +1259,19 @@ async def _process_message(
     user_id: int, user_text: str, voice_msg=None,
 ) -> None:
     prefix = f"🎤 Ти сказав: {user_text}\n\n" if voice_msg else ""
-
-    # Препроцесинг: розкрити займенники через реальну історію
     try:
         preprocessed = await asyncio.wait_for(preprocess_query(user_id, user_text), timeout=15)
     except Exception:
         preprocessed = user_text
-
-    # Контекст медіа/пошуку
     try:
         enriched = await asyncio.wait_for(resolve_text_with_context(user_id, preprocessed), timeout=15)
     except Exception:
         enriched = preprocessed
-
-    # Інтент і емоція
     try:
         intent = await asyncio.wait_for(detect_intent(enriched), timeout=15)
     except Exception:
         intent = "chat"
-
     emotion = detect_emotion(user_text)
-
-    # Емоційна підтримка
     if intent == "chat" and needs_support_first(emotion, user_text) and not voice_msg:
         try:
             support = await asyncio.wait_for(call_ai([
@@ -1331,39 +1283,27 @@ async def _process_message(
             return
         except Exception as e:
             log.warning("support reply: %s", e)
-
-    # Dispatch спеціальних інтентів
     if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent, voice_msg=voice_msg):
         return
-
-    # Звичайний чат — зберігаємо повідомлення ДО виклику AI щоб воно увійшло в messages
     await append_and_trim(user_id, "user", enriched)
-
     try:
         dynamic_prompt = build_dynamic_prompt(user_id, emotion)
     except Exception:
         dynamic_prompt = get_system_prompt(user_id)
-
-    # Передаємо повну актуальну історію (system замінюємо на dynamic)
     history  = get_history(user_id)
     messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
-
     try:
         reply = await asyncio.wait_for(call_ai(messages), timeout=60)
     except (asyncio.TimeoutError, RuntimeError) as e:
         log.error("call_ai failed: %s", e)
         reply = "Щось пішло не так. Спробуй ще раз."
-
     await append_and_trim(user_id, "assistant", reply)
-
     full_reply = clean_markdown(f"{prefix}{reply}".strip())
     chunks     = [full_reply[i:i + MSG_CHUNK_SIZE] for i in range(0, max(len(full_reply), 1), MSG_CHUNK_SIZE)]
     for j, chunk in enumerate(chunks):
         await _send_chunk(update, chunk, voice_msg=voice_msg if j == 0 else None)
-
     _set_ctx(user_id, user_text, reply)
     asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
-
     user_msgs = [m for m in get_history(user_id) if m.get("role") == "user"]
     if len(user_msgs) % STYLE_UPDATE_INTERVAL == 0:
         asyncio.create_task(update_communication_style(user_id))
@@ -1462,7 +1402,7 @@ async def _dispatch_intent(
         "generate":  ("✍️ Генерую текст...", do_generate,   True),
         "edit":      ("✏️ Редагую...",        do_edit,       True),
         "recipe":    ("🍳 Рецепти...",         do_recipe,     True),
-        "news":      ("📰 Шукаю новини...",   do_news,       False),  # plain text
+        "news":      ("📰 Шукаю новини...",   do_news,       False),
     }
     if intent in INTENT_MAP:
         status_text, fn, use_markdown = INTENT_MAP[intent]
@@ -1735,8 +1675,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addressed, user_text = _is_bot_addressed(update, ctx)
     if not addressed:
         return
-    user_id    = update.message.from_user.id
-    stop_evt   = asyncio.Event()
+    user_id     = update.message.from_user.id
+    stop_evt    = asyncio.Event()
     typing_task = asyncio.create_task(_keep_typing(ctx.bot, update.effective_chat.id, stop_evt))
     try:
         await asyncio.wait_for(_process_message(update, ctx, user_id, user_text), timeout=90)
