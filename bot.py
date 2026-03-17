@@ -974,16 +974,17 @@ async def do_news(query: str) -> str:
     clean_query = query.split("Запит користувача:")[-1].strip() if "Запит користувача:" in query else query
     query_words = [w.lower() for w in re.split(r'\s+', clean_query.strip()) if len(w) > 2]
 
+    def is_ua(a: dict) -> bool:
+        return any(d in (a.get("url") or "") for d in UA_DOMAINS)
+
     def relevance_score(a: dict) -> float:
         haystack = ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
         matches  = sum(1 for w in query_words if w in haystack)
         if not matches or matches < max(1, len(query_words) // 2):
             return 0.0
-        # Українські домени отримують бонус +1.0
-        ua_bonus = 1.0 if any(d in (a.get("url") or "") for d in UA_DOMAINS) else 0.0
-        return matches + ua_bonus
+        return float(matches) + (1.0 if is_ua(a) else 0.0)
 
-    def deduplicate_scored(arts: list) -> list:
+    def deduplicate(arts: list) -> list:
         seen, result = set(), []
         for a in arts:
             norm = re.sub(r'[^a-zа-яіїєґ0-9]', '', (a.get("title") or "").lower())
@@ -996,10 +997,10 @@ async def do_news(query: str) -> str:
 
     all_articles: list[dict] = []
 
+    # ── NewsAPI ────────────────────────────────────────────────────────────────
     if NEWS_API_KEY:
         try:
             category = detect_news_category(clean_query)
-            domains  = NEWS_DOMAINS_BY_CATEGORY.get(category, NEWS_DOMAINS_BY_CATEGORY["general"])
 
             async def fetch_articles(p: dict) -> list:
                 async with httpx.AsyncClient(timeout=15) as client:
@@ -1007,60 +1008,58 @@ async def do_news(query: str) -> str:
                     r.raise_for_status()
                 return r.json().get("articles", [])
 
-            params = {
-                "q": clean_query, "domains": ",".join(domains),
-                "sortBy": "publishedAt", "pageSize": NEWS_PAGE_SIZE, "apiKey": NEWS_API_KEY,
-            }
-            all_articles = await fetch_articles(params)
+            base_params = {"q": clean_query, "sortBy": "publishedAt", "pageSize": NEWS_PAGE_SIZE, "apiKey": NEWS_API_KEY}
 
-            # Якщо мало результатів — додаємо general домени
-            if len([a for a in all_articles if relevance_score(a) > 0]) < 5 and category != "general":
-                params["domains"] = ",".join(NEWS_DOMAINS_BY_CATEGORY["general"])
-                all_articles += await fetch_articles(params)
+            # Спроба 1: тематичні домени
+            p = {**base_params, "domains": ",".join(NEWS_DOMAINS_BY_CATEGORY.get(category, NEWS_DOMAINS_BY_CATEGORY["general"]))}
+            all_articles = await fetch_articles(p)
 
-            # Якщо все ще мало — прибираємо обмеження доменів
-            if len([a for a in all_articles if relevance_score(a) > 0]) < 3:
-                params.pop("domains", None)
-                all_articles += await fetch_articles(params)
+            # Спроба 2: general домени
+            if sum(1 for a in all_articles if relevance_score(a) > 0) < 3 and category != "general":
+                p = {**base_params, "domains": ",".join(NEWS_DOMAINS_BY_CATEGORY["general"])}
+                all_articles += await fetch_articles(p)
+
+            # Спроба 3: без обмеження доменів
+            if sum(1 for a in all_articles if relevance_score(a) > 0) < 3:
+                all_articles += await fetch_articles(base_params)
 
         except Exception as e:
             log.warning("do_news NewsAPI: %s", e)
 
-    # Fallback: Tavily/DuckDuckGo
-    if len([a for a in all_articles if relevance_score(a) > 0]) < 3:
-        try:
-            sr = await search_web(f"новини {clean_query}")
-            if sr:
-                for block in sr.split("\n\n"):
-                    lines = block.strip().splitlines()
-                    title = lines[0].replace("Джерело: ", "").strip() if lines else ""
-                    url   = lines[2].strip() if len(lines) > 2 else ""
-                    if title and url:
-                        all_articles.append({
-                            "title": title,
-                            "description": lines[1].strip() if len(lines) > 1 else "",
-                            "url": url,
-                            "publishedAt": "",
-                            "source": {"name": ""},
-                        })
-        except Exception as e:
-            log.warning("do_news fallback: %s", e)
+    # ── Tavily / DuckDuckGo fallback ──────────────────────────────────────────
+    # Використовуємо завжди як доповнення для кращого покриття
+    try:
+        sr = await search_web(f"{clean_query} новини")
+        if sr:
+            for block in sr.split("\n\n"):
+                lines = block.strip().splitlines()
+                title = lines[0].replace("Джерело: ", "").strip() if lines else ""
+                url   = lines[2].strip() if len(lines) > 2 else ""
+                if title and url:
+                    all_articles.append({
+                        "title": title,
+                        "description": lines[1].strip() if len(lines) > 1 else "",
+                        "url": url, "publishedAt": "", "source": {"name": ""},
+                    })
+    except Exception as e:
+        log.warning("do_news search fallback: %s", e)
 
-    # Сортуємо: спочатку за score (UA отримує бонус), потім за датою
-    scored = [(a, relevance_score(a)) for a in all_articles if relevance_score(a) > 0]
-    scored.sort(key=lambda x: (
-        -x[1],                                          # вищий score — вище
-        -(1 if any(d in (x[0].get("url") or "") for d in UA_DOMAINS) else 0),  # UA вище
-        -(x[0].get("publishedAt") or ""),               # свіжіше — вище
-    ))
+    # ── Оцінка, сортування, дедублікація ─────────────────────────────────────
+    scored = [(a, relevance_score(a)) for a in all_articles]
+    scored = [(a, s) for a, s in scored if s > 0]
 
-    # Дедублікуємо після сортування щоб зберегти пріоритет UA
-    unique = deduplicate_scored([a for a, _ in scored])
-
-    if not unique:
+    if not scored:
         return f"📰 Новин за темою «{clean_query}» не знайдено."
 
-    # Підсумок від AI
+    scored.sort(key=lambda x: (
+        -x[1],                                    # вищий score — вище
+        -(1 if is_ua(x[0]) else 0),               # UA вище при рівному score
+        -(x[0].get("publishedAt") or "0"),        # свіжіше — вище (рядковий sort, "" → "0")
+    ))
+
+    unique = deduplicate([a for a, _ in scored])
+
+    # ── AI підсумок ───────────────────────────────────────────────────────────
     sources_text = "\n".join(f"{a.get('title','Без назви')}. {a.get('description') or ''}" for a in unique)
     try:
         summary = await call_ai([{"role": "user", "content": (
@@ -1070,22 +1069,20 @@ async def do_news(query: str) -> str:
     except Exception:
         summary = ""
 
-    # Формуємо відповідь: 10 лінків з пріоритетом UA
+    # ── Формуємо відповідь: UA першими ───────────────────────────────────────
+    ua_list   = [a for a in unique if is_ua(a)]
+    intl_list = [a for a in unique if not is_ua(a)]
+    ordered   = (ua_list + intl_list)[:MAX_NEWS_RESULTS]
+
     lines = [f"📰 Новини: {clean_query}\n"]
     if summary:
         lines.append(f"💡 {summary}\n")
-
-    ua_articles    = [a for a in unique if any(d in (a.get("url") or "") for d in UA_DOMAINS)]
-    intl_articles  = [a for a in unique if not any(d in (a.get("url") or "") for d in UA_DOMAINS)]
-    ordered        = ua_articles + intl_articles  # UA спочатку
-
-    for i, a in enumerate(ordered[:MAX_NEWS_RESULTS], 1):
-        title      = a.get("title", "Без назви")
-        url        = a.get("url", "")
-        date_str   = f"📅 {a['publishedAt'][:10]} • " if a.get("publishedAt") else ""
-        source     = a.get("source", {}).get("name", "")
-        ua_flag    = "🇺🇦 " if any(d in url for d in UA_DOMAINS) else "🌐 "
-        lines.append(f"{i}. {ua_flag}{title}\n   {date_str}{source}\n   🔗 {url}\n")
+    for i, a in enumerate(ordered, 1):
+        url      = a.get("url", "")
+        date_str = f"📅 {a['publishedAt'][:10]} • " if a.get("publishedAt") else ""
+        source   = a.get("source", {}).get("name", "")
+        flag     = "🇺🇦" if is_ua(a) else "🌐"
+        lines.append(f"{i}. {flag} {a.get('title', 'Без назви')}\n   {date_str}{source}\n   🔗 {url}\n")
 
     return "\n".join(lines)
 
