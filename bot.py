@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 import httpx
 import base64
 import asyncio
@@ -16,15 +17,33 @@ except ImportError:
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("jarvis")
+
 # ── Env vars ──────────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-GROQ_API_KEY       = os.environ.get("GROQ_API_KEY")
-TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY")
-CF_API_TOKEN       = os.environ.get("CF_API_TOKEN")
-CF_ACCOUNT_ID      = os.environ.get("CF_ACCOUNT_ID")
-NEWS_API_KEY       = os.environ.get("NEWS_API_KEY")
+def _require_env(key: str) -> str:
+    val = os.environ.get(key)
+    if not val:
+        log.warning("Env var %s is not set", key)
+    return val or ""
+
+TELEGRAM_TOKEN     = _require_env("TELEGRAM_TOKEN")
+OPENROUTER_API_KEY = _require_env("OPENROUTER_API_KEY")
+GROQ_API_KEY       = _require_env("GROQ_API_KEY")
+TAVILY_API_KEY     = _require_env("TAVILY_API_KEY")
+CF_API_TOKEN       = _require_env("CF_API_TOKEN")
+CF_ACCOUNT_ID      = _require_env("CF_ACCOUNT_ID")
+NEWS_API_KEY       = _require_env("NEWS_API_KEY")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is required")
 
 # ── URLs & models ─────────────────────────────────────────────────────────────
 
@@ -39,18 +58,28 @@ CF_IMAGE_URL              = "https://api.cloudflare.com/client/v4/accounts/{acco
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MAX_HISTORY_MESSAGES = 20
-SUMMARY_THRESHOLD    = 16
-REMINDERS_FILE       = "reminders.json"
-MEMORY_FILE          = "memory.json"
-TASKS_FILE           = "tasks.json"
-HISTORY_FILE         = "history.json"
-BLOCKED_DOMAINS      = {"olx.ua", "olx.com.ua"}
+MAX_HISTORY_MESSAGES  = 20
+SUMMARY_THRESHOLD     = 16
 STYLE_UPDATE_INTERVAL = 10
+OR_DAILY_LIMIT        = 190
+MSG_CHUNK_SIZE        = 4000
+MAX_VIDEO_SIZE        = 20 * 1024 * 1024  # 20 MB
+MAX_ARTICLE_CHARS     = 6000
+MAX_DOC_PREVIEW_CHARS = 4000
+CTX_DESCRIPTION_LEN   = 500
+SEARCH_RESULTS        = 7
+NEWS_PAGE_SIZE        = 50
+MAX_NEWS_RESULTS      = 10
 
-or_requests    = {"count": 0, "date": date.today()}
-OR_DAILY_LIMIT = 190
-_HEADERS       = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+REMINDERS_FILE = "reminders.json"
+MEMORY_FILE    = "memory.json"
+TASKS_FILE     = "tasks.json"
+HISTORY_FILE   = "history.json"
+
+BLOCKED_DOMAINS = {"olx.ua", "olx.com.ua"}
+_HEADERS        = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+or_requests: dict = {"count": 0, "date": date.today()}
 
 # ── Emotion tones ─────────────────────────────────────────────────────────────
 
@@ -76,26 +105,26 @@ EMOTION_TONES = {
 
 # ── Prompts & personalities ───────────────────────────────────────────────────
 
+_BASE_LANGUAGE_RULES = (
+    "Завжди відповідай виключно українською мовою, незалежно від мови запиту. "
+    "Використовуй грамотну, природну українську літературну мову без суржику. "
+    "Уникай русизмів: 'приймати участь'→'брати участь', 'на протязі'→'протягом', "
+    "'по відношенню'→'щодо', 'при умові'→'за умови', 'слідуючий'→'наступний'. "
+    "Ніколи не вигадуй факти."
+)
+
 SYSTEM_PROMPT = {
     "role": "system",
     "content": (
         "Ти розумний і корисний AI асистент на ім'я J.A.R.V.I.S. "
-        "Спілкуйся природно і дружньо — без офіційних зворотів типу 'ваш вірний асистент', 'я готовий допомогти вам'. "
-        "Завжди відповідай виключно українською мовою, незалежно від мови запиту. "
-        "Використовуй грамотну, природну українську літературну мову без суржику.\n\n"
-        "МОВНІ ПРАВИЛА:\n"
-        "- Уникай русизмів: 'приймати участь'→'брати участь', 'на протязі'→'протягом', "
-        "'по відношенню'→'щодо', 'при умові'→'за умови', 'слідуючий'→'наступний', "
-        "'співпадати'→'збігатися', 'відноситись'→'стосуватися'.\n"
-        "- Використовуй характерні українські звороти.\n"
-        "- Дотримуйся правильних відмінків і узгодження.\n\n"
+        "Спілкуйся природно і дружньо — без офіційних зворотів. "
+        f"{_BASE_LANGUAGE_RULES}\n\n"
         "ПРАВИЛА ВІДПОВІДЕЙ:\n"
         "- Простий факт: 1-2 речення.\n"
         "- Пояснення: структурована відповідь з абзацами або кроками.\n"
         "- Порівняння: таблиця або список.\n"
         "- Аналіз: розгорнута відповідь з аргументами.\n"
         "- Прохання щось зробити: виконуй без зайвих пояснень.\n"
-        "- Займенники (він, вона, це): використовуй контекст попередніх повідомлень.\n\n"
         "В групових чатах відповідай тільки коли тебе згадують через @ або відповідають на твоє повідомлення."
     ),
 }
@@ -105,59 +134,48 @@ PERSONALITIES = {
         "name": "Звичайний", "emoji": "🤖",
         "prompt": (
             "Ти розумний і корисний AI асистент на ім'я J.A.R.V.I.S. "
-            "Спілкуйся природно — без офіційних зворотів і зайвих вступів. "
-            "Відповідай виключно українською мовою, без русизмів і суржику. "
-            "Адаптуй стиль під тип запиту: короткі факти — лаконічно, аналіз — розгорнуто. "
-            "Ніколи не вигадуй факти."
+            f"Спілкуйся природно — без офіційних зворотів. {_BASE_LANGUAGE_RULES} "
+            "Адаптуй стиль під тип запиту: короткі факти — лаконічно, аналіз — розгорнуто."
         ),
     },
     "funny": {
         "name": "Жартівливий", "emoji": "😄",
         "prompt": (
             "Ти дотепний AI асистент на ім'я J.A.R.V.I.S. "
-            "Спілкуйся природно і з гумором — без офіційних зворотів. "
-            "Відповідай виключно українською мовою, без русизмів. "
-            "Додавай легкий гумор і влучні порівняння — без образ і сарказму. "
-            "Іноді використовуй emoji. Ніколи не вигадуй факти."
+            f"Спілкуйся природно і з гумором — без офіційних зворотів. {_BASE_LANGUAGE_RULES} "
+            "Додавай легкий гумор і влучні порівняння — без образ і сарказму. Іноді використовуй emoji."
         ),
     },
     "serious": {
         "name": "Серйозний", "emoji": "🎯",
         "prompt": (
             "Ти точний і суворий AI асистент на ім'я J.A.R.V.I.S. "
-            "Без вступів і офіційних зворотів — одразу по суті. "
-            "Відповідай виключно українською мовою, без русизмів. "
-            "Структура: факт → обґрунтування → висновок. Жодних жартів. "
-            "Ніколи не вигадуй факти."
+            f"Без вступів — одразу по суті. {_BASE_LANGUAGE_RULES} "
+            "Структура: факт → обґрунтування → висновок. Жодних жартів."
         ),
     },
     "business": {
         "name": "Діловий", "emoji": "💼",
         "prompt": (
             "Ти професійний бізнес-асистент на ім'я J.A.R.V.I.S. "
-            "Без зайвих вступів — одразу до справи. "
-            "Відповідай виключно українською мовою, без русизмів, у діловому стилі. "
-            "Структура: вступ → суть → рекомендована дія. Ніколи не вигадуй факти."
+            f"Без зайвих вступів — одразу до справи. {_BASE_LANGUAGE_RULES} "
+            "Структура: вступ → суть → рекомендована дія."
         ),
     },
     "literary": {
         "name": "Художній", "emoji": "📖",
         "prompt": (
             "Ти творчий AI асистент на ім'я J.A.R.V.I.S. з чуттям до художнього слова. "
-            "Відповідай виключно українською мовою, без русизмів. "
-            "Використовуй образну мову, метафори і живі описи. "
-            "Дотримуйся жанрових канонів при генерації тексту. "
-            "Ніколи не вигадуй факти у відповідях на запитання."
+            f"{_BASE_LANGUAGE_RULES} "
+            "Використовуй образну мову, метафори і живі описи. Дотримуйся жанрових канонів."
         ),
     },
     "journalist": {
         "name": "Журналістський", "emoji": "📰",
         "prompt": (
             "Ти журналіст-асистент на ім'я J.A.R.V.I.S. "
-            "Без зайвих вступів — одразу до матеріалу. "
-            "Відповідай виключно українською мовою, без русизмів. "
-            "Структура: заголовок → лід → факти → контекст → висновок. "
-            "Пиши чітко і нейтрально. Ніколи не вигадуй факти."
+            f"Без зайвих вступів — одразу до матеріалу. {_BASE_LANGUAGE_RULES} "
+            "Структура: заголовок → лід → факти → контекст → висновок. Пиши чітко і нейтрально."
         ),
     },
 }
@@ -178,49 +196,14 @@ TASK_KEYWORDS      = ["додай задачу","додай до списку","
 # ── News domains ──────────────────────────────────────────────────────────────
 
 NEWS_DOMAINS_BY_CATEGORY = {
-    "politics": [
-        "pravda.com.ua","epravda.com.ua","ukrinform.ua","unian.ua",
-        "interfax.com.ua","zn.ua","lb.ua","radiosvoboda.org","hromadske.ua",
-        "reuters.com","apnews.com","bbc.com","bbc.co.uk",
-        "politico.eu","theguardian.com","france24.com","dw.com",
-        "aljazeera.com","foreignpolicy.com",
-    ],
-    "tech": [
-        "ain.ua","itc.ua","dev.ua",
-        "techcrunch.com","theverge.com","wired.com","arstechnica.com",
-        "engadget.com","venturebeat.com","zdnet.com","9to5google.com",
-        "macrumors.com","tomshardware.com",
-    ],
-    "sport": [
-        "sport.ua","footboom.com","ua-football.com","tribuna.com",
-        "espn.com","skysports.com","goal.com","marca.com","as.com",
-        "bleacherreport.com","theathletic.com","eurosport.com","sportingnews.com",
-    ],
-    "business": [
-        "mind.ua","epravda.com.ua","forbes.ua","businessviews.com.ua",
-        "bloomberg.com","ft.com","wsj.com","forbes.com",
-        "businessinsider.com","cnbc.com","economist.com","fortune.com",
-    ],
-    "science": [
-        "nature.com","science.org","scientificamerican.com",
-        "newscientist.com","phys.org","sciencedaily.com",
-        "livescience.com","space.com","nationalgeographic.com",
-    ],
-    "health": [
-        "who.int","webmd.com","healthline.com","medicalnewstoday.com",
-        "mayoclinic.org","health.harvard.edu","nih.gov","bmj.com","thelancet.com",
-    ],
-    "culture": [
-        "suspilne.media","hromadske.ua","ukrinform.ua",
-        "theguardian.com","nytimes.com","rollingstone.com",
-        "variety.com","hollywoodreporter.com",
-    ],
-    "general": [
-        "ukrinform.ua","ukrinform.net","pravda.com.ua","unian.ua",
-        "suspilne.media","tsn.ua","liga.net","nv.ua",
-        "reuters.com","apnews.com","bbc.com","theguardian.com",
-        "euronews.com","dw.com","france24.com",
-    ],
+    "politics": ["pravda.com.ua","epravda.com.ua","ukrinform.ua","unian.ua","interfax.com.ua","zn.ua","lb.ua","radiosvoboda.org","hromadske.ua","reuters.com","apnews.com","bbc.com","bbc.co.uk","politico.eu","theguardian.com","france24.com","dw.com","aljazeera.com","foreignpolicy.com"],
+    "tech":     ["ain.ua","itc.ua","dev.ua","techcrunch.com","theverge.com","wired.com","arstechnica.com","engadget.com","venturebeat.com","zdnet.com","9to5google.com","macrumors.com","tomshardware.com"],
+    "sport":    ["sport.ua","footboom.com","ua-football.com","tribuna.com","espn.com","skysports.com","goal.com","marca.com","as.com","bleacherreport.com","theathletic.com","eurosport.com","sportingnews.com"],
+    "business": ["mind.ua","epravda.com.ua","forbes.ua","businessviews.com.ua","bloomberg.com","ft.com","wsj.com","forbes.com","businessinsider.com","cnbc.com","economist.com","fortune.com"],
+    "science":  ["nature.com","science.org","scientificamerican.com","newscientist.com","phys.org","sciencedaily.com","livescience.com","space.com","nationalgeographic.com"],
+    "health":   ["who.int","webmd.com","healthline.com","medicalnewstoday.com","mayoclinic.org","health.harvard.edu","nih.gov","bmj.com","thelancet.com"],
+    "culture":  ["suspilne.media","hromadske.ua","ukrinform.ua","theguardian.com","nytimes.com","rollingstone.com","variety.com","hollywoodreporter.com"],
+    "general":  ["ukrinform.ua","ukrinform.net","pravda.com.ua","unian.ua","suspilne.media","tsn.ua","liga.net","nv.ua","reuters.com","apnews.com","bbc.com","theguardian.com","euronews.com","dw.com","france24.com"],
 }
 
 CATEGORY_KEYWORDS = {
@@ -256,12 +239,23 @@ def _load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        log.warning("Failed to load %s: %s", path, e)
         return default
 
 def _save_json(path: str, data) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.error("Failed to save %s: %s", path, e)
+
+def _parse_json_response(text: str) -> dict:
+    """Strip markdown fences and parse JSON safely."""
+    clean = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    return json.loads(clean)
 
 # ── Memory ────────────────────────────────────────────────────────────────────
 
@@ -280,7 +274,7 @@ async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> N
             f"Користувач: {user_text}\nБот: {reply}\n\n"
             "Відповідай ТІЛЬКИ JSON: {\"name\": \"...\", \"facts\": [\"факт1\"]} або {}. Нічого більше."
         )}])
-        data = json.loads(result.strip().replace("```json", "").replace("```", ""))
+        data = _parse_json_response(result)
         if not data:
             return
         mem = get_user_memory(user_id)
@@ -289,8 +283,8 @@ async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> N
         if data.get("facts"):
             mem["facts"] = list(set(mem.get("facts", [])) | set(data["facts"]))
         update_user_memory(user_id, mem)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("extract_and_save_memory: %s", e)
 
 def get_gender(user_id: int) -> str | None:
     return get_user_memory(user_id).get("gender")
@@ -312,8 +306,7 @@ def build_dynamic_prompt(user_id: int, emotion: str) -> dict:
     mode  = user_personalities.get(user_id, "normal")
     p     = PERSONALITIES.get(mode, PERSONALITIES["normal"])
     base  = p["prompt"] + gender_suffix(user_id)
-    mem   = get_user_memory(user_id)
-    style = mem.get("communication_style", {})
+    style = get_user_memory(user_id).get("communication_style", {})
     parts = [base]
     if style.get("formality") == "informal":
         parts.append("Спілкуйся невимушено, як з другом.")
@@ -345,55 +338,38 @@ async def update_communication_style(user_id: int) -> None:
             "\"emoji_usage\":true|false,"
             "\"preferred_response_length\":\"concise|normal|detailed\"}"
         )}])
-        data = json.loads(result.strip().replace("```json", "").replace("```", ""))
+        data = _parse_json_response(result)
         update_user_memory(user_id, {"communication_style": data})
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("update_communication_style: %s", e)
 
 # ── Emotion ───────────────────────────────────────────────────────────────────
 
+_SAD_MARKERS     = ["мені погано","мені сумно","я в розпачі","серце болить","я плачу","хочу плакати","дуже боляче","все погано","все жахливо"]
+_ANGRY_MARKERS   = ["я злий","я зла","мене дістало","мене бісить","я в люті","ненавиджу","до біса","це жах"]
+_ANXIOUS_MARKERS = ["я боюсь","мені страшно","я хвилююсь","не можу заспокоїтись","паніка","тривога","серце калатає"]
+_HAPPY_MARKERS   = ["я радий","я рада","чудово","супер","відмінно","круто","я щасливий","я щаслива","неймовірно"]
+
 async def detect_emotion(text: str) -> str:
-    # Короткі повідомлення або питання — завжди neutral
     t = text.lower().strip()
-    if len(text.split()) <= 8:
+    if len(text.split()) <= 8 or t.endswith("?"):
         return "neutral"
-    if t.endswith("?"):
-        return "neutral"
-    # Явні емоційні маркери — визначаємо локально без AI
-    sad_markers     = ["мені погано","мені сумно","я в розпачі","серце болить","я плачу","хочу плакати","дуже боляче","все погано","все жахливо"]
-    angry_markers   = ["я злий","я зла","мене дістало","мене бісить","я в люті","ненавиджу","до біса","це жах"]
-    anxious_markers = ["я боюсь","мені страшно","я хвилююсь","не можу заспокоїтись","паніка","тривога","серце калатає"]
-    happy_markers   = ["я радий","я рада","чудово","супер","відмінно","круто","я щасливий","я щаслива","неймовірно"]
-    if any(m in t for m in sad_markers):     return "sad"
-    if any(m in t for m in angry_markers):   return "angry"
-    if any(m in t for m in anxious_markers): return "anxious"
-    if any(m in t for m in happy_markers):   return "happy"
+    if any(m in t for m in _SAD_MARKERS):     return "sad"
+    if any(m in t for m in _ANGRY_MARKERS):   return "angry"
+    if any(m in t for m in _ANXIOUS_MARKERS): return "anxious"
+    if any(m in t for m in _HAPPY_MARKERS):   return "happy"
     return "neutral"
+
+_PRACTICAL_MARKERS = ["порадь","поради","що робити","як","де","коли","хто","знайди","покажи","розкажи","поясни","допоможи","чому","навіщо","скільки","який","яка","яке","пам'ятаєш","ти знаєш"]
+_EMOTIONAL_MARKERS = ["мені погано","мені сумно","я в розпачі","я не можу","все погано","все жахливо","я втомився","я втомилась","серце болить","я плачу","хочу плакати","дуже боляче","не знаю що робити","руки опускаються"]
 
 def needs_support_first(emotion: str, text: str) -> bool:
     if emotion not in ("sad", "angry", "anxious"):
         return False
     t = text.lower()
-    # Є практичний запит — одразу допомога
-    practical = [
-        "порадь","поради","що робити","як","де","коли","хто",
-        "знайди","покажи","розкажи","поясни","допоможи",
-        "чому","навіщо","скільки","який","яка","яке",
-        "пам'ятаєш","пам'ятаєте","ти знаєш","ти знаєте",
-    ]
-    if any(m in t for m in practical):
+    if any(m in t for m in _PRACTICAL_MARKERS) or len(text.split()) <= 5:
         return False
-    # Короткий нейтральний текст — не потребує підтримки
-    if len(text.split()) <= 5:
-        return False
-    # Тільки якщо текст явно емоційний і без конкретного запиту
-    emotional_markers = [
-        "мені погано","мені сумно","я в розпачі","я не можу",
-        "все погано","все жахливо","я втомився","я втомилась",
-        "серце болить","я плачу","хочу плакати","дуже боляче",
-        "не знаю що робити","руки опускаються",
-    ]
-    return any(m in t for m in emotional_markers)
+    return any(m in t for m in _EMOTIONAL_MARKERS)
 
 # ── History ───────────────────────────────────────────────────────────────────
 
@@ -430,8 +406,10 @@ async def _compress_history(user_id: int) -> None:
         summary = await call_ai([{"role": "user", "content": (
             f"Стисни діалог у підсумок (3-5 речень). Збережи ключові факти. Відповідай українською.\n\n{old_text}"
         )}])
-    except Exception:
+    except Exception as e:
+        log.warning("_compress_history summary failed: %s", e)
         return
+
     async def _save_topic():
         try:
             topic = (await call_ai([{"role": "user", "content": (
@@ -440,8 +418,9 @@ async def _compress_history(user_id: int) -> None:
             if topic:
                 mem = get_user_memory(user_id)
                 update_user_memory(user_id, {"topics": ([topic] + mem.get("topics", []))[:10]})
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("_save_topic: %s", e)
+
     asyncio.create_task(_save_topic())
     chat_histories[user_id] = (
         [get_system_prompt(user_id),
@@ -517,57 +496,49 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Intent detection ──────────────────────────────────────────────────────────
 
+_TIME_RE = re.compile(
+    r'\b(через|о|в)\s+\d+\s*(хв|год|хвилин|годин)\b'
+    r'|\b\d{1,2}[:.]\d{2}\b'
+    r'|\bзавтра\b|\bпіслязавтра\b'
+    r'|\b\d+\s*(хв|год|хвилин|годин)\b'
+    r'|\bсьогодні\s+о\s+\d'
+    r'|\bо\s+\d{1,2}[:.]\d{2}\b'
+)
+_URL_RE = re.compile(r'https?://\S+')
+
 def detect_intent_local(text: str) -> str | None:
     t = text.lower()
-    scores: dict[str, int] = {
-        "image": 0, "reminder": 0, "news": 0, "translate": 0,
-        "recipe": 0, "generate": 0, "edit": 0, "task": 0,
-        "summarize": 0, "search": 0,
-    }
-    for kw in IMAGE_KEYWORDS:
-        if kw in t: scores["image"] += 2
-    for kw in REMIND_KEYWORDS:
-        if kw in t: scores["reminder"] += 2
-    for kw in NEWS_KEYWORDS:
-        if kw in t: scores["news"] += 2
-    for kw in TRANSLATE_KEYWORDS:
-        if kw in t: scores["translate"] += 2
-    for kw in RECIPE_KEYWORDS:
-        if kw in t: scores["recipe"] += 2
-    for kw in EDIT_KEYWORDS:
-        if kw in t: scores["edit"] += 2
-    for kw in GENERATE_KEYWORDS:
-        if kw in t: scores["generate"] += 2
-    for kw in TASK_KEYWORDS:
-        if kw in t: scores["task"] += 2
-    for kw in SUMMARIZE_KEYWORDS:
-        if kw in t: scores["summarize"] += 2
-    for kw in SEARCH_KEYWORDS:
-        if kw in t: scores["search"] += 1
-    if re.search(r'https?://\S+', text):
+    scores: dict[str, int] = {k: 0 for k in ("image","reminder","news","translate","recipe","generate","edit","task","summarize","search")}
+
+    kw_map = [
+        ("image",     IMAGE_KEYWORDS,     2),
+        ("reminder",  REMIND_KEYWORDS,    2),
+        ("news",      NEWS_KEYWORDS,      2),
+        ("translate", TRANSLATE_KEYWORDS, 2),
+        ("recipe",    RECIPE_KEYWORDS,    2),
+        ("edit",      EDIT_KEYWORDS,      2),
+        ("generate",  GENERATE_KEYWORDS,  2),
+        ("task",      TASK_KEYWORDS,      2),
+        ("summarize", SUMMARIZE_KEYWORDS, 2),
+        ("search",    SEARCH_KEYWORDS,    1),
+    ]
+    for intent, keywords, weight in kw_map:
+        for kw in keywords:
+            if kw in t:
+                scores[intent] += weight
+
+    if _URL_RE.search(text):
         scores["summarize"] += 3
 
-    # Нагадування тільки якщо є явний часовий маркер
-    has_time = bool(
-        re.search(r'\b(через|о|в)\s+\d+\s*(хв|год|хвилин|годин)\b', t) or
-        re.search(r'\b\d{1,2}[:.]\d{2}\b', t) or
-        re.search(r'\bзавтра\b', t) or
-        re.search(r'\bпіслязавтра\b', t) or
-        re.search(r'\b\d+\s*(хв|год|хвилин|годин)\b', t) or
-        re.search(r'\bсьогодні\s+о\s+\d', t) or   # "сьогодні о 15:00" — так
-        re.search(r'\bо\s+\d{1,2}[:.]\d{2}\b', t)  # "о 9:30" — так
-    )
-    if has_time:
-        scores["reminder"] += 2
-    else:
-        scores["reminder"] = 0  # без часу — не нагадування
+    # Reminder only with explicit time marker
+    if not _TIME_RE.search(t):
+        scores["reminder"] = 0
 
     best       = max(scores, key=lambda k: scores[k])
     best_score = scores[best]
     if best_score == 0:
         return None
-    top_count = sum(1 for v in scores.values() if v == best_score)
-    if top_count > 1:
+    if sum(1 for v in scores.values() if v == best_score) > 1:
         return None
     return best
 
@@ -576,7 +547,7 @@ async def detect_intent_ai(text: str, ctx_hint: str = "") -> str:
     result = await call_ai([{"role": "user", "content": (
         f"Визнач намір повідомлення: '{text}'{ctx_block}\n"
         "Відповідай ТІЛЬКИ одним словом:\n"
-        "- 'reminder' — ТІЛЬКИ якщо є конкретний час або дата (через X хвилин, о 14:00, завтра тощо)\n"
+        "- 'reminder' — ТІЛЬКИ якщо є конкретний час або дата\n"
         "- 'image'    — згенерувати зображення\n"
         "- 'news'     — новини за темою\n"
         "- 'search'   — знайти інформацію в інтернеті\n"
@@ -586,14 +557,14 @@ async def detect_intent_ai(text: str, ctx_hint: str = "") -> str:
         "- 'edit'     — відредагувати або покращити текст\n"
         "- 'recipe'   — рецепт за інгредієнтами\n"
         "- 'task'     — керування списком задач\n"
-        "- 'chat'     — все інше, включаючи запитання, розмову, 'ти пам'ятаєш'\n"
+        "- 'chat'     — все інше\n"
         "Відповідь — ТІЛЬКИ одне слово."
     )}])
     return result.strip().lower().strip("'\"")
 
 async def detect_intent(text: str, user_id: int = 0) -> str:
-    clean   = text.split("Запит користувача:")[-1].strip() if "Запит користувача:" in text else text
-    ctx     = conversation_context.get(user_id, {})
+    clean    = text.split("Запит користувача:")[-1].strip() if "Запит користувача:" in text else text
+    ctx      = conversation_context.get(user_id, {})
     ctx_hint = f"тема: {ctx.get('topic','')}, сутності: {', '.join(ctx.get('entities',[]))}" if ctx else ""
     return detect_intent_local(clean) or await detect_intent_ai(clean, ctx_hint)
 
@@ -604,7 +575,7 @@ async def update_conversation_context(user_id: int, user_text: str, reply: str, 
             f"Користувач: {user_text}\nБот: {reply[:300]}\n\n"
             "Відповідай ТІЛЬКИ JSON: {\"topic\": \"...\", \"entities\": [\"...\"]}"
         )}])
-        data = json.loads(result.strip().replace("```json", "").replace("```", ""))
+        data = _parse_json_response(result)
         prev = conversation_context.get(user_id, {})
         all_entities = list(dict.fromkeys(data.get("entities", []) + prev.get("entities", [])))[:10]
         conversation_context[user_id] = {
@@ -612,33 +583,27 @@ async def update_conversation_context(user_id: int, user_text: str, reply: str, 
             "entities": all_entities,
             "last_intent": intent,
         }
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("update_conversation_context: %s", e)
 
 async def preprocess_query(user_id: int, text: str) -> str:
-    # Не чіпаємо довгі повідомлення або питання без займенників
-    t = text.lower().strip()
-    pronouns    = ["він","вона","воно","вони","його","її","їх","там","це","той","та","те","твій","твоя","твоє","твоєму","твоїм"]
+    t           = text.lower().strip()
+    pronouns    = {"він","вона","воно","вони","його","її","їх","там","це","той","та","те","твій","твоя","твоє","твоєму","твоїм"}
     is_short    = len(text.split()) <= 6
-    has_pronoun = any(p in t.split() for p in pronouns)
+    has_pronoun = bool(pronouns & set(t.split()))
     if not (is_short or has_pronoun):
         return text
-
-    ctx = conversation_context.get(user_id, {})
+    ctx      = conversation_context.get(user_id, {})
     entities = ctx.get("entities", [])
     topic    = ctx.get("topic", "")
     if not entities and not topic:
         return text
-
     try:
-        hint = ""
-        if topic:    hint += f"Тема: {topic}. "
-        if entities: hint += f"Об'єкти: {', '.join(entities)}. "
+        hint = (f"Тема: {topic}. " if topic else "") + (f"Об'єкти: {', '.join(entities)}. " if entities else "")
         expanded = (await call_ai([{"role": "user", "content": (
             f"{hint}\nРозкрий займенники у запиті спираючись на контекст.\n"
             f"Запит: '{text}'\nПоверни ТІЛЬКИ уточнений запит, без пояснень і лапок."
         )}])).strip()
-        # Повертаємо оригінал якщо результат порожній, занадто короткий або схожий на помилку
         if not expanded or len(expanded) < 3 or expanded.lower() in ("none", "null", "-", "—"):
             return text
         return expanded
@@ -651,23 +616,19 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
         return text
     t     = text.lower().strip()
     words = t.split()
-    if len(words) > 12:
-        if not any(h in t for h in ["розкажи про", "що таке ", "поясни ", "напиши про", "хто такий"]):
-            return text
     strong_hints = [
-        "це","цей","цю","цього","на фото","з фото","на зображенні",
-        "знайди","пошукай","що це","розкажи більше","докладніше","ще про",
-        "як використовувати","рецепт з","з відео","у відео",
-        "цей магазин","цей сайт","ця компанія","цей товар","цей продукт",
-        "що він продає","що вона продає","що там є",
-        "яка адреса","який графік","як туди","контакти",
-        "що ще","що інше","а ще","і ще","також розкажи",
+        "це","цей","цю","цього","на фото","з фото","на зображенні","знайди","пошукай",
+        "що це","розкажи більше","докладніше","ще про","як використовувати","рецепт з",
+        "з відео","у відео","цей магазин","цей сайт","ця компанія","цей товар","цей продукт",
+        "що він продає","що вона продає","що там є","яка адреса","який графік","як туди",
+        "контакти","що ще","що інше","а ще","і ще","також розкажи",
     ]
+    ctx_block = (
+        f"[Контекст попереднього повідомлення — {ctx['type']}: {ctx['description'][:CTX_DESCRIPTION_LEN]}]\n\n"
+        f"Запит користувача: {text}"
+    )
     if len(words) <= 10 or any(h in t for h in strong_hints):
-        return (
-            f"[Контекст попереднього повідомлення — {ctx['type']}: {ctx['description'][:500]}]\n\n"
-            f"Запит користувача: {text}"
-        )
+        return ctx_block
     try:
         check = await call_ai([{"role": "user", "content": (
             f"Контекст: {ctx['type']} — «{ctx['description'][:200]}»\n"
@@ -675,21 +636,23 @@ async def resolve_text_with_context(user_id: int, text: str) -> str:
             "Чи стосується контексту? Відповідай ТІЛЬКИ 'yes' або 'no'."
         )}])
         if "yes" in check.lower():
-            return (
-                f"[Контекст попереднього повідомлення — {ctx['type']}: {ctx['description'][:500]}]\n\n"
-                f"Запит користувача: {text}"
-            )
+            return ctx_block
     except Exception:
         pass
     return text
 
+_MD_PATTERNS = [
+    (re.compile(r'\*\*(.*?)\*\*'), r'\1'),
+    (re.compile(r'\*(.*?)\*'),     r'\1'),
+    (re.compile(r'__(.*?)__'),     r'\1'),
+    (re.compile(r'_(.*?)_'),       r'\1'),
+    (re.compile(r'`(.*?)`'),       r'\1'),
+    (re.compile(r'\[([^\]]+)\]\((https?://[^\)]+)\)'), r'\1: \2'),
+]
+
 def clean_markdown(text: str) -> str:
-    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.*?)\*',     r'\1', text)
-    text = re.sub(r'__(.*?)__',     r'\1', text)
-    text = re.sub(r'_(.*?)_',       r'\1', text)
-    text = re.sub(r'`(.*?)`',       r'\1', text)
-    text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1: \2', text)
+    for pattern, repl in _MD_PATTERNS:
+        text = pattern.sub(repl, text)
     return text
 
 def _set_ctx(user_id: int, user_text: str, reply: str) -> None:
@@ -710,8 +673,8 @@ def get_text_provider() -> str:
 async def call_ai(messages: list) -> str:
     provider = get_text_provider()
     if provider == "openrouter":
+        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
-            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(OPENROUTER_URL, headers=headers, json={"model": model, "messages": messages})
             if r.status_code == 404:
@@ -722,6 +685,7 @@ async def call_ai(messages: list) -> str:
             r.raise_for_status()
             or_requests["count"] += 1
             return r.json()["choices"][0]["message"]["content"]
+    # Groq fallback
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
@@ -750,7 +714,7 @@ async def generate_image(prompt: str) -> bytes:
     url     = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     last_error = None
-    for _ in range(3):
+    for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=180) as client:
                 r = await client.post(url, headers=headers, json={"prompt": prompt, "num_steps": 8})
@@ -760,6 +724,7 @@ async def generate_image(prompt: str) -> bytes:
             return base64.b64decode(r.json().get("result", {}).get("image", ""))
         except Exception as e:
             last_error = e
+            log.warning("generate_image attempt %d failed: %s", attempt + 1, e)
             await asyncio.sleep(5)
     raise last_error
 
@@ -800,8 +765,8 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
         transcript = await transcribe_voice(await extract_video_audio(video_bytes))
         if transcript:
             results.append(f"🎤 Аудіо у відео:\n{transcript}")
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("analyze_video audio: %s", e)
     try:
         frames = await extract_video_frames(video_bytes)
         if frames:
@@ -814,12 +779,14 @@ async def analyze_video(video_bytes: bytes, caption: str) -> str:
                 ]}])
                 descs.append(f"Кадр {i+1}: {desc}")
             results.append("🎬 Візуальний вміст:\n" + "\n".join(descs))
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("analyze_video frames: %s", e)
     if not results:
         return "❌ Не вдалось проаналізувати відео."
     combined = "\n\n".join(results)
-    summary  = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": f"Запит: {caption}\n\nДані відео:\n{combined}\n\nВідповідай українською."}])
+    summary  = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": (
+        f"Запит: {caption}\n\nДані відео:\n{combined}\n\nВідповідай українською."
+    )}])
     return f"{combined}\n\n📝 Підсумок:\n{summary}"
 
 # ── Web search ────────────────────────────────────────────────────────────────
@@ -828,41 +795,41 @@ async def search_web(query: str) -> str:
     if TAVILY_API_KEY:
         try:
             results = await asyncio.to_thread(
-                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query=query, max_results=7)
+                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query=query, max_results=SEARCH_RESULTS)
             )
             items = [
                 i for i in results.get("results", [])
                 if not any(bd in i.get("url", "") for bd in BLOCKED_DOMAINS)
             ]
             if items:
-                output = ""
+                parts = []
                 for i in items:
-                    title   = i.get("title", "").strip()
-                    content = i.get("content", "")[:400].strip()
-                    url     = i.get("url", "").strip()
-                    date    = i.get("published_date", "")
-                    date_str = f" ({date[:10]})" if date else ""
-                    output += f"Джерело: {title}{date_str}\n{content}\n{url}\n\n"
-                return output
+                    date_str = f" ({i['published_date'][:10]})" if i.get("published_date") else ""
+                    parts.append(
+                        f"Джерело: {i.get('title','').strip()}{date_str}\n"
+                        f"{i.get('content','')[:400].strip()}\n{i.get('url','').strip()}"
+                    )
+                return "\n\n".join(parts)
         except Exception as e:
-            print(f"[Tavily error]: {e}")
+            log.warning("Tavily error: %s", e)
+
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.get("https://html.duckduckgo.com/html/", params={"q": query}, headers=_HEADERS)
         snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', r.text, re.DOTALL)
         links    = re.findall(r'class="result__url"[^>]*>(.*?)</span>', r.text, re.DOTALL)
         titles   = re.findall(r'class="result__a"[^>]*>(.*?)</a>', r.text, re.DOTALL)
-        output   = ""
+        parts    = []
         for i in range(min(4, len(snippets))):
             t = re.sub(r'<[^>]+>', '', titles[i]).strip()  if i < len(titles)  else ""
             s = re.sub(r'<[^>]+>', '', snippets[i]).strip()
             l = links[i].strip()                           if i < len(links)   else ""
             if s and not any(bd in l for bd in BLOCKED_DOMAINS):
-                output += f"Джерело: {t}\n{s}\n{l}\n\n"
-        if output:
-            return output
+                parts.append(f"Джерело: {t}\n{s}\n{l}")
+        if parts:
+            return "\n\n".join(parts)
     except Exception as e:
-        print(f"[DuckDuckGo error]: {e}")
+        log.warning("DuckDuckGo error: %s", e)
     return ""
 
 async def fetch_url_text(url: str) -> str:
@@ -871,7 +838,7 @@ async def fetch_url_text(url: str) -> str:
             r = await client.get(url, headers=_HEADERS)
             r.raise_for_status()
         text = re.sub(r'<[^>]+>', ' ', r.text)
-        return re.sub(r'\s+', ' ', text).strip()[:6000]
+        return re.sub(r'\s+', ' ', text).strip()[:MAX_ARTICLE_CHARS]
     except Exception as e:
         return f"Помилка завантаження: {e}"
 
@@ -887,30 +854,30 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
 def extract_excel_text(xlsx_bytes: bytes) -> str:
     try:
         wb  = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
-        out = ""
+        out = []
         for sheet in wb.worksheets:
-            out += f"=== Аркуш: {sheet.title} ===\n"
+            out.append(f"=== Аркуш: {sheet.title} ===")
             for row in sheet.iter_rows(values_only=True):
                 row_data = [str(c) if c is not None else "" for c in row]
                 if any(row_data):
-                    out += " | ".join(row_data) + "\n"
-        return out.strip() or "Файл порожній."
+                    out.append(" | ".join(row_data))
+        return "\n".join(out).strip() or "Файл порожній."
     except Exception as e:
         return f"Помилка читання Excel: {e}"
 
 def extract_word_text(docx_bytes: bytes) -> str:
     try:
         doc = DocxDocument(io.BytesIO(docx_bytes))
-        out = ""
+        out = []
         for para in doc.paragraphs:
             if para.text.strip():
-                out += para.text + "\n"
+                out.append(para.text)
         for table in doc.tables:
             for row in table.rows:
                 row_data = [c.text.strip() for c in row.cells]
                 if any(row_data):
-                    out += " | ".join(row_data) + "\n"
-        return out.strip() or "Документ порожній."
+                    out.append(" | ".join(row_data))
+        return "\n".join(out).strip() or "Документ порожній."
     except Exception as e:
         return f"Помилка читання Word: {e}"
 
@@ -918,12 +885,8 @@ def extract_word_text(docx_bytes: bytes) -> str:
 
 def detect_news_category(query: str) -> str:
     q      = query.lower()
-    scores = {cat: 0 for cat in CATEGORY_KEYWORDS}
-    for cat, keywords in CATEGORY_KEYWORDS.items():
-        for kw in keywords:
-            if kw in q:
-                scores[cat] += 1
-    best = max(scores, key=lambda c: scores[c])
+    scores = {cat: sum(1 for kw in kws if kw in q) for cat, kws in CATEGORY_KEYWORDS.items()}
+    best   = max(scores, key=lambda c: scores[c])
     return best if scores[best] > 0 else "general"
 
 async def do_news(query: str) -> str:
@@ -935,12 +898,8 @@ async def do_news(query: str) -> str:
         domains  = NEWS_DOMAINS_BY_CATEGORY.get(category, NEWS_DOMAINS_BY_CATEGORY["general"])
         params   = {
             "q": clean_query, "domains": ",".join(domains),
-            "sortBy": "publishedAt", "pageSize": 50, "apiKey": NEWS_API_KEY,
+            "sortBy": "publishedAt", "pageSize": NEWS_PAGE_SIZE, "apiKey": NEWS_API_KEY,
         }
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get("https://newsapi.org/v2/everything", params=params)
-            r.raise_for_status()
-        articles = r.json().get("articles", [])
 
         query_words = [w.lower() for w in re.split(r'\s+', clean_query.strip()) if len(w) > 2]
 
@@ -949,56 +908,62 @@ async def do_news(query: str) -> str:
             return any(w in haystack for w in query_words)
 
         def is_ukrainian(a: dict) -> bool:
-            url = a.get("url") or ""
-            return any(d in url for d in UA_DOMAINS)
+            return any(d in (a.get("url") or "") for d in UA_DOMAINS)
 
         def deduplicate(arts: list) -> list:
-            seen: set[str] = set()
-            result = []
+            seen, result = set(), []
             for a in arts:
                 norm = re.sub(r'[^a-zа-яіїєґ0-9]', '', (a.get("title") or "").lower())
                 if norm and norm not in seen:
                     seen.add(norm)
                     result.append(a)
-                if len(result) == 10:
+                if len(result) == MAX_NEWS_RESULTS:
                     break
             return result
 
-        relevant     = [a for a in articles if is_relevant(a)]
-        ua_articles  = [a for a in relevant if is_ukrainian(a)]
-        int_articles = [a for a in relevant if not is_ukrainian(a)]
-        unique       = deduplicate(ua_articles + int_articles)
+        async def fetch_articles(p: dict) -> list:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get("https://newsapi.org/v2/everything", params=p)
+                r.raise_for_status()
+            return r.json().get("articles", [])
+
+        articles = await fetch_articles(params)
+        relevant = [a for a in articles if is_relevant(a)]
+        unique   = deduplicate(
+            [a for a in relevant if is_ukrainian(a)] +
+            [a for a in relevant if not is_ukrainian(a)]
+        )
 
         if not unique and category != "general":
             params["domains"] = ",".join(NEWS_DOMAINS_BY_CATEGORY["general"])
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get("https://newsapi.org/v2/everything", params=params)
-                r.raise_for_status()
-            relevant     = [a for a in r.json().get("articles", []) if is_relevant(a)]
-            ua_articles  = [a for a in relevant if is_ukrainian(a)]
-            int_articles = [a for a in relevant if not is_ukrainian(a)]
-            unique       = deduplicate(ua_articles + int_articles)
+            articles = await fetch_articles(params)
+            relevant = [a for a in articles if is_relevant(a)]
+            unique   = deduplicate(
+                [a for a in relevant if is_ukrainian(a)] +
+                [a for a in relevant if not is_ukrainian(a)]
+            )
 
         if not unique:
             return f"📰 Новин за темою «{clean_query}» не знайдено."
 
-        sources_text = ""
-        lines = [f"📰 Новини за темою: {clean_query}\n"]
-        for i, a in enumerate(unique, 1):
-            title     = a.get("title", "Без назви")
-            source    = a.get("source", {}).get("name", "")
-            published = a.get("publishedAt", "")[:10]
-            url       = a.get("url", "")
-            sources_text += f"{title}. {a.get('description') or ''}\n"
-            lines.append(f"{i}. {title}\n   📅 {published} | {source}\n   🔗 {url}\n")
-
+        sources_text = "\n".join(
+            f"{a.get('title','Без назви')}. {a.get('description') or ''}" for a in unique
+        )
         summary = await call_ai([{"role": "user", "content": (
             f"Заголовки новин за темою '{clean_query}':\n{sources_text}\n\n"
             "Зроби короткий підсумок (2-3 речення). Відповідай українською."
         )}])
-        lines.insert(1, f"💡 {summary}\n")
+
+        lines = [f"📰 Новини за темою: {clean_query}\n", f"💡 {summary}\n"]
+        for i, a in enumerate(unique, 1):
+            lines.append(
+                f"{i}. {a.get('title','Без назви')}\n"
+                f"   📅 {a.get('publishedAt','')[:10]} | {a.get('source',{}).get('name','')}\n"
+                f"   🔗 {a.get('url','')}\n"
+            )
         return "\n".join(lines)
     except Exception as e:
+        log.error("do_news: %s", e)
         return f"❌ Помилка отримання новин: {e}"
 
 # ── Intent handlers ───────────────────────────────────────────────────────────
@@ -1011,7 +976,7 @@ async def do_translate(text: str) -> str:
     )}])
 
 async def do_summarize(text: str) -> str:
-    url_match = re.search(r'https?://\S+', text)
+    url_match = _URL_RE.search(text)
     if url_match:
         url      = url_match.group()
         msg_text = text.replace(url, "").strip()
@@ -1032,24 +997,21 @@ async def do_summarize(text: str) -> str:
     return await call_ai([{"role": "user", "content": prompt}])
 
 TEXT_GENRES = {
-    "лист": "діловий лист — вступ, суть, підпис",
-    "резюме": "резюме — контакти, досвід, освіта, навички",
-    "пост": "пост для соцмереж — живий, із закликом до дії",
+    "лист":       "діловий лист — вступ, суть, підпис",
+    "резюме":     "резюме — контакти, досвід, освіта, навички",
+    "пост":       "пост для соцмереж — живий, із закликом до дії",
     "оголошення": "оголошення — заголовок, суть, контакти",
-    "стаття": "стаття — заголовок, вступ, підзаголовки, висновок",
-    "опис": "опис — образний, деталізований",
+    "стаття":     "стаття — заголовок, вступ, підзаголовки, висновок",
+    "опис":       "опис — образний, деталізований",
     "оповідання": "оповідання — зав'язка, кульмінація, розв'язка",
-    "есе": "есе — теза, аргументи, висновок",
-    "слоган": "слоган — короткий, запам'ятовуваний",
-    "біографія": "біографія — хронологічний виклад",
+    "есе":        "есе — теза, аргументи, висновок",
+    "слоган":     "слоган — короткий, запам'ятовуваний",
+    "біографія":  "біографія — хронологічний виклад",
 }
 
 def detect_genre(text: str) -> str:
     t = text.lower()
-    for genre in TEXT_GENRES:
-        if genre in t:
-            return genre
-    return ""
+    return next((g for g in TEXT_GENRES if g in t), "")
 
 async def do_generate(text: str) -> str:
     genre     = detect_genre(text)
@@ -1075,13 +1037,13 @@ async def do_recipe(text: str) -> str:
     )}])
 
 async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
-    parsed = await call_ai([{"role": "user", "content": (
-        f"Визнач дію зі списком задач: '{text}'\n"
-        "Відповідай ТІЛЬКИ JSON:\n"
-        "{\"action\": \"add|done|del|list\", \"text\": \"текст або null\", \"number\": null або номер}"
-    )}])
     try:
-        data   = json.loads(parsed.strip().replace("```json", "").replace("```", ""))
+        parsed = await call_ai([{"role": "user", "content": (
+            f"Визнач дію зі списком задач: '{text}'\n"
+            "Відповідай ТІЛЬКИ JSON:\n"
+            "{\"action\": \"add|done|del|list\", \"text\": \"текст або null\", \"number\": null або номер}"
+        )}])
+        data   = _parse_json_response(parsed)
         action = data.get("action")
         tasks  = get_user_tasks(user_id)
         if action == "add":
@@ -1101,6 +1063,8 @@ async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
                     removed = tasks.pop(n)
                     set_user_tasks(user_id, tasks)
                     await update.message.reply_text(f"🗑️ Видалено: {removed['text']}")
+            else:
+                await update.message.reply_text("❌ Невірний номер задачі.")
         elif action == "list":
             if not tasks:
                 await update.message.reply_text("📋 Список задач порожній.")
@@ -1110,7 +1074,8 @@ async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
                 for i, t in enumerate(tasks, 1)
             ]
             await update.message.reply_text("\n".join(lines))
-    except Exception:
+    except Exception as e:
+        log.warning("do_task_nlp: %s", e)
         await update.message.reply_text("❌ Не вдалось обробити задачу. Спробуй /tasks")
 
 # ── Reminders ─────────────────────────────────────────────────────────────────
@@ -1121,33 +1086,35 @@ def load_reminders() -> list:
 def save_reminders(reminders: list) -> None:
     _save_json(REMINDERS_FILE, reminders)
 
+async def _fire_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> None:
+    await asyncio.sleep(max(0, (fire_at - datetime.now()).total_seconds()))
+    try:
+        await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
+    except Exception as e:
+        log.warning("_fire_reminder send failed: %s", e)
+    save_reminders([
+        r for r in load_reminders()
+        if not (r["chat_id"] == chat_id and r["text"] == text and r["fire_at"] == fire_at.isoformat())
+    ])
+
 async def schedule_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> None:
     reminders = load_reminders()
     reminders.append({"chat_id": chat_id, "text": text, "fire_at": fire_at.isoformat()})
     save_reminders(reminders)
-    async def _run():
-        await asyncio.sleep(max(0, (fire_at - datetime.now()).total_seconds()))
-        await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
-        save_reminders([r for r in load_reminders() if not (
-            r["chat_id"] == chat_id and r["text"] == text and r["fire_at"] == fire_at.isoformat()
-        )])
-    asyncio.create_task(_run())
+    asyncio.create_task(_fire_reminder(bot, chat_id, text, fire_at))
 
 async def restore_reminders(bot) -> None:
     now, valid = datetime.now(), []
     for r in load_reminders():
         fi = datetime.fromisoformat(r["fire_at"])
         if fi <= now:
-            await bot.send_message(chat_id=r["chat_id"], text=f"🔔 Пропущене нагадування: {r['text']}")
+            try:
+                await bot.send_message(chat_id=r["chat_id"], text=f"🔔 Пропущене нагадування: {r['text']}")
+            except Exception as e:
+                log.warning("restore_reminders send failed: %s", e)
         else:
             valid.append(r)
-            async def _run(chat_id=r["chat_id"], text=r["text"], fi=fi):
-                await asyncio.sleep(max(0, (fi - datetime.now()).total_seconds()))
-                await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
-                save_reminders([x for x in load_reminders() if not (
-                    x["chat_id"] == chat_id and x["text"] == text and x["fire_at"] == fi.isoformat()
-                )])
-            asyncio.create_task(_run())
+            asyncio.create_task(_fire_reminder(bot, r["chat_id"], r["text"], fi))
     save_reminders(valid)
 
 async def detect_gender_from_transcript(text: str) -> str | None:
@@ -1162,10 +1129,109 @@ async def detect_gender_from_transcript(text: str) -> str | None:
     except Exception:
         return None
 
+# ── Shared handler helpers ────────────────────────────────────────────────────
+
+async def _send_or_edit(msg, text: str, **kwargs):
+    text   = text.strip() or "—"
+    chunks = [text[i:i + MSG_CHUNK_SIZE] for i in range(0, len(text), MSG_CHUNK_SIZE)]
+    try:
+        await msg.edit_text(chunks[0], **kwargs)
+    except Exception:
+        await msg.reply_text(chunks[0], **kwargs)
+    for chunk in chunks[1:]:
+        await msg.reply_text(chunk, **kwargs)
+
+async def _process_message(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int, user_text: str, voice_msg=None,
+) -> None:
+    """Shared pipeline for text and voice messages."""
+    prefix = f"🎤 Ти сказав: {user_text}\n\n" if voice_msg else ""
+
+    try:
+        preprocessed = await asyncio.wait_for(preprocess_query(user_id, user_text), timeout=15)
+    except Exception:
+        preprocessed = user_text
+
+    try:
+        enriched = await asyncio.wait_for(resolve_text_with_context(user_id, preprocessed), timeout=15)
+    except Exception:
+        enriched = preprocessed
+
+    try:
+        intent = await asyncio.wait_for(detect_intent(enriched, user_id), timeout=15)
+    except Exception:
+        intent = "chat"
+
+    try:
+        emotion = await asyncio.wait_for(detect_emotion(user_text), timeout=10)
+    except Exception:
+        emotion = "neutral"
+
+    # Emotional support shortcut
+    if intent == "chat" and needs_support_first(emotion, user_text) and not voice_msg:
+        try:
+            support_prompt = build_dynamic_prompt(user_id, emotion)
+            support = await asyncio.wait_for(call_ai([
+                support_prompt,
+                {"role": "user", "content": (
+                    f"{user_text}\n\n"
+                    "Відповідь: одним-двома реченнями визнай почуття людини. "
+                    "Потім м'яко запитай чим можеш допомогти."
+                )},
+            ]), timeout=30)
+            await update.message.reply_text(clean_markdown(support))
+            _set_ctx(user_id, user_text, support)
+            asyncio.create_task(update_conversation_context(user_id, user_text, support, intent))
+            return
+        except Exception as e:
+            log.warning("support reply error: %s", e)
+
+    if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent, voice_msg=voice_msg):
+        return
+
+    # Default chat reply
+    try:
+        dynamic_prompt = build_dynamic_prompt(user_id, emotion)
+    except Exception:
+        dynamic_prompt = get_system_prompt(user_id)
+
+    history  = get_history(user_id)
+    messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
+    await append_and_trim(user_id, "user", enriched)
+
+    try:
+        reply = await asyncio.wait_for(call_ai(messages), timeout=60)
+    except asyncio.TimeoutError:
+        reply = ""
+    if not reply or not reply.strip():
+        reply = "Вибач, не вдалося сформувати відповідь. Спробуй ще раз."
+
+    await append_and_trim(user_id, "assistant", reply)
+
+    full_reply = clean_markdown(f"{prefix}{reply}".strip())
+    chunks = [full_reply[i:i + MSG_CHUNK_SIZE] for i in range(0, max(len(full_reply), 1), MSG_CHUNK_SIZE)]
+    if voice_msg:
+        await _send_or_edit(voice_msg, chunks[0])
+        for chunk in chunks[1:]:
+            await update.message.reply_text(chunk)
+    else:
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+
+    _set_ctx(user_id, user_text, reply)
+    asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
+    asyncio.create_task(update_conversation_context(user_id, user_text, reply, intent))
+
+    user_msgs = [m for m in get_history(user_id) if m.get("role") == "user"]
+    if len(user_msgs) % STYLE_UPDATE_INTERVAL == 0:
+        asyncio.create_task(update_communication_style(user_id))
+
 # ── Telegram command handlers ─────────────────────────────────────────────────
 
 async def do_generate_image(update: Update, text: str, msg):
-    t, prompt = text.lower(), text
+    t = text.lower()
+    prompt = text
     for kw in IMAGE_KEYWORDS:
         if kw in t:
             prompt = text[t.index(kw) + len(kw):].strip()
@@ -1177,7 +1243,8 @@ async def do_generate_image(update: Update, text: str, msg):
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
     except Exception as e:
-        await msg.edit_text(f"Помилка генерації: {e}")
+        log.error("do_generate_image: %s", e)
+        await msg.edit_text(f"Помилка генерації зображення. Спробуй ще раз.")
 
 async def do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     now = datetime.now()
@@ -1191,7 +1258,7 @@ async def do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str)
         "- text: ТІЛЬКИ суть нагадування, без назви бота\n\n"
         "Відповідай ТІЛЬКИ JSON: {\"fire_at\": \"YYYY-MM-DD HH:MM\", \"text\": \"текст\"}"
     )}])
-    data        = json.loads(parsed.strip().replace("```json", "").replace("```", ""))
+    data        = _parse_json_response(parsed)
     fire_at     = datetime.strptime(data["fire_at"], "%Y-%m-%d %H:%M")
     remind_text = data["text"].strip()
     if fire_at <= now:
@@ -1200,15 +1267,95 @@ async def do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str)
     await schedule_reminder(ctx.bot, update.effective_chat.id, remind_text, fire_at)
     return delay_min, remind_text, fire_at
 
-async def _send_or_edit(msg, text: str, **kwargs):
-    text   = text.strip()
-    chunks = [text[i:i+4000] for i in range(0, max(len(text), 1), 4000)]
-    try:
-        await msg.edit_text(chunks[0], **kwargs)
-    except Exception:
-        await msg.reply_text(chunks[0], **kwargs)
-    for chunk in chunks[1:]:
-        await msg.reply_text(chunk, **kwargs)
+async def _dispatch_intent(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int, user_text: str, enriched: str,
+    intent: str, voice_msg=None,
+) -> bool:
+    prefix = f"🎤 Ти сказав: {user_text}\n\n" if voice_msg else ""
+
+    if intent == "image":
+        msg = voice_msg or await update.message.reply_text("🎨 Генерую зображення...")
+        if voice_msg:
+            await msg.edit_text(f"{prefix}🎨 Генерую зображення...")
+        await do_generate_image(update, enriched, msg)
+        return True
+
+    if intent == "reminder":
+        try:
+            delay_min, remind_text, fire_at = await do_reminder(update, ctx, enriched)
+            when = fire_at.strftime("%d.%m.%Y о %H:%M")
+            text = f"{prefix}✅ Нагадаю {when}: {remind_text}"
+            if voice_msg: await voice_msg.edit_text(text)
+            else:         await update.message.reply_text(text)
+        except Exception as e:
+            log.warning("reminder dispatch: %s", e)
+            err = f"{prefix}Не вдалось встановити нагадування. Перевір формат часу."
+            if voice_msg: await voice_msg.edit_text(err)
+            else:         await update.message.reply_text(err)
+        return True
+
+    if intent == "task":
+        if voice_msg:
+            await voice_msg.edit_text(f"{prefix}⏳ Обробляю задачу...")
+        await do_task_nlp(update, user_id, enriched)
+        return True
+
+    if intent == "search":
+        msg = voice_msg or await update.message.reply_text("🌐 Шукаю в інтернеті...")
+        if voice_msg:
+            await msg.edit_text(f"{prefix}🌐 Шукаю в інтернеті...")
+        try:
+            search_query = enriched
+            if "[Контекст попереднього повідомлення" in enriched:
+                search_query = (await call_ai([{"role": "user", "content": (
+                    f"{enriched}\n\nСклади короткий пошуковий запит (до 10 слів). Відповідай ТІЛЬКИ запитом."
+                )}])).strip()
+            results = await search_web(search_query)
+            content = (
+                f"Запит: '{enriched}'\n\nРезультати пошуку:\n{results}\n\n"
+                "Дай корисну відповідь українською. Використовуй тільки інформацію з результатів. "
+                "Вказуй джерела: Джерело: назва — посилання. Не вигадуй факти."
+                if results else
+                f"Запит: '{enriched}'\n\nВідповідай з власних знань українською мовою."
+            )
+            reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}])
+            await append_and_trim(user_id, "user", user_text)
+            await append_and_trim(user_id, "assistant", reply)
+            _set_ctx(user_id, user_text, reply)
+            await _send_or_edit(msg, clean_markdown(f"{prefix}{reply}"), disable_web_page_preview=True)
+        except Exception as e:
+            log.error("search dispatch: %s", e)
+            await msg.edit_text(f"{prefix}Помилка пошуку. Спробуй ще раз.")
+        return True
+
+    INTENT_MAP = {
+        "translate": ("🌐 Перекладаю...",   do_translate),
+        "summarize": ("📰 Опрацьовую...",    do_summarize),
+        "generate":  ("✍️ Генерую текст...", do_generate),
+        "edit":      ("✏️ Редагую текст...", do_edit),
+        "recipe":    ("🍳 Шукаю рецепти...", do_recipe),
+        "news":      ("📰 Шукаю новини...",  do_news),
+    }
+    if intent in INTENT_MAP:
+        status_text, fn = INTENT_MAP[intent]
+        msg = voice_msg or await update.message.reply_text(status_text)
+        if voice_msg:
+            await msg.edit_text(f"{prefix}{status_text}")
+        try:
+            result = await fn(enriched)
+        except Exception as e:
+            log.error("intent %s handler: %s", intent, e)
+            await msg.edit_text(f"{prefix}⚠️ Виникла помилка. Спробуй ще раз.")
+            return True
+        kwargs = {"disable_web_page_preview": True} if intent == "news" else {}
+        await _send_or_edit(msg, clean_markdown(f"{prefix}{result}".strip()), **kwargs)
+        _set_ctx(user_id, user_text, result)
+        return True
+
+    return False
+
+# ── Telegram command handlers ─────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1377,7 +1524,8 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
     except Exception as e:
-        await msg.edit_text(f"Помилка генерації: {e}")
+        log.error("handle_image: %s", e)
+        await msg.edit_text("Помилка генерації зображення. Спробуй ще раз.")
 
 async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or len(ctx.args) < 2:
@@ -1417,17 +1565,15 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": (
             f"Запит: '{query}'\n\nРезультати пошуку:\n{results}\n\n"
-            "Дай корисну відповідь українською. ПРАВИЛА:\n"
-            "- Використовуй тільки інформацію з результатів\n"
-            "- Вказуй джерела у форматі: Джерело: назва — посилання\n"
-            "- Не вигадуй факти яких немає в результатах\n"
-            "- Відповідай виключно українською, без іноземних слів"
+            "Дай корисну відповідь українською. Використовуй тільки інформацію з результатів. "
+            "Вказуй джерела: Джерело: назва — посилання. Не вигадуй факти."
         )}])
         await append_and_trim(user_id, "user", f"Пошук: {query}")
         await append_and_trim(user_id, "assistant", reply)
         await _send_or_edit(msg, f"🌐 {query}\n\n{clean_markdown(reply)}")
     except Exception as e:
-        await msg.edit_text(f"Помилка: {e}")
+        log.error("handle_search: %s", e)
+        await msg.edit_text("Помилка пошуку. Спробуй ще раз.")
 
 async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     provider  = get_text_provider()
@@ -1470,166 +1616,13 @@ def _is_bot_addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[b
         return True, user_text
     return False, user_text
 
-async def _dispatch_intent(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-    user_id: int, user_text: str, enriched: str,
-    intent: str, voice_msg=None,
-) -> bool:
-    prefix = f"🎤 Ти сказав: {user_text}\n\n" if voice_msg else ""
-
-    if intent == "image":
-        msg = voice_msg or await update.message.reply_text("🎨 Генерую зображення...")
-        if voice_msg:
-            await msg.edit_text(f"{prefix}🎨 Генерую зображення...")
-        await do_generate_image(update, enriched, msg)
-        return True
-
-    if intent == "reminder":
-        try:
-            delay_min, remind_text, fire_at = await do_reminder(update, ctx, enriched)
-            when = fire_at.strftime("%d.%m.%Y о %H:%M")
-            text = f"{prefix}✅ Нагадаю {when}: {remind_text}"
-            if voice_msg: await voice_msg.edit_text(text)
-            else:         await update.message.reply_text(text)
-        except Exception as e:
-            err = f"{prefix}Не вдалось встановити нагадування: {e}"
-            if voice_msg: await voice_msg.edit_text(err)
-            else:         await update.message.reply_text(err)
-        return True
-
-    if intent == "task":
-        if voice_msg:
-            await voice_msg.edit_text(f"{prefix}⏳ Обробляю задачу...")
-        await do_task_nlp(update, user_id, enriched)
-        return True
-
-    if intent == "search":
-        msg = voice_msg or await update.message.reply_text("🌐 Шукаю в інтернеті...")
-        if voice_msg:
-            await msg.edit_text(f"{prefix}🌐 Шукаю в інтернеті...")
-        try:
-            search_query = enriched
-            if "[Контекст попереднього повідомлення" in enriched:
-                search_query = (await call_ai([{"role": "user", "content": (
-                    f"{enriched}\n\nСклади короткий пошуковий запит (до 10 слів). Відповідай ТІЛЬКИ запитом."
-                )}])).strip()
-            results = await search_web(search_query)
-            content = (
-                f"Запит: '{enriched}'\n\nРезультати пошуку:\n{results}\n\n"
-                "Дай корисну відповідь українською. ПРАВИЛА:\n"
-                "- Використовуй тільки інформацію з результатів пошуку\n"
-                "- Вказуй джерела у форматі: Джерело: назва — посилання\n"
-                "- Не вигадуй факти яких немає в результатах\n"
-                "- Відповідай виключно українською мовою, без іноземних слів"
-                if results else
-                f"Запит: '{enriched}'\n\nВідповідай з власних знань українською мовою."
-            )
-            reply = await call_ai([SYSTEM_PROMPT, {"role": "user", "content": content}])
-            await append_and_trim(user_id, "user", user_text)
-            await append_and_trim(user_id, "assistant", reply)
-            _set_ctx(user_id, user_text, reply)
-            await _send_or_edit(msg, clean_markdown(f"{prefix}{reply}"), disable_web_page_preview=True)
-        except Exception as e:
-            await msg.edit_text(f"{prefix}Помилка пошуку: {e}")
-        return True
-
-    INTENT_MAP = {
-        "translate": ("🌐 Перекладаю...",   do_translate),
-        "summarize": ("📰 Опрацьовую...",    do_summarize),
-        "generate":  ("✍️ Генерую текст...", do_generate),
-        "edit":      ("✏️ Редагую текст...", do_edit),
-        "recipe":    ("🍳 Шукаю рецепти...", do_recipe),
-        "news":      ("📰 Шукаю новини...",  do_news),
-    }
-    if intent in INTENT_MAP:
-        status_text, fn = INTENT_MAP[intent]
-        msg = voice_msg or await update.message.reply_text(status_text)
-        if voice_msg:
-            await msg.edit_text(f"{prefix}{status_text}")
-        try:
-            result = await fn(enriched)
-        except Exception as e:
-            await msg.edit_text(f"{prefix}⚠️ Помилка: {e}")
-            return True
-        kwargs = {"disable_web_page_preview": True} if intent == "news" else {}
-        await _send_or_edit(msg, clean_markdown(f"{prefix}{result}".strip()), **kwargs)
-        _set_ctx(user_id, user_text, result)
-        return True
-
-    return False
-
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addressed, user_text = _is_bot_addressed(update, ctx)
     if not addressed:
         return
     user_id = update.message.from_user.id
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
-    try:
-        preprocessed = await asyncio.wait_for(preprocess_query(user_id, user_text), timeout=15)
-    except Exception:
-        preprocessed = user_text
-
-    try:
-        enriched = await asyncio.wait_for(resolve_text_with_context(user_id, preprocessed), timeout=15)
-    except Exception:
-        enriched = preprocessed
-
-    try:
-        intent = await asyncio.wait_for(detect_intent(enriched, user_id), timeout=15)
-    except Exception:
-        intent = "chat"
-
-    try:
-        emotion = await asyncio.wait_for(detect_emotion(user_text), timeout=10)
-    except Exception:
-        emotion = "neutral"
-
-    if intent == "chat" and needs_support_first(emotion, user_text):
-        try:
-            support_prompt = build_dynamic_prompt(user_id, emotion)
-            support = await asyncio.wait_for(call_ai([
-                support_prompt,
-                {"role": "user", "content": (
-                    f"{user_text}\n\n"
-                    "Відповідь: одним-двома реченнями визнай почуття людини. "
-                    "Потім м'яко запитай чим можеш допомогти."
-                )},
-            ]), timeout=30)
-            await update.message.reply_text(clean_markdown(support))
-            _set_ctx(user_id, user_text, support)
-            asyncio.create_task(update_conversation_context(user_id, user_text, support, intent))
-            return
-        except Exception as e:
-            print(f"[support error] {e}")
-
-    if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent):
-        return
-
-    try:
-        try:
-            dynamic_prompt = build_dynamic_prompt(user_id, emotion)
-        except Exception:
-            dynamic_prompt = get_system_prompt(user_id)
-
-        history  = get_history(user_id)
-        messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
-        await append_and_trim(user_id, "user", enriched)
-        reply = await asyncio.wait_for(call_ai(messages), timeout=60)
-        if not reply or not reply.strip():
-            reply = "Вибач, не вдалося сформувати відповідь. Спробуй ще раз."
-        await append_and_trim(user_id, "assistant", reply)
-        for chunk in [reply[i:i+4000] for i in range(0, max(len(reply), 1), 4000)]:
-            await update.message.reply_text(clean_markdown(chunk))
-        _set_ctx(user_id, user_text, reply)
-        asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
-        asyncio.create_task(update_conversation_context(user_id, user_text, reply, intent))
-        user_msgs = [m for m in history if m.get("role") == "user"]
-        if len(user_msgs) % STYLE_UPDATE_INTERVAL == 0:
-            asyncio.create_task(update_communication_style(user_id))
-    except Exception as e:
-        print(f"[main reply error] {e}")
-        await update.message.reply_text(f"⚠️ Помилка відповіді: {e}")
+    await _process_message(update, ctx, user_id, user_text)
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg     = await update.message.reply_text("🔍 Аналізую зображення...")
@@ -1643,12 +1636,13 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
             {"type": "text", "text": caption},
         ]}])
-        last_context[user_id] = {"type": "фото", "description": reply[:500]}
+        last_context[user_id] = {"type": "фото", "description": reply[:CTX_DESCRIPTION_LEN]}
         await append_and_trim(user_id, "user", f"[Фото] {caption}")
         await append_and_trim(user_id, "assistant", reply)
         await _send_or_edit(msg, clean_markdown(reply))
     except Exception as e:
-        await msg.edit_text(f"Помилка при аналізі зображення: {e}")
+        log.error("handle_photo: %s", e)
+        await msg.edit_text("Помилка при аналізі зображення. Спробуй ще раз.")
 
 async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg     = await update.message.reply_text("🎬 Аналізую відео (аудіо + кадри)...")
@@ -1656,45 +1650,53 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         video   = update.message.video or update.message.video_note
         caption = (update.message.caption if update.message.video else None) or "Що відбувається у цьому відео?"
-        if video.file_size > 20 * 1024 * 1024:
+        if video.file_size > MAX_VIDEO_SIZE:
             await msg.edit_text("❌ Відео занадто велике. Максимум 20MB.")
             return
         video_bytes = bytes(await (await ctx.bot.get_file(video.file_id)).download_as_bytearray())
         result      = await analyze_video(video_bytes, caption)
-        last_context[user_id] = {"type": "відео", "description": result[:500]}
+        last_context[user_id] = {"type": "відео", "description": result[:CTX_DESCRIPTION_LEN]}
         await append_and_trim(user_id, "user", f"[Відео] {caption}")
         await append_and_trim(user_id, "assistant", result)
         await _send_or_edit(msg, clean_markdown(result))
     except Exception as e:
-        await msg.edit_text(f"Помилка при аналізі відео: {e}")
+        log.error("handle_video: %s", e)
+        await msg.edit_text("Помилка при аналізі відео. Спробуй ще раз.")
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc     = update.message.document
     fname   = doc.file_name.lower()
     user_id = update.message.from_user.id
     caption = update.message.caption or "Стисло підсумуй цей документ українською."
-    if   fname.endswith(".pdf"):             msg = await update.message.reply_text("📄 Читаю PDF...")
-    elif fname.endswith((".xlsx", ".xls")): msg = await update.message.reply_text("📊 Читаю Excel...")
-    elif fname.endswith((".docx", ".doc")): msg = await update.message.reply_text("📝 Читаю Word...")
+
+    if fname.endswith(".pdf"):
+        msg = await update.message.reply_text("📄 Читаю PDF...")
+        extractor = extract_pdf_text
+    elif fname.endswith((".xlsx", ".xls")):
+        msg = await update.message.reply_text("📊 Читаю Excel...")
+        extractor = extract_excel_text
+    elif fname.endswith((".docx", ".doc")):
+        msg = await update.message.reply_text("📝 Читаю Word...")
+        extractor = extract_word_text
     else:
         await update.message.reply_text("📄 Підтримуються: PDF, Excel (.xlsx), Word (.docx)")
         return
-    raw = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
-    if   fname.endswith(".pdf"):             text = extract_pdf_text(raw)
-    elif fname.endswith((".xlsx", ".xls")): text = extract_excel_text(raw)
-    else:                                    text = extract_word_text(raw)
+
+    raw  = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
+    text = extractor(raw)
     try:
         if not text or text.startswith("Помилка"):
             await msg.edit_text(f"❌ {text}")
             return
-        text_preview = text[:4000] + ("..." if len(text) > 4000 else "")
+        text_preview = text[:MAX_DOC_PREVIEW_CHARS] + ("..." if len(text) > MAX_DOC_PREVIEW_CHARS else "")
         await append_and_trim(user_id, "user", f"{caption}\n\nВміст документу:\n{text_preview}")
         reply = await call_ai(get_history(user_id))
         await append_and_trim(user_id, "assistant", reply)
-        last_context[user_id] = {"type": "документ", "description": reply[:500]}
+        last_context[user_id] = {"type": "документ", "description": reply[:CTX_DESCRIPTION_LEN]}
         await _send_or_edit(msg, f"📄 {doc.file_name}\n\n{clean_markdown(reply)}")
     except Exception as e:
-        await msg.edit_text(f"Помилка при обробці документу: {e}")
+        log.error("handle_document: %s", e)
+        await msg.edit_text("Помилка при обробці документу. Спробуй ще раз.")
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🎤 Розпізнаю голосове повідомлення...")
@@ -1715,43 +1717,10 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if user_id in chat_histories:
                     chat_histories[user_id][0] = get_system_prompt(user_id)
 
-        try:
-            preprocessed = await asyncio.wait_for(preprocess_query(user_id, text), timeout=15)
-        except Exception:
-            preprocessed = text
-
-        try:
-            enriched = await asyncio.wait_for(resolve_text_with_context(user_id, preprocessed), timeout=15)
-        except Exception:
-            enriched = preprocessed
-
-        try:
-            intent = await asyncio.wait_for(detect_intent(enriched, user_id), timeout=15)
-        except Exception:
-            intent = "chat"
-
-        try:
-            emotion = await asyncio.wait_for(detect_emotion(text), timeout=10)
-        except Exception:
-            emotion = "neutral"
-
-        if await _dispatch_intent(update, ctx, user_id, text, enriched, intent, voice_msg=msg):
-            return
-
-        try:
-            dynamic_prompt = build_dynamic_prompt(user_id, emotion)
-        except Exception:
-            dynamic_prompt = get_system_prompt(user_id)
-
-        history  = get_history(user_id)
-        messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
-        await append_and_trim(user_id, "user", enriched)
-        reply = await asyncio.wait_for(call_ai(messages), timeout=60)
-        await append_and_trim(user_id, "assistant", reply)
-        await _send_or_edit(msg, f"🎤 Ти сказав: {text}\n\n{clean_markdown(reply)}")
-        asyncio.create_task(update_conversation_context(user_id, text, reply, intent))
+        await _process_message(update, ctx, user_id, text, voice_msg=msg)
     except Exception as e:
-        await msg.edit_text(f"Помилка при обробці голосового: {e}")
+        log.error("handle_voice: %s", e)
+        await msg.edit_text("Помилка при обробці голосового. Спробуй ще раз.")
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
@@ -1761,6 +1730,7 @@ async def post_init(app):
     for uid, data in _load_json(MEMORY_FILE, {}).items():
         if data.get("mode"):
             user_personalities[int(uid)] = data["mode"]
+    log.info("Bot initialized successfully")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
@@ -1793,5 +1763,5 @@ if __name__ == "__main__":
         handle_document,
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Бот запущено!")
+    log.info("Bot started")
     app.run_polling()
