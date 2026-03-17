@@ -53,7 +53,7 @@ OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL                  = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL          = "https://api.groq.com/openai/v1/audio/transcriptions"
 OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"
-OPENROUTER_MODEL_FALLBACK = "openrouter/free"
+OPENROUTER_MODEL_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"
 GROQ_MODEL                = "llama-3.3-70b-versatile"
 VISION_MODEL              = "openrouter/auto"
 CF_IMAGE_URL              = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
@@ -741,8 +741,16 @@ def get_text_provider() -> str:
         or_requests["count"] = 0
     return "openrouter" if or_requests["count"] < OR_DAILY_LIMIT else "groq"
 
+_NON_UA_RE = re.compile(
+    r'\b(the|is|are|was|were|and|for|puedo|puede|como|vous|pour|pour|ich|das|ist|und'
+    r'|это|что|как|для|не|на|по|も|は|が|的|了|我|你|他)\b',
+    re.IGNORECASE,
+)
+
 async def call_ai(messages: list) -> str:
     provider = get_text_provider()
+    result   = None
+
     if provider == "openrouter":
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
@@ -755,13 +763,34 @@ async def call_ai(messages: list) -> str:
                 break
             r.raise_for_status()
             or_requests["count"] += 1
-            return r.json()["choices"][0]["message"]["content"]
-    # Groq fallback
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
-        r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+            result = r.json()["choices"][0]["message"]["content"]
+            break
+
+    if result is None:
+        # Groq fallback
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
+            r.raise_for_status()
+        result = r.json()["choices"][0]["message"]["content"]
+
+    # Якщо відповідь містить чужомовні слова — просимо переказати українською
+    if result and _NON_UA_RE.search(result):
+        log.warning("Non-Ukrainian response detected, retranslating")
+        try:
+            fix_messages = messages + [
+                {"role": "assistant", "content": result},
+                {"role": "user",      "content": "Перефразуй свою попередню відповідь виключно українською мовою. Жодних іноземних слів."},
+            ]
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": fix_messages})
+                r.raise_for_status()
+            result = r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            log.warning("Retranslation failed: %s", e)
+
+    return result
 
 async def call_vision(messages: list) -> str:
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
