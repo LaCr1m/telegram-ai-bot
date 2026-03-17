@@ -1592,6 +1592,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
         await append_and_trim(user_id, "user", enriched)
         reply = await asyncio.wait_for(call_ai(messages), timeout=60)
+        if not reply or not reply.strip():
+            reply = "Вибач, не вдалось сформувати відповідь. Спробуй ще раз."
         await append_and_trim(user_id, "assistant", reply)
         for chunk in [reply[i:i+4000] for i in range(0, max(len(reply), 1), 4000)]:
             await update.message.reply_text(clean_markdown(chunk))
