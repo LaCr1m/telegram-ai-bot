@@ -1058,16 +1058,18 @@ async def do_news(query: str) -> str:
             return False
         return is_specific_article(a)
 
-    specific   = [(a, relevance_score(a)) for a in all_articles if is_real_article(a)]
-    specific   = [(a, s) for a, s in specific if s > 0]
+    # Фільтруємо _CAT_ONLY_DOMAINS з усіх джерел (NewsAPI + Tavily/DDG)
+    filtered_articles = [a for a in all_articles if is_real_article(a)]
+
+    specific = [(a, relevance_score(a)) for a in filtered_articles]
+    specific = [(a, s) for a, s in specific if s > 0]
     if len(specific) >= 3:
         scored = specific
     else:
-        all_scored = [(a, relevance_score(a)) for a in all_articles]
+        # Якщо після фільтрації мало — додаємо відфільтровані але без _CAT_ONLY_DOMAINS
+        all_scored = [(a, relevance_score(a)) for a in filtered_articles]
         all_scored = [(a, s) for a, s in all_scored if s > 0]
-        specific_urls = {a.get("url") for a, _ in specific}
-        rest   = [(a, s) for a, s in all_scored if a.get("url") not in specific_urls]
-        scored = specific + rest
+        scored = all_scored if all_scored else specific
 
     if not scored:
         return f"📰 Новин за темою «{clean_query}» не знайдено."
