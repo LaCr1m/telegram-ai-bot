@@ -1793,7 +1793,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.error("handle_message timeout for user %s", user_id)
         await update.message.reply_text("Щось затяглось — спробуй ще раз.")
     except Exception as e:
-        log.error("handle_message error for user %s: %s", user_id, e)
+        log.error("handle_message error for user %s: %s", user_id, e, exc_info=True)
         await update.message.reply_text("Виникла помилка. Спробуй ще раз.")
     finally:
         stop_evt.set()
