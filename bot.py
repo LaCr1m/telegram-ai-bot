@@ -190,7 +190,7 @@ PERSONALITIES = {
 
 # ── Keywords ──────────────────────────────────────────────────────────────────
 
-IMAGE_KEYWORDS     = ["створи фото","згенеруй фото","намалюй","згенеруй зображення","створи зображення","зроби фото","зроби картинку","створи картинку","зроби зображення","згенеруй картинку","покажи зображення","generate image","draw","create image","create photo","make image"]
+IMAGE_KEYWORDS     = ["створи фото","згенеруй фото","намалюй","згенеруй зображення","створи зображення","зроби фото","зроби картинку","створи картинку","зроби зображення","згенеруй картинку","покажи зображення","згенер","зобрази","generate image","draw","create image","create photo","make image","generate a","генеруй зображення","генеруй картинку","згенери зображення","згенери картинку","зроби зображення у стилі","зроби картинку у стилі","намалюй у стилі","згенеруй у стилі","зображення має бути","у стилі"]
 REMIND_KEYWORDS    = ["нагадай","нагади","нагадуй","remind me","set reminder","постав нагадування","нагадай мені","нагадування о","нагадування через"]
 SEARCH_KEYWORDS    = ["пошукай","знайди в інтернеті","загугли","що відбувається","останні новини","актуальні новини","яка погода","який курс","де купити","де придбати","де замовити","де знайти","де продається","search","look up"]
 TRANSLATE_KEYWORDS = ["перекладай","переклади","перекласти","translate","як буде","як сказати","як перекласти"]
@@ -550,6 +550,7 @@ async def detect_intent_ai(text: str) -> str:
         f"Визнач намір повідомлення: '{text}'\n"
         "Відповідай ТІЛЬКИ одним словом:\n"
         "reminder|image|search|translate|summarize|generate|edit|recipe|task|chat\n"
+        "- image: якщо людина просить намалювати, згенерувати, створити або зобразити будь-яке зображення/картинку/фото, навіть з опечатками або в конкретному стилі\n"
         "- reminder: ТІЛЬКИ якщо є конкретний час або дата\n"
         "- chat: все інше, включаючи питання і розмову"
     )}])
@@ -745,6 +746,41 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
 
 # ── Image generation ──────────────────────────────────────────────────────────
 
+# ── Style dictionary ──────────────────────────────────────────────────────────
+
+STYLE_HINTS: dict[str, str] = {
+    "mewgenics":       "mewgenics indie game pixel art style, chunky pixels, limited color palette, retro 16-bit aesthetic, cat characters",
+    "ghibli":          "Studio Ghibli anime style, soft watercolor backgrounds, hand-drawn look, warm pastel colors",
+    "cyberpunk":       "cyberpunk style, neon lights, dark dystopian city, rain reflections, high contrast",
+    "vaporwave":       "vaporwave aesthetic, pink and purple gradient, retro 80s, glitch effects, synthwave",
+    "comic":           "comic book style, bold outlines, halftone dots, flat colors, dynamic poses",
+    "watercolor":      "watercolor painting style, soft edges, translucent washes, paper texture",
+    "oil painting":    "oil painting style, rich textures, visible brushstrokes, classical composition",
+    "pixel art":       "pixel art style, 16-bit retro, chunky pixels, limited color palette",
+    "anime":           "anime style, cel shading, large expressive eyes, vibrant colors, clean lines",
+    "noir":            "film noir style, black and white, high contrast shadows, dramatic lighting",
+    "minimalist":      "minimalist style, clean lines, flat colors, simple shapes, lots of whitespace",
+    "surrealism":      "surrealist style, dreamlike, impossible scenes, Salvador Dali inspired",
+    "low poly":        "low poly 3D style, geometric shapes, flat shading, triangulated surfaces",
+    "sketch":          "pencil sketch style, hand-drawn lines, crosshatching, monochrome",
+    "ukiyo-e":         "ukiyo-e Japanese woodblock print style, bold outlines, flat colors, traditional",
+    "impressionism":   "impressionist painting style, visible brushstrokes, light and color focus, Monet inspired",
+    "pop art":         "pop art style, bold colors, Ben-Day dots, Andy Warhol inspired, high contrast",
+    "sticker":         "sticker art style, thick white outline, flat colors, cute cartoon, glossy look",
+    "claymation":      "claymation style, clay texture, 3D molded look, soft rounded shapes, stop motion",
+    "concept art":     "concept art style, detailed environment, cinematic lighting, professional illustration",
+}
+
+def _enrich_prompt_with_style(prompt: str, style_hint: str) -> str:
+    """Додає опис стилю до промпту якщо знайдено у словнику."""
+    pl = prompt.lower()
+    for key, description in STYLE_HINTS.items():
+        if key in pl:
+            # Замінюємо коротку назву стилю на розгорнутий опис
+            prompt = re.sub(re.escape(key), description, prompt, flags=re.IGNORECASE)
+            break
+    return prompt
+
 async def _call_ai_english(instruction: str) -> str:
     """
     Викликає Groq напряму і повертає відповідь англійською.
@@ -797,6 +833,7 @@ async def _build_image_prompt(user_request: str, ctx_desc: str = "") -> str:
             f"Request: {user_request}"
         )
     translation = await _call_ai_english(instruction)
+    translation = _enrich_prompt_with_style(translation, user_request)
     translation = f"{translation}, highly detailed, sharp focus, high quality"
     log.info("Image prompt sent to CF Flux: %s", translation)
     return translation
