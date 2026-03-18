@@ -890,14 +890,19 @@ async def extract_video_frames(video_bytes: bytes, max_frames: int = 3) -> list[
 async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> str:
     sys_prompt = get_active_system_prompt(user_id)
     results    = []
+    log.info("analyze_video: start, size=%d bytes", len(video_bytes))
     try:
-        transcript = await transcribe_voice(await extract_video_audio(video_bytes))
+        audio = await extract_video_audio(video_bytes)
+        log.info("analyze_video: audio extracted, size=%d", len(audio))
+        transcript = await transcribe_voice(audio)
+        log.info("analyze_video: transcript='%s'", transcript[:100] if transcript else "")
         if transcript:
             results.append(f"🎤 Аудіо:\n{transcript}")
     except Exception as e:
-        log.debug("analyze_video audio: %s", e)
+        log.warning("analyze_video audio failed: %s", e)
     try:
         frames = await extract_video_frames(video_bytes)
+        log.info("analyze_video: extracted %d frames", len(frames))
         if frames:
             descs = []
             for i, frame in enumerate(frames):
@@ -909,8 +914,9 @@ async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> s
                 descs.append(f"Кадр {i+1}: {desc}")
             results.append("🎬 Відео:\n" + "\n".join(descs))
     except Exception as e:
-        log.debug("analyze_video frames: %s", e)
+        log.warning("analyze_video frames failed: %s", e)
     if not results:
+        log.error("analyze_video: no results at all — ffmpeg missing or file corrupt?")
         return "❌ Не вдалось проаналізувати відео."
     combined = "\n\n".join(results)
     summary  = await call_ai([sys_prompt, {"role": "user", "content": f"Запит: {caption}\n\nДані відео:\n{combined}\n\nВідповідай українською."}])
@@ -1290,7 +1296,7 @@ async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
         # Будуємо точний промпт через окрему функцію
         final_prompt = await _build_image_prompt(prompt, ctx_desc)
         img_bytes    = await generate_image(final_prompt)
-        await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt[:200]}")
+        await update.message.reply_photo(photo=img_bytes)
         await msg.delete()
     except Exception as e:
         log.error("_do_generate_image: %s", e)
@@ -1531,7 +1537,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         final_prompt = await _build_image_prompt(prompt)
         img_bytes    = await generate_image(final_prompt)
-        await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
+        await update.message.reply_photo(photo=img_bytes)
         await msg.delete()
     except Exception as e:
         log.error("handle_image: %s", e)
