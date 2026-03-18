@@ -745,35 +745,58 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
 
 # ── Image generation ──────────────────────────────────────────────────────────
 
+async def _call_ai_english(instruction: str) -> str:
+    """
+    Викликає Groq напряму і повертає відповідь англійською.
+    Навмисно обходить call_ai, щоб уникнути Ukrainian retranslation фільтра.
+    """
+    messages = [{"role": "user", "content": instruction}]
+    if GROQ_API_KEY:
+        try:
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
+                r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.warning("_call_ai_english Groq failed: %s", e)
+    if OPENROUTER_API_KEY:
+        try:
+            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(OPENROUTER_URL, headers=headers, json={"model": OPENROUTER_MODEL, "messages": messages})
+                r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.warning("_call_ai_english OpenRouter failed: %s", e)
+    raise RuntimeError("_call_ai_english: all providers failed")
+
 async def _build_image_prompt(user_request: str, ctx_desc: str = "") -> str:
     """
     Перекладає запит користувача в англійський промпт для Flux.
-    Якщо є контекст попереднього зображення/відео — включає його.
-    Промпт не пом'якшується і не інтерпретується — лише точний переклад.
+    Використовує _call_ai_english щоб уникнути Ukrainian retranslation фільтра.
     """
     if ctx_desc:
-        prompt_instruction = (
+        instruction = (
             f"You are a prompt engineer for an image generation model.\n"
             f"Base subject (keep exactly as described): {ctx_desc[:300]}\n"
             f"Apply this modification or style: {user_request}\n\n"
             f"Rules:\n"
-            f"- Translate the request LITERALLY — do NOT soften, sanitize or reinterpret.\n"
-            f"- Describe only visual elements.\n"
-            f"- Be specific and concrete.\n"
-            f"- Max 60 words.\n"
+            f"- Write the prompt in ENGLISH only.\n"
+            f"- Translate LITERALLY — do NOT soften, sanitize or reinterpret.\n"
+            f"- Describe only visual elements. Be specific. Max 60 words.\n"
             f"- Return ONLY the prompt, no explanations."
         )
     else:
-        prompt_instruction = (
+        instruction = (
             f"You are a prompt engineer for an image generation model.\n"
-            f"Translate this image request to English LITERALLY — do NOT soften, "
+            f"Translate this image request to ENGLISH ONLY — do NOT soften, "
             f"sanitize or reinterpret the request in any way.\n"
             f"Be specific and concrete. Max 60 words.\n"
-            f"Return ONLY the prompt, no explanations.\n\n"
+            f"Return ONLY the English prompt, no explanations.\n\n"
             f"Request: {user_request}"
         )
-    translation = (await call_ai([{"role": "user", "content": prompt_instruction}])).strip()
-    # Додаємо якісні теги для кращого результату
+    translation = await _call_ai_english(instruction)
     translation = f"{translation}, highly detailed, sharp focus, high quality"
     log.info("Image prompt sent to CF Flux: %s", translation)
     return translation
@@ -923,6 +946,14 @@ def extract_excel_text(xlsx_bytes: bytes) -> str:
         return "\n".join(out).strip() or "Файл порожній."
     except Exception as e:
         return f"Помилка читання Excel: {e}"
+
+def extract_txt_text(txt_bytes: bytes) -> str:
+    for enc in ("utf-8", "cp1251", "latin-1"):
+        try:
+            return txt_bytes.decode(enc).strip()
+        except Exception:
+            continue
+    return "Помилка читання TXT: невідоме кодування."
 
 def extract_word_text(docx_bytes: bytes) -> str:
     try:
@@ -1628,8 +1659,10 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg, extractor = await update.message.reply_text("📊 Читаю Excel..."), extract_excel_text
     elif fname.endswith((".docx", ".doc")):
         msg, extractor = await update.message.reply_text("📝 Читаю Word..."), extract_word_text
+    elif fname.endswith(".txt"):
+        msg, extractor = await update.message.reply_text("📄 Читаю TXT..."), extract_txt_text
     else:
-        await update.message.reply_text("📄 Підтримуються: PDF, Excel, Word")
+        await update.message.reply_text("📄 Підтримуються: PDF, Excel, Word, TXT")
         return
 
     raw  = bytes(await (await ctx.bot.get_file(doc.file_id)).download_as_bytearray())
@@ -1706,7 +1739,8 @@ if __name__ == "__main__":
         filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") |
         filters.Document.MimeType("application/vnd.openxmlformats-officedocument.wordprocessingml.document") |
         filters.Document.MimeType("application/msword") |
-        filters.Document.MimeType("application/vnd.ms-excel"),
+        filters.Document.MimeType("application/vnd.ms-excel") |
+        filters.Document.MimeType("text/plain"),
         handle_document,
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
