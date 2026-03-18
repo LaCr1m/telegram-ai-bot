@@ -20,6 +20,19 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
+import subprocess, shutil
+
+def _ensure_ffmpeg():
+    if shutil.which("ffmpeg"):
+        return
+    log.info("ffmpeg not found, trying to install...")
+    try:
+        subprocess.run(["apt-get", "update", "-qq"], check=True)
+        subprocess.run(["apt-get", "install", "-y", "-qq", "ffmpeg"], check=True)
+        log.info("ffmpeg installed successfully")
+    except Exception as e:
+        log.error("Failed to install ffmpeg: %s", e)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -1749,6 +1762,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Startup ───────────────────────────────────────────────────────────────────
 
 async def post_init(app):
+    _ensure_ffmpeg()
     await restore_reminders(app.bot)
     restore_histories()
     for uid, data in _load_json(MEMORY_FILE, {}).items():
