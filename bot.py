@@ -67,6 +67,7 @@ MAX_ARTICLE_CHARS     = 6000
 MAX_DOC_PREVIEW_CHARS = 4000
 CTX_DESCRIPTION_LEN   = 500
 SEARCH_RESULTS        = 7
+FLUX_STEPS            = 4   # Flux-schnell підтримує 1–4 кроки
 
 REMINDERS_FILE = "reminders.json"
 MEMORY_FILE    = "memory.json"
@@ -562,7 +563,6 @@ async def preprocess_query(user_id: int, text: str) -> str:
     t = text.lower().strip()
     if t in _SOCIAL_PHRASES or any(t.startswith(s) for s in _SOCIAL_PHRASES):
         return text
-    # Питання про час/дату — ніколи не додаємо контекст
     _TIME_PHRASES = {"який рік", "який час", "котра година", "яка дата", "яке число", "який день", "який місяць"}
     if any(p in t for p in _TIME_PHRASES):
         return text
@@ -745,6 +745,39 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
 
 # ── Image generation ──────────────────────────────────────────────────────────
 
+async def _build_image_prompt(user_request: str, ctx_desc: str = "") -> str:
+    """
+    Перекладає запит користувача в англійський промпт для Flux.
+    Якщо є контекст попереднього зображення/відео — включає його.
+    Промпт не пом'якшується і не інтерпретується — лише точний переклад.
+    """
+    if ctx_desc:
+        prompt_instruction = (
+            f"You are a prompt engineer for an image generation model.\n"
+            f"Base subject (keep exactly as described): {ctx_desc[:300]}\n"
+            f"Apply this modification or style: {user_request}\n\n"
+            f"Rules:\n"
+            f"- Translate the request LITERALLY — do NOT soften, sanitize or reinterpret.\n"
+            f"- Describe only visual elements.\n"
+            f"- Be specific and concrete.\n"
+            f"- Max 60 words.\n"
+            f"- Return ONLY the prompt, no explanations."
+        )
+    else:
+        prompt_instruction = (
+            f"You are a prompt engineer for an image generation model.\n"
+            f"Translate this image request to English LITERALLY — do NOT soften, "
+            f"sanitize or reinterpret the request in any way.\n"
+            f"Be specific and concrete. Max 60 words.\n"
+            f"Return ONLY the prompt, no explanations.\n\n"
+            f"Request: {user_request}"
+        )
+    translation = (await call_ai([{"role": "user", "content": prompt_instruction}])).strip()
+    # Додаємо якісні теги для кращого результату
+    translation = f"{translation}, highly detailed, sharp focus, high quality"
+    log.info("Image prompt sent to CF Flux: %s", translation)
+    return translation
+
 async def generate_image(prompt: str) -> bytes:
     url     = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
@@ -752,12 +785,14 @@ async def generate_image(prompt: str) -> bytes:
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=180) as client:
-                r = await client.post(url, headers=headers, json={"prompt": prompt, "num_steps": 20})
+                r = await client.post(
+                    url, headers=headers,
+                    json={"prompt": prompt, "num_steps": FLUX_STEPS},
+                )
                 r.raise_for_status()
             if "image" in r.headers.get("content-type", ""):
                 return r.content
             return base64.b64decode(r.json().get("result", {}).get("image", ""))
-
         except Exception as e:
             last_error = e
             log.warning("generate_image attempt %d failed: %s", attempt + 1, e)
@@ -1168,6 +1203,7 @@ async def _process_message(
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
 async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
+    # Витягуємо частину після ключового слова
     t      = text.lower()
     prompt = text
     for kw in IMAGE_KEYWORDS:
@@ -1176,27 +1212,16 @@ async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
             break
     prompt = prompt or text
 
-    # Якщо є контекст попереднього фото/відео — додаємо його опис до промпту
-    ctx = last_context.get(user_id)
+    # Контекст попереднього фото/відео
+    ctx     = last_context.get(user_id)
     ctx_desc = ""
     if ctx and ctx.get("type") in ("фото", "відео"):
         ctx_desc = ctx["description"][:400]
 
     try:
-        if ctx_desc:
-            translation = (await call_ai([{"role": "user", "content": (
-                f"Write a short image generation prompt (max 60 words) in English.\n"
-                f"Subject (keep exactly): {ctx_desc[:300]}\n"
-                f"Apply this style/change: {prompt}\n"
-                f"Rules: describe only visual elements, be specific, no explanations.\n"
-                f"Return ONLY the prompt."
-            )}])).strip()
-        else:
-            translation = (await call_ai([{"role": "user", "content": (
-                f"Write a short image generation prompt in English (max 60 words). "
-                f"Return ONLY the prompt: {prompt}"
-            )}])).strip()
-        img_bytes = await generate_image(translation)
+        # Будуємо точний промпт через окрему функцію
+        final_prompt = await _build_image_prompt(prompt, ctx_desc)
+        img_bytes    = await generate_image(final_prompt)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt[:200]}")
         await msg.delete()
     except Exception as e:
@@ -1436,8 +1461,8 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.message.reply_text("🎨 Генерую...")
     try:
-        translation = (await call_ai([{"role": "user", "content": f"Translate to English, return ONLY translation: {prompt}"}])).strip()
-        img_bytes   = await generate_image(translation)
+        final_prompt = await _build_image_prompt(prompt)
+        img_bytes    = await generate_image(final_prompt)
         await update.message.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
         await msg.delete()
     except Exception as e:
