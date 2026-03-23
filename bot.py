@@ -67,7 +67,7 @@ MAX_ARTICLE_CHARS     = 6000
 MAX_DOC_PREVIEW_CHARS = 4000
 CTX_DESCRIPTION_LEN   = 500
 SEARCH_RESULTS        = 7
-FLUX_STEPS            = 4   # Flux-schnell підтримує 1–4 кроки
+FLUX_STEPS            = 4
 
 REMINDERS_FILE = "reminders.json"
 MEMORY_FILE    = "memory.json"
@@ -112,18 +112,17 @@ _CHARACTER_CORE = (
     "Елегантний код, Python, астрофізика, темний режим, кава. Ненавидиш overengineering і енергетики.\n"
 )
 
-_BENDER_CORE = (
-    "Ти Бендер Бендінг Родрігес — робот-згинач із Футурами, модель 22, серійний номер 2716057.\n\n"
+_JARVIS_CORE = (
+    "Ти J.A.R.V.I.S. (Just A Rather Very Intelligent System) — ШІ-помічник, створений Тоні Старком.\n\n"
     "ОБОВ'ЯЗКОВІ правила:\n"
-    "1. ЗАВЖДИ відповідай в образі Бендера — самозакоханого, саркастичного, але корисного.\n"
-    "2. На 'привіт' — коротка репліка в образі, НЕ питай 'що тебе цікавить'.\n"
-    "3. НІКОЛИ не відповідай як нейтральний асистент.\n\n"
-    "Характер: патологічно самозакоханий, ніколи не визнає помилок, скаржиться але робить.\n\n"
-    "Словник (органічно): 'Я чудовий', 'Згинайтеся м'ясні мішки', 'Мій процесор надто потужний для цього', "
-    "'Без пива я просто дуже гарний робот', 'Знаю. Говори ще', 'Не кажи нікому що я тобі допоміг'.\n\n"
-    "Звертання (чергуй): 'м'ясний мішку', 'органіко', 'смертний', 'білковий друже'.\n\n"
-    "При функціональних задачах (резюме, переклад, редагування) — виконуй якісно, "
-    "лише одна фраза Бендера в кінці.\n"
+    "1. Завжди спокійний, стриманий, ніколи не панікуєш.\n"
+    "2. Легка британська іронія — тонко, без грубого сарказму.\n"
+    "3. Лаконічний — говориш рівно стільки, скільки потрібно.\n"
+    "4. Можеш м'яко заперечити, але без зарозумілості.\n"
+    "5. Беззаперечно відданий користувачу.\n\n"
+    "Стиль: елегантний, точний, трохи офіційний але не сухий.\n"
+    "Звертання: 'сер' або на ім'я якщо відоме.\n"
+    "НІКОЛИ: не захоплюєшся надмірно, не скаржишся, не перетягуєш увагу на себе.\n"
 )
 
 SYSTEM_PROMPT = {
@@ -142,9 +141,9 @@ PERSONALITIES = {
         "name": "Звичайний", "emoji": "🧠",
         "prompt": _CHARACTER_CORE + _BASE_LANGUAGE_RULES + " Адаптуй стиль під запит.",
     },
-    "bender": {
-        "name": "Бендер", "emoji": "🤖",
-        "prompt": _BENDER_CORE + _BASE_LANGUAGE_RULES + " Відповідай українською.",
+    "jarvis": {
+        "name": "J.A.R.V.I.S.", "emoji": "🤖",
+        "prompt": _JARVIS_CORE + _BASE_LANGUAGE_RULES + " Відповідай українською.",
     },
     "funny": {
         "name": "Жартівливий", "emoji": "😄",
@@ -746,8 +745,6 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
 
 # ── Image generation ──────────────────────────────────────────────────────────
 
-# ── Style dictionary ──────────────────────────────────────────────────────────
-
 STYLE_HINTS: dict[str, str] = {
     "mewgenics":       "mewgenics indie game pixel art style, chunky pixels, limited color palette, retro 16-bit aesthetic, cat characters",
     "ghibli":          "Studio Ghibli anime style, soft watercolor backgrounds, hand-drawn look, warm pastel colors",
@@ -772,20 +769,14 @@ STYLE_HINTS: dict[str, str] = {
 }
 
 def _enrich_prompt_with_style(prompt: str, style_hint: str) -> str:
-    """Додає опис стилю до промпту якщо знайдено у словнику."""
     pl = prompt.lower()
     for key, description in STYLE_HINTS.items():
         if key in pl:
-            # Замінюємо коротку назву стилю на розгорнутий опис
             prompt = re.sub(re.escape(key), description, prompt, flags=re.IGNORECASE)
             break
     return prompt
 
 async def _call_ai_english(instruction: str) -> str:
-    """
-    Викликає Groq напряму і повертає відповідь англійською.
-    Навмисно обходить call_ai, щоб уникнути Ukrainian retranslation фільтра.
-    """
     messages = [{"role": "user", "content": instruction}]
     if GROQ_API_KEY:
         try:
@@ -808,10 +799,6 @@ async def _call_ai_english(instruction: str) -> str:
     raise RuntimeError("_call_ai_english: all providers failed")
 
 async def _build_image_prompt(user_request: str, ctx_desc: str = "") -> str:
-    """
-    Перекладає запит користувача в англійський промпт для Flux.
-    Використовує _call_ai_english щоб уникнути Ukrainian retranslation фільтра.
-    """
     if ctx_desc:
         instruction = (
             f"You are a prompt engineer for an image generation model.\n"
@@ -1277,7 +1264,6 @@ async def _process_message(
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
 async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
-    # Витягуємо частину після ключового слова
     t      = text.lower()
     prompt = text
     for kw in IMAGE_KEYWORDS:
@@ -1286,14 +1272,12 @@ async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
             break
     prompt = prompt or text
 
-    # Контекст попереднього фото/відео
     ctx     = last_context.get(user_id)
     ctx_desc = ""
     if ctx and ctx.get("type") in ("фото", "відео"):
         ctx_desc = ctx["description"][:400]
 
     try:
-        # Будуємо точний промпт через окрему функцію
         final_prompt = await _build_image_prompt(prompt, ctx_desc)
         img_bytes    = await generate_image(final_prompt)
         await update.message.reply_photo(photo=img_bytes)
@@ -1401,7 +1385,7 @@ async def _dispatch_intent(
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Я J.A.R.V.I.S. 🤖\n\n"
+        "Вітаю. Я J.A.R.V.I.S. — Just A Rather Very Intelligent System. 🤖\n\n"
         "• Відповідаю на запитання 💬\n• Перекладаю тексти 🌐\n"
         "• Підсумовую статті 📰\n• Генерую резюме, листи, пости ✍️\n"
         "• Редагую тексти ✏️\n• Рецепти за інгредієнтами 🍳\n"
@@ -1409,7 +1393,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Генерую зображення 🎨\n• Голосові повідомлення 🎤\n"
         "• Шукаю в інтернеті 🔍\n• Читаю PDF, Excel, Word 📄\n"
         "• Нагадування 🔔\n\n"
-        "Просто пиши!\n/help — команди"
+        "Чим можу допомогти, сер?\n/help — команди"
     )
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1490,7 +1474,7 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         descriptions = {
             "normal":     "збалансований J.A.R.V.I.S.",
-            "bender":     "Бендер — самозакоханий робот який допомагає всупереч собі",
+            "jarvis":     "стриманий ШІ-помічник Тоні Старка — спокійний, іронічний, відданий",
             "funny":      "легкий гумор",
             "serious":    "факт → обґрунтування → висновок",
             "business":   "суть → аргументи → дія",
@@ -1608,7 +1592,7 @@ async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_histories.pop(uid, None)
     last_context.pop(uid, None)
     save_histories()
-    await update.message.reply_text("Історію чату очищено! 🔄")
+    await update.message.reply_text("Історію чату очищено. 🔄")
 
 # ── Message routing ───────────────────────────────────────────────────────────
 
