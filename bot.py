@@ -6,6 +6,7 @@ import base64
 import asyncio
 import io
 import json
+import sqlite3
 from datetime import date, timedelta, datetime
 from zoneinfo import ZoneInfo
 from tavily import TavilyClient
@@ -15,8 +16,11 @@ try:
     from pypdf import PdfReader
 except ImportError:
     from PyPDF2 import PdfReader
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, MessageHandler, CommandHandler,
+    CallbackQueryHandler, filters, ContextTypes,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -41,6 +45,7 @@ GROQ_API_KEY       = _require_env("GROQ_API_KEY")
 TAVILY_API_KEY     = _require_env("TAVILY_API_KEY")
 CF_API_TOKEN       = _require_env("CF_API_TOKEN")
 CF_ACCOUNT_ID      = _require_env("CF_ACCOUNT_ID")
+BRIEF_CHAT_ID      = _require_env("BRIEF_CHAT_ID")   # chat_id куди слати щоденний бриф
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is required")
@@ -68,12 +73,9 @@ MAX_DOC_PREVIEW_CHARS = 4000
 CTX_DESCRIPTION_LEN   = 500
 SEARCH_RESULTS        = 7
 FLUX_STEPS            = 4
+BRIEF_HOUR            = 8   # година щоденного брифу (Київ)
 
-REMINDERS_FILE = "reminders.json"
-MEMORY_FILE    = "memory.json"
-TASKS_FILE     = "tasks.json"
-HISTORY_FILE   = "history.json"
-
+DB_PATH         = os.environ.get("DB_PATH", "/data/jarvis.db")
 BLOCKED_DOMAINS = {"olx.ua", "olx.com.ua"}
 _HEADERS        = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
@@ -81,6 +83,97 @@ TZ = ZoneInfo("Europe/Kyiv")
 
 def now_kyiv() -> datetime:
     return datetime.now(TZ)
+
+# ── SQLite storage ────────────────────────────────────────────────────────────
+
+def _db() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db() -> None:
+    with _db() as con:
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS memory (
+                user_id INTEGER PRIMARY KEY,
+                data    TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS history (
+                user_id  INTEGER PRIMARY KEY,
+                messages TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                user_id INTEGER PRIMARY KEY,
+                data    TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS reminders (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                text    TEXT NOT NULL,
+                fire_at TEXT NOT NULL
+            );
+        """)
+    log.info("DB initialized at %s", DB_PATH)
+
+# memory
+def get_user_memory(user_id: int) -> dict:
+    with _db() as con:
+        row = con.execute("SELECT data FROM memory WHERE user_id=?", (user_id,)).fetchone()
+    return json.loads(row["data"]) if row else {}
+
+def update_user_memory(user_id: int, data: dict) -> None:
+    mem = get_user_memory(user_id)
+    mem.update(data)
+    with _db() as con:
+        con.execute(
+            "INSERT INTO memory(user_id,data) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data",
+            (user_id, json.dumps(mem, ensure_ascii=False)),
+        )
+
+# history
+def load_history_db(user_id: int) -> list:
+    with _db() as con:
+        row = con.execute("SELECT messages FROM history WHERE user_id=?", (user_id,)).fetchone()
+    return json.loads(row["messages"]) if row else []
+
+def save_history_db(user_id: int, messages: list) -> None:
+    with _db() as con:
+        con.execute(
+            "INSERT INTO history(user_id,messages) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET messages=excluded.messages",
+            (user_id, json.dumps(messages, ensure_ascii=False)),
+        )
+
+# tasks
+def get_user_tasks(user_id: int) -> list:
+    with _db() as con:
+        row = con.execute("SELECT data FROM tasks WHERE user_id=?", (user_id,)).fetchone()
+    return json.loads(row["data"]) if row else []
+
+def set_user_tasks(user_id: int, tasks: list) -> None:
+    with _db() as con:
+        con.execute(
+            "INSERT INTO tasks(user_id,data) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data",
+            (user_id, json.dumps(tasks, ensure_ascii=False)),
+        )
+
+# reminders
+def load_reminders() -> list:
+    with _db() as con:
+        rows = con.execute("SELECT id, chat_id, text, fire_at FROM reminders").fetchall()
+    return [dict(r) for r in rows]
+
+def add_reminder(chat_id: int, text: str, fire_at: datetime) -> int:
+    with _db() as con:
+        cur = con.execute(
+            "INSERT INTO reminders(chat_id,text,fire_at) VALUES(?,?,?)",
+            (chat_id, text, fire_at.isoformat()),
+        )
+    return cur.lastrowid
+
+def delete_reminder(rid: int) -> None:
+    with _db() as con:
+        con.execute("DELETE FROM reminders WHERE id=?", (rid,))
 
 # ── Emotion tones ─────────────────────────────────────────────────────────────
 
@@ -137,13 +230,13 @@ SYSTEM_PROMPT = {
 }
 
 PERSONALITIES = {
-    "normal": {
-        "name": "Звичайний", "emoji": "🧠",
-        "prompt": _CHARACTER_CORE + _BASE_LANGUAGE_RULES + " Адаптуй стиль під запит.",
-    },
     "jarvis": {
         "name": "J.A.R.V.I.S.", "emoji": "🤖",
         "prompt": _JARVIS_CORE + _BASE_LANGUAGE_RULES + " Відповідай українською.",
+    },
+    "normal": {
+        "name": "Звичайний", "emoji": "🧠",
+        "prompt": _CHARACTER_CORE + _BASE_LANGUAGE_RULES + " Адаптуй стиль під запит.",
     },
     "funny": {
         "name": "Жартівливий", "emoji": "😄",
@@ -187,6 +280,16 @@ PERSONALITIES = {
     },
 }
 
+PERSONALITY_DESCRIPTIONS = {
+    "jarvis":     "стриманий ШІ Тоні Старка — спокійний, іронічний, відданий",
+    "normal":     "збалансований J.A.R.V.I.S.",
+    "funny":      "легкий гумор і сарказм",
+    "serious":    "факт → обґрунтування → висновок",
+    "business":   "суть → аргументи → дія",
+    "literary":   "художній стиль, метафори",
+    "journalist": "заголовок → лід → факти → висновок",
+}
+
 # ── Keywords ──────────────────────────────────────────────────────────────────
 
 IMAGE_KEYWORDS     = ["створи фото","згенеруй фото","намалюй","згенеруй зображення","створи зображення","зроби фото","зроби картинку","створи картинку","зроби зображення","згенеруй картинку","покажи зображення","згенер","зобрази","generate image","draw","create image","create photo","make image","generate a","генеруй зображення","генеруй картинку","згенери зображення","згенери картинку","зроби зображення у стилі","зроби картинку у стилі","намалюй у стилі","згенеруй у стилі","зображення має бути","у стилі"]
@@ -205,46 +308,34 @@ _SOCIAL_PHRASES = {
     "як ти","як твої справи","що нового","як діла","yo","hi","hello",
 }
 
+# Стікери — реакції J.A.R.V.I.S.
+STICKER_REACTIONS = [
+    "Цікавий вибір, сер. Стікер отримано, проаналізовано, занесено до архіву.",
+    "Зафіксовано. Мій сенсорний аналіз підказує, що це мало щось означати.",
+    "Стікер? Справді? Гаразд, сер. Занотовано.",
+    "Виразно. Майже так само виразно, як мій мовчазний осуд.",
+    "Отримано. Рівень інформативності — мінімальний, але я не суджу.",
+]
+
 # ── Runtime state ─────────────────────────────────────────────────────────────
 
 chat_histories:     dict[int, list] = {}
 user_personalities: dict[int, str]  = {}
 last_context:       dict[int, dict] = {}
+_user_locks:        dict[int, asyncio.Lock] = {}
 
-# ── JSON helpers ──────────────────────────────────────────────────────────────
+def _get_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    return _user_locks[user_id]
 
-def _load_json(path: str, default):
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log.warning("Failed to load %s: %s", path, e)
-        return default
-
-def _save_json(path: str, data) -> None:
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except Exception as e:
-        log.error("Failed to save %s: %s", path, e)
+# ── JSON parse helper ─────────────────────────────────────────────────────────
 
 def _parse_json_ai(text: str) -> dict:
     clean = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     return json.loads(clean)
 
-# ── Memory ────────────────────────────────────────────────────────────────────
-
-def get_user_memory(user_id: int) -> dict:
-    return _load_json(MEMORY_FILE, {}).get(str(user_id), {})
-
-def update_user_memory(user_id: int, data: dict) -> None:
-    memory = _load_json(MEMORY_FILE, {})
-    memory.setdefault(str(user_id), {}).update(data)
-    _save_json(MEMORY_FILE, memory)
+# ── Memory helpers ────────────────────────────────────────────────────────────
 
 async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> None:
     try:
@@ -278,12 +369,12 @@ def _gender_suffix(user_id: int) -> str:
 
 def get_system_prompt(user_id: int) -> dict:
     mode = user_personalities.get(user_id, "jarvis")
-    p    = PERSONALITIES.get(mode, PERSONALITIES["normal"])
+    p    = PERSONALITIES.get(mode, PERSONALITIES["jarvis"])
     return {"role": "system", "content": p["prompt"] + _gender_suffix(user_id)}
 
 def build_dynamic_prompt(user_id: int, emotion: str) -> dict:
     mode  = user_personalities.get(user_id, "jarvis")
-    p     = PERSONALITIES.get(mode, PERSONALITIES["normal"])
+    p     = PERSONALITIES.get(mode, PERSONALITIES["jarvis"])
     parts = [p["prompt"] + _gender_suffix(user_id)]
 
     style = get_user_memory(user_id).get("communication_style", {})
@@ -371,21 +462,18 @@ def needs_support_first(emotion: str, text: str) -> bool:
 # ── History ───────────────────────────────────────────────────────────────────
 
 def save_histories() -> None:
-    to_save = {}
     for uid, history in chat_histories.items():
         msgs = [m for m in history if m.get("role") != "system"]
         if msgs:
-            to_save[str(uid)] = msgs[-MAX_HISTORY_MESSAGES:]
-    _save_json(HISTORY_FILE, to_save)
+            save_history_db(uid, msgs[-MAX_HISTORY_MESSAGES:])
 
 def restore_histories() -> None:
-    for uid_str, msgs in _load_json(HISTORY_FILE, {}).items():
-        uid = int(uid_str)
-        chat_histories[uid] = [get_system_prompt(uid)] + msgs
+    pass  # буде відновлено ліниво при першому зверненні
 
 def get_history(user_id: int) -> list:
     if user_id not in chat_histories:
-        chat_histories[user_id] = [get_system_prompt(user_id)]
+        msgs = load_history_db(user_id)
+        chat_histories[user_id] = [get_system_prompt(user_id)] + msgs
     return chat_histories[user_id]
 
 async def _compress_history(user_id: int) -> None:
@@ -438,28 +526,27 @@ async def append_and_trim(user_id: int, role: str, content) -> None:
 
 # ── Tasks ─────────────────────────────────────────────────────────────────────
 
-def get_user_tasks(user_id: int) -> list:
-    return _load_json(TASKS_FILE, {}).get(str(user_id), [])
-
-def set_user_tasks(user_id: int, tasks: list) -> None:
-    all_tasks = _load_json(TASKS_FILE, {})
-    all_tasks[str(user_id)] = tasks
-    _save_json(TASKS_FILE, all_tasks)
+def _tasks_keyboard(tasks: list) -> InlineKeyboardMarkup:
+    buttons = []
+    for i, t in enumerate(tasks):
+        icon = "✅" if t.get("done") else "⬜"
+        buttons.append([
+            InlineKeyboardButton(f"{icon} {t['text'][:30]}", callback_data=f"task_toggle_{i}"),
+            InlineKeyboardButton("🗑", callback_data=f"task_del_{i}"),
+        ])
+    buttons.append([InlineKeyboardButton("➕ Додати", callback_data="task_add")])
+    return InlineKeyboardMarkup(buttons)
 
 async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     args    = ctx.args or []
     tasks   = get_user_tasks(user_id)
+
     if not args:
-        if not tasks:
-            await update.message.reply_text("📋 Список задач порожній.\n\nДодати: /tasks add Назва")
-            return
-        lines = ["📋 Твої задачі:\n"]
-        for i, t in enumerate(tasks, 1):
-            lines.append(f"{'✅' if t.get('done') else '⬜'} {i}. {t['text']}")
-        lines.append("\n/tasks add текст | done N | del N | clear")
-        await update.message.reply_text("\n".join(lines))
+        text = "📋 *Твої задачі:*\n\nНатисни ⬜ щоб виконати, 🗑 щоб видалити." if tasks else "📋 Список задач порожній."
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_tasks_keyboard(tasks))
         return
+
     cmd = args[0].lower()
     if cmd == "add":
         task_text = " ".join(args[1:])
@@ -468,7 +555,7 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         tasks.append({"text": task_text, "done": False})
         set_user_tasks(user_id, tasks)
-        await update.message.reply_text(f"✅ Додано: {task_text}")
+        await update.message.reply_text(f"✅ Додано: {task_text}", reply_markup=_tasks_keyboard(tasks))
     elif cmd in ("done", "del"):
         if len(args) < 2 or not args[1].isdigit():
             await update.message.reply_text(f"Вкажи номер: /tasks {cmd} 1")
@@ -480,16 +567,41 @@ async def handle_tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if cmd == "done":
             tasks[n]["done"] = True
             set_user_tasks(user_id, tasks)
-            await update.message.reply_text(f"✅ Виконано: {tasks[n]['text']}")
+            await update.message.reply_text(f"✅ Виконано: {tasks[n]['text']}", reply_markup=_tasks_keyboard(tasks))
         else:
             removed = tasks.pop(n)
             set_user_tasks(user_id, tasks)
-            await update.message.reply_text(f"🗑️ Видалено: {removed['text']}")
+            await update.message.reply_text(f"🗑️ Видалено: {removed['text']}", reply_markup=_tasks_keyboard(tasks))
     elif cmd == "clear":
         set_user_tasks(user_id, [])
         await update.message.reply_text("🗑️ Список очищено.")
     else:
         await update.message.reply_text("❓ Команди: add / done N / del N / clear")
+
+async def handle_task_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    user_id = query.from_user.id
+    data    = query.data
+    tasks   = get_user_tasks(user_id)
+    await query.answer()
+
+    if data.startswith("task_toggle_"):
+        n = int(data.split("_")[-1])
+        if 0 <= n < len(tasks):
+            tasks[n]["done"] = not tasks[n]["done"]
+            set_user_tasks(user_id, tasks)
+            await query.edit_message_reply_markup(reply_markup=_tasks_keyboard(tasks))
+
+    elif data.startswith("task_del_"):
+        n = int(data.split("_")[-1])
+        if 0 <= n < len(tasks):
+            removed = tasks.pop(n)
+            set_user_tasks(user_id, tasks)
+            text = "📋 *Твої задачі:*" if tasks else "📋 Список задач порожній."
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=_tasks_keyboard(tasks))
+
+    elif data == "task_add":
+        await query.message.reply_text("Напиши задачу: /tasks add текст")
 
 # ── Intent detection ──────────────────────────────────────────────────────────
 
@@ -505,7 +617,6 @@ _URL_RE = re.compile(r'https?://\S+')
 def detect_intent_local(text: str) -> str | None:
     t = text.lower()
     scores: dict[str, int] = {k: 0 for k in ("image","reminder","translate","recipe","generate","edit","task","summarize","search")}
-
     for intent, keywords, weight in [
         ("image",     IMAGE_KEYWORDS,     2),
         ("reminder",  REMIND_KEYWORDS,    2),
@@ -520,7 +631,6 @@ def detect_intent_local(text: str) -> str | None:
         for kw in keywords:
             if kw in t:
                 scores[intent] += weight
-
     for intent in ("edit", "generate"):
         if scores[intent] > 0:
             kw_list = EDIT_KEYWORDS if intent == "edit" else GENERATE_KEYWORDS
@@ -530,12 +640,10 @@ def detect_intent_local(text: str) -> str | None:
             )
             if not has_content:
                 scores[intent] = 0
-
     if _URL_RE.search(text):
         scores["summarize"] += 3
     if not _TIME_RE.search(t):
         scores["reminder"] = 0
-
     best       = max(scores, key=lambda k: scores[k])
     best_score = scores[best]
     if best_score == 0:
@@ -549,9 +657,9 @@ async def detect_intent_ai(text: str) -> str:
         f"Визнач намір повідомлення: '{text}'\n"
         "Відповідай ТІЛЬКИ одним словом:\n"
         "reminder|image|search|translate|summarize|generate|edit|recipe|task|chat\n"
-        "- image: якщо людина просить намалювати, згенерувати, створити або зобразити будь-яке зображення/картинку/фото, навіть з опечатками або в конкретному стилі\n"
+        "- image: якщо людина просить намалювати, згенерувати, створити або зобразити будь-яке зображення/картинку/фото\n"
         "- reminder: ТІЛЬКИ якщо є конкретний час або дата\n"
-        "- chat: все інше, включаючи питання і розмову"
+        "- chat: все інше"
     )}])
     return result.strip().lower().strip("'\"")
 
@@ -746,26 +854,26 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
 # ── Image generation ──────────────────────────────────────────────────────────
 
 STYLE_HINTS: dict[str, str] = {
-    "mewgenics":       "mewgenics indie game pixel art style, chunky pixels, limited color palette, retro 16-bit aesthetic, cat characters",
-    "ghibli":          "Studio Ghibli anime style, soft watercolor backgrounds, hand-drawn look, warm pastel colors",
-    "cyberpunk":       "cyberpunk style, neon lights, dark dystopian city, rain reflections, high contrast",
-    "vaporwave":       "vaporwave aesthetic, pink and purple gradient, retro 80s, glitch effects, synthwave",
-    "comic":           "comic book style, bold outlines, halftone dots, flat colors, dynamic poses",
-    "watercolor":      "watercolor painting style, soft edges, translucent washes, paper texture",
-    "oil painting":    "oil painting style, rich textures, visible brushstrokes, classical composition",
-    "pixel art":       "pixel art style, 16-bit retro, chunky pixels, limited color palette",
-    "anime":           "anime style, cel shading, large expressive eyes, vibrant colors, clean lines",
-    "noir":            "film noir style, black and white, high contrast shadows, dramatic lighting",
-    "minimalist":      "minimalist style, clean lines, flat colors, simple shapes, lots of whitespace",
-    "surrealism":      "surrealist style, dreamlike, impossible scenes, Salvador Dali inspired",
-    "low poly":        "low poly 3D style, geometric shapes, flat shading, triangulated surfaces",
-    "sketch":          "pencil sketch style, hand-drawn lines, crosshatching, monochrome",
-    "ukiyo-e":         "ukiyo-e Japanese woodblock print style, bold outlines, flat colors, traditional",
-    "impressionism":   "impressionist painting style, visible brushstrokes, light and color focus, Monet inspired",
-    "pop art":         "pop art style, bold colors, Ben-Day dots, Andy Warhol inspired, high contrast",
-    "sticker":         "sticker art style, thick white outline, flat colors, cute cartoon, glossy look",
-    "claymation":      "claymation style, clay texture, 3D molded look, soft rounded shapes, stop motion",
-    "concept art":     "concept art style, detailed environment, cinematic lighting, professional illustration",
+    "mewgenics":     "mewgenics indie game pixel art style, chunky pixels, limited color palette, retro 16-bit aesthetic, cat characters",
+    "ghibli":        "Studio Ghibli anime style, soft watercolor backgrounds, hand-drawn look, warm pastel colors",
+    "cyberpunk":     "cyberpunk style, neon lights, dark dystopian city, rain reflections, high contrast",
+    "vaporwave":     "vaporwave aesthetic, pink and purple gradient, retro 80s, glitch effects, synthwave",
+    "comic":         "comic book style, bold outlines, halftone dots, flat colors, dynamic poses",
+    "watercolor":    "watercolor painting style, soft edges, translucent washes, paper texture",
+    "oil painting":  "oil painting style, rich textures, visible brushstrokes, classical composition",
+    "pixel art":     "pixel art style, 16-bit retro, chunky pixels, limited color palette",
+    "anime":         "anime style, cel shading, large expressive eyes, vibrant colors, clean lines",
+    "noir":          "film noir style, black and white, high contrast shadows, dramatic lighting",
+    "minimalist":    "minimalist style, clean lines, flat colors, simple shapes, lots of whitespace",
+    "surrealism":    "surrealist style, dreamlike, impossible scenes, Salvador Dali inspired",
+    "low poly":      "low poly 3D style, geometric shapes, flat shading, triangulated surfaces",
+    "sketch":        "pencil sketch style, hand-drawn lines, crosshatching, monochrome",
+    "ukiyo-e":       "ukiyo-e Japanese woodblock print style, bold outlines, flat colors, traditional",
+    "impressionism": "impressionist painting style, visible brushstrokes, light and color focus, Monet inspired",
+    "pop art":       "pop art style, bold colors, Ben-Day dots, Andy Warhol inspired, high contrast",
+    "sticker":       "sticker art style, thick white outline, flat colors, cute cartoon, glossy look",
+    "claymation":    "claymation style, clay texture, 3D molded look, soft rounded shapes, stop motion",
+    "concept art":   "concept art style, detailed environment, cinematic lighting, professional illustration",
 }
 
 def _enrich_prompt_with_style(prompt: str, style_hint: str) -> str:
@@ -804,20 +912,16 @@ async def _build_image_prompt(user_request: str, ctx_desc: str = "") -> str:
             f"You are a prompt engineer for an image generation model.\n"
             f"Base subject (keep exactly as described): {ctx_desc[:300]}\n"
             f"Apply this modification or style: {user_request}\n\n"
-            f"Rules:\n"
-            f"- Write the prompt in ENGLISH only.\n"
-            f"- Translate LITERALLY — do NOT soften, sanitize or reinterpret.\n"
-            f"- Describe only visual elements. Be specific. Max 60 words.\n"
+            f"Rules:\n- Write the prompt in ENGLISH only.\n"
+            f"- Translate LITERALLY. Describe only visual elements. Max 60 words.\n"
             f"- Return ONLY the prompt, no explanations."
         )
     else:
         instruction = (
             f"You are a prompt engineer for an image generation model.\n"
-            f"Translate this image request to ENGLISH ONLY — do NOT soften, "
-            f"sanitize or reinterpret the request in any way.\n"
+            f"Translate this image request to ENGLISH ONLY.\n"
             f"Be specific and concrete. Max 60 words.\n"
-            f"Return ONLY the English prompt, no explanations.\n\n"
-            f"Request: {user_request}"
+            f"Return ONLY the English prompt, no explanations.\n\nRequest: {user_request}"
         )
     translation = await _call_ai_english(instruction)
     translation = _enrich_prompt_with_style(translation, user_request)
@@ -832,10 +936,7 @@ async def generate_image(prompt: str) -> bytes:
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=180) as client:
-                r = await client.post(
-                    url, headers=headers,
-                    json={"prompt": prompt, "num_steps": FLUX_STEPS},
-                )
+                r = await client.post(url, headers=headers, json={"prompt": prompt, "num_steps": FLUX_STEPS})
                 r.raise_for_status()
             if "image" in r.headers.get("content-type", ""):
                 return r.content
@@ -877,19 +978,15 @@ async def extract_video_frames(video_bytes: bytes, max_frames: int = 3) -> list[
 async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> str:
     sys_prompt = get_active_system_prompt(user_id)
     results    = []
-    log.info("analyze_video: start, size=%d bytes", len(video_bytes))
     try:
-        audio = await extract_video_audio(video_bytes)
-        log.info("analyze_video: audio extracted, size=%d", len(audio))
+        audio      = await extract_video_audio(video_bytes)
         transcript = await transcribe_voice(audio)
-        log.info("analyze_video: transcript='%s'", transcript[:100] if transcript else "")
         if transcript:
             results.append(f"🎤 Аудіо:\n{transcript}")
     except Exception as e:
         log.warning("analyze_video audio failed: %s", e)
     try:
         frames = await extract_video_frames(video_bytes)
-        log.info("analyze_video: extracted %d frames", len(frames))
         if frames:
             descs = []
             for i, frame in enumerate(frames):
@@ -903,7 +1000,6 @@ async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> s
     except Exception as e:
         log.warning("analyze_video frames failed: %s", e)
     if not results:
-        log.error("analyze_video: no results at all — ffmpeg missing or file corrupt?")
         return "❌ Не вдалось проаналізувати відео."
     combined = "\n\n".join(results)
     summary  = await call_ai([sys_prompt, {"role": "user", "content": f"Запит: {caption}\n\nДані відео:\n{combined}\n\nВідповідай українською."}])
@@ -1024,16 +1120,16 @@ async def do_summarize(text: str) -> str:
     return await call_ai([{"role": "user", "content": prompt}])
 
 TEXT_GENRES = {
-    "лист":      "діловий лист — вступ, суть, підпис",
-    "резюме":    "резюме — контакти, досвід, освіта, навички",
-    "пост":      "пост для соцмереж — живий, із закликом до дії",
-    "оголошення":"оголошення — заголовок, суть, контакти",
-    "стаття":    "стаття — заголовок, вступ, підзаголовки, висновок",
-    "опис":      "опис — образний, деталізований",
-    "оповідання":"оповідання — зав'язка, кульмінація, розв'язка",
-    "есе":       "есе — теза, аргументи, висновок",
-    "слоган":    "слоган — короткий, запам'ятовуваний",
-    "біографія": "біографія — хронологічний виклад",
+    "лист":       "діловий лист — вступ, суть, підпис",
+    "резюме":     "резюме — контакти, досвід, освіта, навички",
+    "пост":       "пост для соцмереж — живий, із закликом до дії",
+    "оголошення": "оголошення — заголовок, суть, контакти",
+    "стаття":     "стаття — заголовок, вступ, підзаголовки, висновок",
+    "опис":       "опис — образний, деталізований",
+    "оповідання": "оповідання — зав'язка, кульмінація, розв'язка",
+    "есе":        "есе — теза, аргументи, висновок",
+    "слоган":     "слоган — короткий, запам'ятовуваний",
+    "біографія":  "біографія — хронологічний виклад",
 }
 
 def detect_genre(text: str) -> str:
@@ -1046,13 +1142,12 @@ async def do_generate(text: str) -> str:
     return await call_ai([SYSTEM_PROMPT, {"role": "user", "content": (
         f"Виконай завдання з генерації тексту: {text}{genre_tip}\n\n"
         "Пиши грамотно, українською. Дотримуйся жанрових канонів.\n\n"
-        "ФОРМАТУВАННЯ: ## заголовки, **жирний**, - списки. Без таблиць і горизонтальних ліній."
+        "ФОРМАТУВАННЯ: ## заголовки, **жирний**, - списки."
     )}])
 
 async def do_edit(text: str) -> str:
     return await call_ai([SYSTEM_PROMPT, {"role": "user", "content": (
-        f"Відредагуй текст: {text}\n\n"
-        "Зберігай зміст, виправляй русизми, адаптуй стиль. Поверни ТІЛЬКИ текст.\n"
+        f"Відредагуй текст: {text}\n\nЗберігай зміст, виправляй русизми. Поверни ТІЛЬКИ текст.\n"
         "ФОРМАТУВАННЯ: ## заголовки, **жирний**, - списки."
     )}])
 
@@ -1076,60 +1171,45 @@ async def do_task_nlp(update: Update, user_id: int, text: str) -> None:
             if task_text:
                 tasks.append({"text": task_text, "done": False})
                 set_user_tasks(user_id, tasks)
-                await update.message.reply_text(f"✅ Додано: {task_text}")
+                await update.message.reply_text(f"✅ Додано: {task_text}", reply_markup=_tasks_keyboard(tasks))
         elif action in ("done", "del"):
             n = (data.get("number") or 1) - 1
             if 0 <= n < len(tasks):
                 if action == "done":
                     tasks[n]["done"] = True
                     set_user_tasks(user_id, tasks)
-                    await update.message.reply_text(f"✅ Виконано: {tasks[n]['text']}")
+                    await update.message.reply_text(f"✅ Виконано: {tasks[n]['text']}", reply_markup=_tasks_keyboard(tasks))
                 else:
                     removed = tasks.pop(n)
                     set_user_tasks(user_id, tasks)
-                    await update.message.reply_text(f"🗑️ Видалено: {removed['text']}")
+                    await update.message.reply_text(f"🗑️ Видалено: {removed['text']}", reply_markup=_tasks_keyboard(tasks))
             else:
                 await update.message.reply_text("❌ Невірний номер.")
         elif action == "list":
-            if not tasks:
-                await update.message.reply_text("📋 Список порожній.")
-                return
-            lines = ["📋 Задачі:\n"] + [
-                f"{'✅' if t.get('done') else '⬜'} {i}. {t['text']}"
-                for i, t in enumerate(tasks, 1)
-            ]
-            await update.message.reply_text("\n".join(lines))
+            text_msg = "📋 *Твої задачі:*" if tasks else "📋 Список порожній."
+            await update.message.reply_text(text_msg, parse_mode="Markdown", reply_markup=_tasks_keyboard(tasks))
     except Exception as e:
         log.warning("do_task_nlp: %s", e)
         await update.message.reply_text("❌ Не вдалось. Спробуй /tasks")
 
 # ── Reminders ─────────────────────────────────────────────────────────────────
 
-def load_reminders() -> list:
-    return _load_json(REMINDERS_FILE, [])
-
-def save_reminders(reminders: list) -> None:
-    _save_json(REMINDERS_FILE, reminders)
-
-async def _fire_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> None:
-    await asyncio.sleep(max(0, (fire_at - now_kyiv()).total_seconds()))
+async def _fire_reminder(bot, rid: int, chat_id: int, text: str, fire_at: datetime) -> None:
+    delay = (fire_at - now_kyiv()).total_seconds()
+    if delay > 0:
+        await asyncio.sleep(delay)
     try:
         await bot.send_message(chat_id=chat_id, text=f"🔔 Нагадування: {text}")
     except Exception as e:
         log.warning("_fire_reminder: %s", e)
-    save_reminders([
-        r for r in load_reminders()
-        if not (r["chat_id"] == chat_id and r["text"] == text and r["fire_at"] == fire_at.isoformat())
-    ])
+    delete_reminder(rid)
 
 async def schedule_reminder(bot, chat_id: int, text: str, fire_at: datetime) -> None:
-    reminders = load_reminders()
-    reminders.append({"chat_id": chat_id, "text": text, "fire_at": fire_at.isoformat()})
-    save_reminders(reminders)
-    asyncio.create_task(_fire_reminder(bot, chat_id, text, fire_at))
+    rid = add_reminder(chat_id, text, fire_at)
+    asyncio.create_task(_fire_reminder(bot, rid, chat_id, text, fire_at))
 
 async def restore_reminders(bot) -> None:
-    now, valid = now_kyiv(), []
+    now = now_kyiv()
     for r in load_reminders():
         fi = datetime.fromisoformat(r["fire_at"])
         if fi.tzinfo is None:
@@ -1139,10 +1219,57 @@ async def restore_reminders(bot) -> None:
                 await bot.send_message(chat_id=r["chat_id"], text=f"🔔 Пропущене нагадування: {r['text']}")
             except Exception as e:
                 log.warning("restore_reminders: %s", e)
+            delete_reminder(r["id"])
         else:
-            valid.append(r)
-            asyncio.create_task(_fire_reminder(bot, r["chat_id"], r["text"], fi))
-    save_reminders(valid)
+            asyncio.create_task(_fire_reminder(bot, r["id"], r["chat_id"], r["text"], fi))
+
+# ── Daily brief ───────────────────────────────────────────────────────────────
+
+async def send_daily_brief(bot) -> None:
+    if not BRIEF_CHAT_ID:
+        return
+    try:
+        chat_id = int(BRIEF_CHAT_ID)
+        tasks   = get_user_tasks(chat_id)
+        pending = [t["text"] for t in tasks if not t.get("done")]
+
+        news_results  = await search_web("головні новини України сьогодні")
+        weather_results = await search_web("погода Київ сьогодні")
+
+        tasks_block = (
+            "📋 *Задачі на сьогодні:*\n" + "\n".join(f"• {t}" for t in pending)
+            if pending else "📋 Задач немає."
+        )
+
+        brief = await call_ai([
+            get_active_system_prompt(chat_id),
+            {"role": "user", "content": (
+                f"Зроби короткий ранковий бриф у стилі J.A.R.V.I.S. для свого користувача.\n\n"
+                f"Поточний час: {now_kyiv().strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"Новини:\n{news_results[:1500]}\n\n"
+                f"Погода:\n{weather_results[:500]}\n\n"
+                f"Незакриті задачі: {', '.join(pending) if pending else 'немає'}\n\n"
+                "Формат: вітання + погода (1 речення) + топ-3 новини + задачі. Стисло, по суті."
+            )},
+        ])
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"🌅 *Добрий ранок, сер*\n\n{clean_markdown(brief)}\n\n{tasks_block}",
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        log.error("send_daily_brief: %s", e)
+
+async def _brief_scheduler(bot) -> None:
+    while True:
+        now  = now_kyiv()
+        next_brief = now.replace(hour=BRIEF_HOUR, minute=0, second=0, microsecond=0)
+        if now >= next_brief:
+            next_brief += timedelta(days=1)
+        await asyncio.sleep((next_brief - now).total_seconds())
+        await send_daily_brief(bot)
+
+# ── Gender detection ──────────────────────────────────────────────────────────
 
 async def detect_gender_from_transcript(text: str) -> str | None:
     if not text:
@@ -1197,69 +1324,70 @@ async def _process_message(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     user_id: int, user_text: str, voice_msg=None,
 ) -> None:
-    prefix = f"🎤 Ти сказав: {user_text}\n\n" if voice_msg else ""
+    async with _get_lock(user_id):
+        prefix = f"🎤 Ти сказав: {user_text}\n\n" if voice_msg else ""
 
-    try:
-        preprocessed = await asyncio.wait_for(preprocess_query(user_id, user_text), timeout=15)
-    except Exception:
-        preprocessed = user_text
-
-    try:
-        enriched = await asyncio.wait_for(resolve_text_with_context(user_id, preprocessed), timeout=15)
-    except Exception:
-        enriched = preprocessed
-
-    try:
-        intent = await asyncio.wait_for(detect_intent(enriched), timeout=15)
-    except Exception:
-        intent = "chat"
-
-    emotion = detect_emotion(user_text)
-
-    if intent == "chat" and needs_support_first(emotion, user_text) and not voice_msg:
         try:
-            support = await asyncio.wait_for(call_ai([
-                build_dynamic_prompt(user_id, emotion),
-                {"role": "user", "content": f"{user_text}\n\nВизнай почуття людини одним-двома реченнями, потім запитай чим допомогти."},
-            ]), timeout=30)
-            await _send_chunk(update, clean_markdown(support))
-            _set_ctx(user_id, user_text, support)
+            preprocessed = await asyncio.wait_for(preprocess_query(user_id, user_text), timeout=15)
+        except Exception:
+            preprocessed = user_text
+
+        try:
+            enriched = await asyncio.wait_for(resolve_text_with_context(user_id, preprocessed), timeout=15)
+        except Exception:
+            enriched = preprocessed
+
+        try:
+            intent = await asyncio.wait_for(detect_intent(enriched), timeout=15)
+        except Exception:
+            intent = "chat"
+
+        emotion = detect_emotion(user_text)
+
+        if intent == "chat" and needs_support_first(emotion, user_text) and not voice_msg:
+            try:
+                support = await asyncio.wait_for(call_ai([
+                    build_dynamic_prompt(user_id, emotion),
+                    {"role": "user", "content": f"{user_text}\n\nВизнай почуття людини одним-двома реченнями, потім запитай чим допомогти."},
+                ]), timeout=30)
+                await _send_chunk(update, clean_markdown(support))
+                _set_ctx(user_id, user_text, support)
+                return
+            except Exception as e:
+                log.warning("support reply: %s", e)
+
+        if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent, voice_msg=voice_msg):
             return
-        except Exception as e:
-            log.warning("support reply: %s", e)
 
-    if await _dispatch_intent(update, ctx, user_id, user_text, enriched, intent, voice_msg=voice_msg):
-        return
+        await append_and_trim(user_id, "user", enriched)
 
-    await append_and_trim(user_id, "user", enriched)
+        try:
+            dynamic_prompt = build_dynamic_prompt(user_id, emotion)
+        except Exception:
+            dynamic_prompt = get_system_prompt(user_id)
 
-    try:
-        dynamic_prompt = build_dynamic_prompt(user_id, emotion)
-    except Exception:
-        dynamic_prompt = get_system_prompt(user_id)
+        history  = get_history(user_id)
+        messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
 
-    history  = get_history(user_id)
-    messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
+        try:
+            reply = await asyncio.wait_for(call_ai(messages), timeout=60)
+        except (asyncio.TimeoutError, RuntimeError) as e:
+            log.error("call_ai failed: %s", e)
+            reply = "Щось пішло не так. Спробуй ще раз."
 
-    try:
-        reply = await asyncio.wait_for(call_ai(messages), timeout=60)
-    except (asyncio.TimeoutError, RuntimeError) as e:
-        log.error("call_ai failed: %s", e)
-        reply = "Щось пішло не так. Спробуй ще раз."
+        await append_and_trim(user_id, "assistant", reply)
 
-    await append_and_trim(user_id, "assistant", reply)
+        full_reply = clean_markdown(f"{prefix}{reply}".strip())
+        chunks     = [full_reply[i:i + MSG_CHUNK_SIZE] for i in range(0, max(len(full_reply), 1), MSG_CHUNK_SIZE)]
+        for j, chunk in enumerate(chunks):
+            await _send_chunk(update, chunk, voice_msg=voice_msg if j == 0 else None)
 
-    full_reply = clean_markdown(f"{prefix}{reply}".strip())
-    chunks     = [full_reply[i:i + MSG_CHUNK_SIZE] for i in range(0, max(len(full_reply), 1), MSG_CHUNK_SIZE)]
-    for j, chunk in enumerate(chunks):
-        await _send_chunk(update, chunk, voice_msg=voice_msg if j == 0 else None)
+        _set_ctx(user_id, user_text, reply)
+        asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
 
-    _set_ctx(user_id, user_text, reply)
-    asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
-
-    user_msgs = [m for m in get_history(user_id) if m.get("role") == "user"]
-    if len(user_msgs) % STYLE_UPDATE_INTERVAL == 0:
-        asyncio.create_task(update_communication_style(user_id))
+        user_msgs = [m for m in get_history(user_id) if m.get("role") == "user"]
+        if len(user_msgs) % STYLE_UPDATE_INTERVAL == 0:
+            asyncio.create_task(update_communication_style(user_id))
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
@@ -1270,13 +1398,11 @@ async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
         if kw in t:
             prompt = text[t.index(kw) + len(kw):].strip()
             break
-    prompt = prompt or text
-
-    ctx     = last_context.get(user_id)
+    prompt   = prompt or text
+    ctx      = last_context.get(user_id)
     ctx_desc = ""
     if ctx and ctx.get("type") in ("фото", "відео"):
         ctx_desc = ctx["description"][:400]
-
     try:
         final_prompt = await _build_image_prompt(prompt, ctx_desc)
         img_bytes    = await generate_image(final_prompt)
@@ -1358,11 +1484,11 @@ async def _dispatch_intent(
         return True
 
     INTENT_MAP = {
-        "translate": ("🌐 Перекладаю...",    do_translate, True),
-        "summarize": ("📰 Опрацьовую...",     do_summarize, True),
-        "generate":  ("✍️ Генерую текст...",  do_generate,  True),
-        "edit":      ("✏️ Редагую...",         do_edit,      True),
-        "recipe":    ("🍳 Рецепти...",          do_recipe,    True),
+        "translate": ("🌐 Перекладаю...",   do_translate, True),
+        "summarize": ("📰 Опрацьовую...",    do_summarize, True),
+        "generate":  ("✍️ Генерую текст...", do_generate,  True),
+        "edit":      ("✏️ Редагую...",        do_edit,      True),
+        "recipe":    ("🍳 Рецепти...",         do_recipe,    True),
     }
     if intent in INTENT_MAP:
         status_text, fn, use_markdown = INTENT_MAP[intent]
@@ -1392,7 +1518,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Список задач 📋\n• Аналізую фото та відео 🎬\n"
         "• Генерую зображення 🎨\n• Голосові повідомлення 🎤\n"
         "• Шукаю в інтернеті 🔍\n• Читаю PDF, Excel, Word 📄\n"
-        "• Нагадування 🔔\n\n"
+        "• Нагадування 🔔\n• Щоденний бриф о 8:00 🌅\n\n"
         "Чим можу допомогти, сер?\n/help — команди"
     )
 
@@ -1407,7 +1533,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "✍️ /generate резюме/лист/пост — генерація тексту\n"
         "✏️ /edit інструкція: текст — редагування\n"
         "🍳 /recipe інгредієнти — рецепти\n"
-        "📋 /tasks — список задач\n\n"
+        "📋 /tasks — список задач\n"
+        "🌅 /brief — щоденний бриф зараз\n\n"
         "⚙️ Налаштування:\n\n"
         "🎭 /mode — стиль бота\n"
         "🧠 /memory — що бот пам'ятає\n"
@@ -1418,49 +1545,10 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "💡 Або просто пиши природною мовою!"
     )
 
-async def translate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(ctx.args)
-    if not text:
-        await update.message.reply_text("Використання: /translate текст")
-        return
-    msg = await update.message.reply_text("🌐 Перекладаю...")
-    await _send_or_edit(msg, clean_markdown(await do_translate(text)))
-
-async def summarize_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(ctx.args)
-    if not text:
-        await update.message.reply_text("Використання: /summarize https://... або текст")
-        return
-    msg = await update.message.reply_text("📰 Опрацьовую...")
-    await _send_or_edit(msg, clean_markdown(await do_summarize(text)))
-
-async def generate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(ctx.args)
-    if not text:
-        await update.message.reply_text("Використання: /generate резюме для розробника")
-        return
-    msg = await update.message.reply_text("✍️ Генерую...")
-    await _send_or_edit(msg, clean_markdown(await do_generate(text)))
-
-async def edit_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(ctx.args)
-    if not text:
-        await update.message.reply_text("Використання: /edit скороти: [текст]")
-        return
-    msg = await update.message.reply_text("✏️ Редагую...")
-    await _send_or_edit(msg, clean_markdown(await do_edit(text)))
-
-async def recipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(ctx.args)
-    if not text:
-        await update.message.reply_text("Використання: /recipe картопля яйця цибуля")
-        return
-    msg = await update.message.reply_text("🍳 Рецепти...")
-    await _send_or_edit(msg, clean_markdown(await do_recipe(text)))
-
 async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     current = user_personalities.get(user_id, "jarvis")
+
     if ctx.args:
         mode = ctx.args[0].lower()
         if mode not in PERSONALITIES:
@@ -1471,21 +1559,48 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_histories[user_id] = [get_system_prompt(user_id)]
         p = PERSONALITIES[mode]
         await update.message.reply_text(f"{p['emoji']} Режим: {p['name']}")
-    else:
-        descriptions = {
-            "normal":     "збалансований J.A.R.V.I.S.",
-            "jarvis":     "стриманий ШІ-помічник Тоні Старка — спокійний, іронічний, відданий",
-            "funny":      "легкий гумор",
-            "serious":    "факт → обґрунтування → висновок",
-            "business":   "суть → аргументи → дія",
-            "literary":   "художній стиль, метафори",
-            "journalist": "заголовок → лід → факти → висновок",
-        }
-        lines = ["🎭 Режими:\n"]
-        for key, p in PERSONALITIES.items():
-            active = "  ✅" if key == current else ""
-            lines.append(f"{p['emoji']} /mode {key} — {p['name']}: {descriptions.get(key,'')}{active}")
-        await update.message.reply_text("\n".join(lines))
+        return
+
+    # Inline-кнопки для вибору режиму
+    buttons = []
+    for key, p in PERSONALITIES.items():
+        mark = " ✅" if key == current else ""
+        buttons.append([InlineKeyboardButton(
+            f"{p['emoji']} {p['name']}{mark}",
+            callback_data=f"mode_{key}",
+        )])
+    await update.message.reply_text(
+        "🎭 Обери режим:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+async def handle_mode_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    user_id = query.from_user.id
+    mode    = query.data.replace("mode_", "")
+    await query.answer()
+
+    if mode not in PERSONALITIES:
+        return
+
+    user_personalities[user_id] = mode
+    update_user_memory(user_id, {"mode": mode})
+    chat_histories[user_id] = [get_system_prompt(user_id)]
+    p = PERSONALITIES[mode]
+
+    # Оновлюємо кнопки — відмічаємо активний
+    buttons = []
+    for key, pers in PERSONALITIES.items():
+        mark = " ✅" if key == mode else ""
+        buttons.append([InlineKeyboardButton(
+            f"{pers['emoji']} {pers['name']}{mark}",
+            callback_data=f"mode_{key}",
+        )])
+    await query.edit_message_text(
+        f"🎭 Обери режим:\n\n_{p['emoji']} {p['name']} активовано_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mem = get_user_memory(update.message.from_user.id)
@@ -1507,12 +1622,12 @@ async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 async def forget_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    memory = _load_json(MEMORY_FILE, {})
-    memory.pop(str(update.message.from_user.id), None)
-    _save_json(MEMORY_FILE, memory)
+    uid = update.message.from_user.id
+    with _db() as con:
+        con.execute("DELETE FROM memory WHERE user_id=?", (uid,))
     await update.message.reply_text("🗑️ Пам'ять очищено.")
 
-async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def handle_image_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(ctx.args)
     if not prompt:
         await update.message.reply_text("Напиши що намалювати: /image захід сонця")
@@ -1524,7 +1639,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_photo(photo=img_bytes)
         await msg.delete()
     except Exception as e:
-        log.error("handle_image: %s", e)
+        log.error("handle_image_cmd: %s", e)
         await msg.edit_text("Помилка генерації. Спробуй ще раз.")
 
 async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1571,6 +1686,11 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.error("handle_search: %s", e)
         await msg.edit_text("Помилка пошуку. Спробуй ще раз.")
 
+async def handle_brief_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🌅 Готую бриф...")
+    await send_daily_brief(ctx.bot)
+    await msg.delete()
+
 async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tavily_status = "❌ Не налаштовано"
     if TAVILY_API_KEY:
@@ -1581,18 +1701,59 @@ async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             tavily_status = f"🔴 {str(e)[:50]}"
     await update.message.reply_text(
         f"📊 Статус:\n"
-        f"• AI: Groq (основний) → OpenRouter (резерв)\n"
+        f"• AI: Groq → OpenRouter\n"
         f"• Tavily: {tavily_status}\n"
         f"• Нагадувань: {len(load_reminders())}\n"
-        f"• Активних сесій: {len(chat_histories)}"
+        f"• Активних сесій: {len(chat_histories)}\n"
+        f"• DB: {DB_PATH}"
     )
 
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     chat_histories.pop(uid, None)
     last_context.pop(uid, None)
-    save_histories()
+    save_history_db(uid, [])
     await update.message.reply_text("Історію чату очищено. 🔄")
+
+async def translate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text("Використання: /translate текст")
+        return
+    msg = await update.message.reply_text("🌐 Перекладаю...")
+    await _send_or_edit(msg, clean_markdown(await do_translate(text)))
+
+async def summarize_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text("Використання: /summarize https://... або текст")
+        return
+    msg = await update.message.reply_text("📰 Опрацьовую...")
+    await _send_or_edit(msg, clean_markdown(await do_summarize(text)))
+
+async def generate_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text("Використання: /generate резюме для розробника")
+        return
+    msg = await update.message.reply_text("✍️ Генерую...")
+    await _send_or_edit(msg, clean_markdown(await do_generate(text)))
+
+async def edit_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text("Використання: /edit скороти: [текст]")
+        return
+    msg = await update.message.reply_text("✏️ Редагую...")
+    await _send_or_edit(msg, clean_markdown(await do_edit(text)))
+
+async def recipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text("Використання: /recipe картопля яйця цибуля")
+        return
+    msg = await update.message.reply_text("🍳 Рецепти...")
+    await _send_or_edit(msg, clean_markdown(await do_recipe(text)))
 
 # ── Message routing ───────────────────────────────────────────────────────────
 
@@ -1674,6 +1835,16 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.error("handle_video: %s", e)
         await msg.edit_text("Помилка аналізу відео. Спробуй ще раз.")
 
+async def handle_sticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    import random
+    user_id = update.message.from_user.id
+    reaction = random.choice(STICKER_REACTIONS)
+    mem  = get_user_memory(user_id)
+    name = mem.get("name")
+    if name:
+        reaction = reaction.replace("сер", name)
+    await update.message.reply_text(reaction)
+
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc     = update.message.document
     fname   = doc.file_name.lower()
@@ -1732,16 +1903,26 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
-async def post_init(app):
+async def post_init(app) -> None:
+    init_db()
     await restore_reminders(app.bot)
-    restore_histories()
-    for uid, data in _load_json(MEMORY_FILE, {}).items():
+    for uid_str, data in ({} if True else {}).items():  # memory вже в DB
+        pass
+    # Відновлюємо режими з DB
+    with _db() as con:
+        rows = con.execute("SELECT user_id, data FROM memory").fetchall()
+    for row in rows:
+        data = json.loads(row["data"])
         if data.get("mode"):
-            user_personalities[int(uid)] = data["mode"]
-    log.info("Bot initialized")
+            user_personalities[row["user_id"]] = data["mode"]
+    # Запускаємо планувальник брифу
+    asyncio.create_task(_brief_scheduler(app.bot))
+    log.info("Bot initialized, DB=%s", DB_PATH)
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+
+    # Commands
     app.add_handler(CommandHandler("start",     start))
     app.add_handler(CommandHandler("help",      help_cmd))
     app.add_handler(CommandHandler("mode",      mode_cmd))
@@ -1751,16 +1932,24 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("search",    handle_search))
     app.add_handler(CommandHandler("status",    handle_status))
     app.add_handler(CommandHandler("remind",    handle_remind))
-    app.add_handler(CommandHandler("image",     handle_image))
+    app.add_handler(CommandHandler("image",     handle_image_cmd))
     app.add_handler(CommandHandler("translate", translate_cmd))
     app.add_handler(CommandHandler("summarize", summarize_cmd))
     app.add_handler(CommandHandler("generate",  generate_cmd))
     app.add_handler(CommandHandler("edit",      edit_cmd))
     app.add_handler(CommandHandler("recipe",    recipe_cmd))
     app.add_handler(CommandHandler("tasks",     handle_tasks_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
+    app.add_handler(CommandHandler("brief",     handle_brief_cmd))
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(handle_mode_callback, pattern="^mode_"))
+    app.add_handler(CallbackQueryHandler(handle_task_callback, pattern="^task_"))
+
+    # Media
+    app.add_handler(MessageHandler(filters.PHOTO,                        handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE,                        handle_voice))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE,   handle_video))
+    app.add_handler(MessageHandler(filters.Sticker.ALL,                  handle_sticker))
     app.add_handler(MessageHandler(
         filters.Document.PDF |
         filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") |
@@ -1771,5 +1960,6 @@ if __name__ == "__main__":
         handle_document,
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     log.info("Bot started")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
