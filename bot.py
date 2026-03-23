@@ -277,12 +277,12 @@ def _gender_suffix(user_id: int) -> str:
 # ── System prompt helpers ─────────────────────────────────────────────────────
 
 def get_system_prompt(user_id: int) -> dict:
-    mode = user_personalities.get(user_id, "normal")
+    mode = user_personalities.get(user_id, "jarvis")
     p    = PERSONALITIES.get(mode, PERSONALITIES["normal"])
     return {"role": "system", "content": p["prompt"] + _gender_suffix(user_id)}
 
 def build_dynamic_prompt(user_id: int, emotion: str) -> dict:
-    mode  = user_personalities.get(user_id, "normal")
+    mode  = user_personalities.get(user_id, "jarvis")
     p     = PERSONALITIES.get(mode, PERSONALITIES["normal"])
     parts = [p["prompt"] + _gender_suffix(user_id)]
 
@@ -1460,7 +1460,7 @@ async def recipe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    current = user_personalities.get(user_id, "normal")
+    current = user_personalities.get(user_id, "jarvis")
     if ctx.args:
         mode = ctx.args[0].lower()
         if mode not in PERSONALITIES:
