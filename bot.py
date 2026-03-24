@@ -44,7 +44,8 @@ OPENROUTER_API_KEY = _require_env("OPENROUTER_API_KEY")
 GROQ_API_KEY       = _require_env("GROQ_API_KEY")
 TAVILY_API_KEY     = _require_env("TAVILY_API_KEY")
 CF_API_TOKEN       = _require_env("CF_API_TOKEN")
-GOOGLE_API_KEY = _require_env("GOOGLE_API_KEY")   # chat_id куди слати щоденний бриф
+CF_ACCOUNT_ID      = _require_env("CF_ACCOUNT_ID")
+BRIEF_CHAT_ID      = _require_env("BRIEF_CHAT_ID")   # chat_id куди слати щоденний бриф
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is required")
@@ -54,9 +55,6 @@ if not TELEGRAM_TOKEN:
 OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL                  = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL          = "https://api.groq.com/openai/v1/audio/transcriptions"
-GEMINI_URL         = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_PRO_MODEL          = "gemini-2.0-flash"
-GEMINI_FLASH_MODEL        = "gemini-1.5-flash"
 OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"
 OPENROUTER_MODEL_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"
 GROQ_MODEL                = "llama-3.3-70b-versatile"
@@ -115,38 +113,8 @@ def init_db() -> None:
                 text    TEXT NOT NULL,
                 fire_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS session_log (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                summary    TEXT NOT NULL,
-                mood       TEXT
-            );
         """)
     log.info("DB initialized at %s", DB_PATH)
-
-def save_session_log(user_id: int, summary: str, mood: str = "") -> None:
-    with _db() as con:
-        con.execute(
-            "INSERT INTO session_log(user_id, created_at, summary, mood) VALUES(?,?,?,?)",
-            (user_id, now_kyiv().isoformat(), summary[:500], mood),
-        )
-    # Зберігаємо лише останні 30 записів на користувача
-    with _db() as con:
-        con.execute(
-            "DELETE FROM session_log WHERE user_id=? AND id NOT IN "
-            "(SELECT id FROM session_log WHERE user_id=? ORDER BY id DESC LIMIT 30)",
-            (user_id, user_id),
-        )
-
-def get_session_log(user_id: int, limit: int = 5) -> list[dict]:
-    with _db() as con:
-        rows = con.execute(
-            "SELECT created_at, summary, mood FROM session_log "
-            "WHERE user_id=? ORDER BY id DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-    return [dict(r) for r in rows]
 
 # memory
 def get_user_memory(user_id: int) -> dict:
@@ -355,7 +323,6 @@ chat_histories:     dict[int, list] = {}
 user_personalities: dict[int, str]  = {}
 last_context:       dict[int, dict] = {}
 _user_locks:        dict[int, asyncio.Lock] = {}
-_ai_cache:          dict[str, str] = {}  # кеш відповідей AI
 
 def _get_lock(user_id: int) -> asyncio.Lock:
     if user_id not in _user_locks:
@@ -455,15 +422,6 @@ def build_dynamic_prompt(user_id: int, emotion: str) -> dict:
     last_session = mem.get("last_session_summary")
     if last_session:
         parts.append(f"Контекст попередньої розмови: {last_session}")
-
-    # Довга пам'ять — останні сесії
-    sessions = get_session_log(user_id, limit=3)
-    if sessions:
-        log_lines = "; ".join(
-            f"[{s['created_at'][:10]}] {s['summary'][:80]}"
-            for s in sessions
-        )
-        parts.append(f"Історія сесій: {log_lines}")
 
     return {"role": "system", "content": " ".join(parts)}
 
@@ -725,27 +683,14 @@ def detect_intent_local(text: str) -> str | None:
 
 async def detect_intent_ai(text: str) -> str:
     result = await call_ai([{"role": "user", "content": (
-        f"Визнач точний намір повідомлення. Відповідай ТІЛЬКИ одним словом з переліку.\n\n"
-        f"Повідомлення: '{text}'\n\n"
-        "НАМІРИ:\n"
-        "• image — намалювати, згенерувати, створити зображення/фото/картинку/ілюстрацію, навіть з опечатками\n"
-        "• reminder — нагадати про щось у конкретний час або через певний час (ОБОВ'ЯЗКОВО має бути час/дата)\n"
-        "• search — знайти актуальну інформацію в інтернеті, новини, погоду, ціни, курси, події\n"
-        "• translate — перекласти текст з однієї мови на іншу\n"
-        "• summarize — підсумувати статтю, текст або посилання\n"
-        "• generate — написати/створити текст: резюме, лист, пост, оголошення, статтю\n"
-        "• edit — відредагувати, покращити, виправити або переписати існуючий текст\n"
-        "• recipe — знайти рецепт або що приготувати з наявних інгредієнтів\n"
-        "• task — додати, видалити, показати або відмітити задачу зі списку\n"
-        "• chat — все інше: питання, розмова, пояснення, аналіз, порада\n\n"
-        "ПРАВИЛА:\n"
-        "1. Якщо є URL — майже завжди summarize\n"
-        "2. reminder ТІЛЬКИ якщо є явний час (через 30 хв, о 15:00, завтра)\n"
-        "3. search якщо потрібна СВІЖА або ПОТОЧНА інформація\n"
-        "4. chat якщо це питання на яке можна відповісти без інтернету\n"
-        "5. Повертай ТІЛЬКИ одне слово, без пояснень"
+        f"Визнач намір повідомлення: '{text}'\n"
+        "Відповідай ТІЛЬКИ одним словом:\n"
+        "reminder|image|search|translate|summarize|generate|edit|recipe|task|chat\n"
+        "- image: якщо людина просить намалювати, згенерувати, створити або зобразити будь-яке зображення/картинку/фото\n"
+        "- reminder: ТІЛЬКИ якщо є конкретний час або дата\n"
+        "- chat: все інше"
     )}])
-    return result.strip().lower().strip("'\"").split()[0]
+    return result.strip().lower().strip("'\"")
 
 async def detect_intent(text: str) -> str:
     clean = text.split("Запит користувача:")[-1].strip() if "Запит користувача:" in text else text
@@ -877,69 +822,17 @@ _NON_UA_RE = re.compile(
     re.IGNORECASE,
 )
 
-async def _call_gemini(messages: list, model: str) -> str | None:
-    """Виклик Google Gemini через нативний API."""
-    if not GOOGLE_API_KEY:
-        return None
-    try:
-        # Конвертуємо OpenAI формат в Gemini формат
-        gemini_messages = []
-        system_text = ""
-        for m in messages:
-            if m["role"] == "system":
-                system_text = m["content"] if isinstance(m["content"], str) else ""
-            elif m["role"] == "user":
-                content = m["content"] if isinstance(m["content"], str) else str(m["content"])
-                gemini_messages.append({"role": "user", "parts": [{"text": content}]})
-            elif m["role"] == "assistant":
-                content = m["content"] if isinstance(m["content"], str) else str(m["content"])
-                gemini_messages.append({"role": "model", "parts": [{"text": content}]})
-
-        payload: dict = {"contents": gemini_messages}
-        if system_text:
-            payload["system_instruction"] = {"parts": [{"text": system_text}]}
-
-        url = f"{GEMINI_URL}/{model}:generateContent?key={GOOGLE_API_KEY}"
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(url, json=payload)
-        if r.status_code == 429:
-            log.warning("Gemini %s rate limit", model)
-            return None
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        log.warning("Gemini %s failed: %s", model, e)
-        return None
-
 async def call_ai(messages: list) -> str:
-    """
-    Порядок провайдерів:
-    1. Gemini 2.0 Flash
-    2. Gemini 1.5 Flash
-    3. OpenRouter (llama-3.3-70b → llama-3.1-8b)
-    4. Groq (llama-3.3-70b)
-    """
-    # Простий кеш для коротких допоміжних запитів (intent, gender, json)
-    last_msg = messages[-1].get("content", "") if messages else ""
-    if isinstance(last_msg, str) and len(last_msg) < 300 and len(messages) == 1:
-        cache_key = last_msg[:200]
-        if cache_key in _ai_cache:
-            return _ai_cache[cache_key]
-
     result = None
-
-    # 1. Gemini 2.0 Flash
-    result = await _call_gemini(messages, GEMINI_PRO_MODEL)
-    if result:
-        log.debug("Provider: Gemini 2.0 Flash")
-
-    # 2. Gemini 1.5 Flash
-    if result is None:
-        result = await _call_gemini(messages, GEMINI_FLASH_MODEL)
-        if result:
-            log.debug("Provider: Gemini 1.5 Flash")
-
-    # 3. OpenRouter
+    if GROQ_API_KEY:
+        try:
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
+                r.raise_for_status()
+            result = r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            log.warning("Groq failed, trying OpenRouter: %s", e)
     if result is None and OPENROUTER_API_KEY:
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
@@ -950,27 +843,11 @@ async def call_ai(messages: list) -> str:
                     continue
                 r.raise_for_status()
                 result = r.json()["choices"][0]["message"]["content"]
-                log.debug("Provider: OpenRouter %s", model)
                 break
             except Exception as e:
                 log.warning("OpenRouter %s failed: %s", model, e)
-
-    # 4. Groq
-    if result is None and GROQ_API_KEY:
-        try:
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
-            if r.status_code != 429:
-                r.raise_for_status()
-                result = r.json()["choices"][0]["message"]["content"]
-                log.debug("Provider: Groq")
-        except Exception as e:
-            log.warning("Groq failed: %s", e)
-
     if not result or not result.strip():
         raise RuntimeError("All AI providers failed")
-
     if _NON_UA_RE.search(result):
         log.warning("Non-Ukrainian response, retranslating")
         try:
@@ -978,21 +855,13 @@ async def call_ai(messages: list) -> str:
                 {"role": "assistant", "content": result},
                 {"role": "user", "content": "Перефразуй відповідь виключно українською мовою."},
             ]
-            fixed = await _call_gemini(fix, GEMINI_FLASH_MODEL)
-            if fixed:
-                result = fixed
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": fix})
+                r.raise_for_status()
+            result = r.json()["choices"][0]["message"]["content"]
         except Exception as e:
             log.warning("Retranslation failed: %s", e)
-
-    # Зберігаємо в кеш
-    if isinstance(last_msg, str) and len(last_msg) < 300 and len(messages) == 1:
-        _ai_cache[last_msg[:200]] = result
-        if len(_ai_cache) > 100:
-            # Очищаємо старі записи
-            oldest = list(_ai_cache.keys())[:50]
-            for k in oldest:
-                del _ai_cache[k]
-
     return result
 
 async def call_vision(messages: list) -> str:
@@ -1167,36 +1036,18 @@ async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> s
 
 # ── Web search ────────────────────────────────────────────────────────────────
 
-async def search_web(query: str, search_type: str = "general") -> str:
-    """
-    search_type: general | news | weather | price
-    """
+async def search_web(query: str) -> str:
     if TAVILY_API_KEY:
         try:
-            # Параметри залежно від типу пошуку
-            kwargs: dict = {"query": query, "max_results": SEARCH_RESULTS}
-            if search_type == "news":
-                kwargs["topic"] = "news"
-                kwargs["max_results"] = 5
-            elif search_type in ("weather", "price"):
-                kwargs["max_results"] = 3
-
             results = await asyncio.to_thread(
-                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(**kwargs)
+                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query=query, max_results=SEARCH_RESULTS)
             )
-            items = [
-                i for i in results.get("results", [])
-                if not any(bd in i.get("url", "") for bd in BLOCKED_DOMAINS)
-            ]
+            items = [i for i in results.get("results", []) if not any(bd in i.get("url", "") for bd in BLOCKED_DOMAINS)]
             if items:
                 parts = []
                 for i in items:
                     date_str = f" ({i['published_date'][:10]})" if i.get("published_date") else ""
-                    parts.append(
-                        f"Джерело: {i.get('title','').strip()}{date_str}\n"
-                        f"{i.get('content','')[:400].strip()}\n"
-                        f"{i.get('url','').strip()}"
-                    )
+                    parts.append(f"Джерело: {i.get('title','').strip()}{date_str}\n{i.get('content','')[:400].strip()}\n{i.get('url','').strip()}")
                 return "\n\n".join(parts)
         except Exception as e:
             log.warning("Tavily error: %s", e)
@@ -1218,17 +1069,6 @@ async def search_web(query: str, search_type: str = "general") -> str:
     except Exception as e:
         log.warning("DuckDuckGo error: %s", e)
     return ""
-
-def _detect_search_type(query: str) -> str:
-    """Визначає тип пошуку для оптимізації запиту."""
-    q = query.lower()
-    if any(w in q for w in ["новини","новина","подія","події","що сталось","що відбулось"]):
-        return "news"
-    if any(w in q for w in ["погода","температура","дощ","сніг","хмарно"]):
-        return "weather"
-    if any(w in q for w in ["ціна","вартість","коштує","курс","скільки"]):
-        return "price"
-    return "general"
 
 async def fetch_url_text(url: str) -> str:
     try:
@@ -1422,8 +1262,8 @@ async def send_daily_brief(bot) -> None:
         tasks   = get_user_tasks(chat_id)
         pending = [t["text"] for t in tasks if not t.get("done")]
 
-        news_results    = await search_web("головні новини України сьогодні", "news")
-        weather_results = await search_web("погода Рівне Україна сьогодні", "weather")
+        news_results    = await search_web("головні новини України сьогодні")
+        weather_results = await search_web("погода Рівне Україна сьогодні")
 
         tasks_block = ""
         if pending:
@@ -1718,8 +1558,7 @@ async def _dispatch_intent(
                 search_query = (await call_ai([{"role": "user", "content": (
                     f"{enriched}\n\nКороткий пошуковий запит (до 10 слів). ТІЛЬКИ запит."
                 )}])).strip()
-            search_type = _detect_search_type(search_query)
-            results     = await search_web(search_query, search_type)
+            results = await search_web(search_query)
             content = (
                 f"Запит: '{enriched}'\n\nРезультати:\n{results}\n\nВідповідь українською. Вказуй джерела."
                 if results else
@@ -1740,8 +1579,8 @@ async def _dispatch_intent(
             header    = clean_markdown(f"🤖 *J.A.R.V.I.S.* | {date_str}\n{'─' * 28}\n\n")
             await _send_or_edit(msg, header + clean_markdown(f"{prefix}{reply}"), disable_web_page_preview=True)
         except Exception as e:
-            log.error("search dispatch: %s", e, exc_info=True)
-            await msg.edit_text(f"{prefix}Помилка пошуку: {e}")
+            log.error("search dispatch: %s", e)
+            await msg.edit_text(f"{prefix}Помилка пошуку. Спробуй ще раз.")
         return True
 
     INTENT_MAP = {
