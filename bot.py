@@ -113,8 +113,38 @@ def init_db() -> None:
                 text    TEXT NOT NULL,
                 fire_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS session_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                summary    TEXT NOT NULL,
+                mood       TEXT
+            );
         """)
     log.info("DB initialized at %s", DB_PATH)
+
+def save_session_log(user_id: int, summary: str, mood: str = "") -> None:
+    with _db() as con:
+        con.execute(
+            "INSERT INTO session_log(user_id, created_at, summary, mood) VALUES(?,?,?,?)",
+            (user_id, now_kyiv().isoformat(), summary[:500], mood),
+        )
+    # Зберігаємо лише останні 30 записів на користувача
+    with _db() as con:
+        con.execute(
+            "DELETE FROM session_log WHERE user_id=? AND id NOT IN "
+            "(SELECT id FROM session_log WHERE user_id=? ORDER BY id DESC LIMIT 30)",
+            (user_id, user_id),
+        )
+
+def get_session_log(user_id: int, limit: int = 5) -> list[dict]:
+    with _db() as con:
+        rows = con.execute(
+            "SELECT created_at, summary, mood FROM session_log "
+            "WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 # memory
 def get_user_memory(user_id: int) -> dict:
@@ -422,6 +452,15 @@ def build_dynamic_prompt(user_id: int, emotion: str) -> dict:
     last_session = mem.get("last_session_summary")
     if last_session:
         parts.append(f"Контекст попередньої розмови: {last_session}")
+
+    # Довга пам'ять — останні сесії
+    sessions = get_session_log(user_id, limit=3)
+    if sessions:
+        log_lines = "; ".join(
+            f"[{s['created_at'][:10]}] {s['summary'][:80]}"
+            for s in sessions
+        )
+        parts.append(f"Історія сесій: {log_lines}")
 
     return {"role": "system", "content": " ".join(parts)}
 
@@ -1304,8 +1343,8 @@ async def send_daily_brief(bot) -> None:
         tasks   = get_user_tasks(chat_id)
         pending = [t["text"] for t in tasks if not t.get("done")]
 
-        news_results    = await search_web("головні новини України сьогодні")
-        weather_results = await search_web("погода Рівне Україна сьогодні")
+        news_results    = await search_web("головні новини України сьогодні", "news")
+        weather_results = await search_web("погода Рівне Україна сьогодні", "weather")
 
         tasks_block = ""
         if pending:
@@ -1600,7 +1639,8 @@ async def _dispatch_intent(
                 search_query = (await call_ai([{"role": "user", "content": (
                     f"{enriched}\n\nКороткий пошуковий запит (до 10 слів). ТІЛЬКИ запит."
                 )}])).strip()
-            results = await search_web(search_query)
+            search_type = _detect_search_type(search_query)
+            results     = await search_web(search_query, search_type)
             content = (
                 f"Запит: '{enriched}'\n\nРезультати:\n{results}\n\nВідповідь українською. Вказуй джерела."
                 if results else
@@ -1621,8 +1661,8 @@ async def _dispatch_intent(
             header    = clean_markdown(f"🤖 *J.A.R.V.I.S.* | {date_str}\n{'─' * 28}\n\n")
             await _send_or_edit(msg, header + clean_markdown(f"{prefix}{reply}"), disable_web_page_preview=True)
         except Exception as e:
-            log.error("search dispatch: %s", e)
-            await msg.edit_text(f"{prefix}Помилка пошуку. Спробуй ще раз.")
+            log.error("search dispatch: %s", e, exc_info=True)
+            await msg.edit_text(f"{prefix}Помилка пошуку: {e}")
         return True
 
     INTENT_MAP = {
