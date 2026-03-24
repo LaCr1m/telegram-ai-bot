@@ -1564,11 +1564,20 @@ async def _dispatch_intent(
                 if results else
                 f"Запит: '{enriched}'\n\nВідповідай з власних знань українською."
             )
-            reply = await call_ai([get_active_system_prompt(user_id), {"role": "user", "content": content}])
+            reply = await call_ai([get_active_system_prompt(user_id), {"role": "user", "content": (
+                content + "\n\nФорматуй відповідь так:\n"
+                "- Якщо є заголовок — виділи його **жирним**\n"
+                "- Використовуй емодзі на початку кожного смислового блоку\n"
+                "- Джерела вказуй в кінці курсивом\n"
+                "- Розділяй блоки порожнім рядком\n"
+                "- Не використовуй таблиці і горизонтальні лінії"
+            )}])
             await append_and_trim(user_id, "user", user_text)
             await append_and_trim(user_id, "assistant", reply)
             _set_ctx(user_id, user_text, reply)
-            await _send_or_edit(msg, clean_markdown(f"{prefix}{reply}"), disable_web_page_preview=True)
+            date_str  = now_kyiv().strftime("%d.%m.%Y")
+            header    = clean_markdown(f"🤖 *J.A.R.V.I.S.* | {date_str}\n{'─' * 28}\n\n")
+            await _send_or_edit(msg, header + clean_markdown(f"{prefix}{reply}"), disable_web_page_preview=True)
         except Exception as e:
             log.error("search dispatch: %s", e)
             await msg.edit_text(f"{prefix}Помилка пошуку. Спробуй ще раз.")
