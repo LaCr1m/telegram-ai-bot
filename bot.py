@@ -73,7 +73,7 @@ MAX_DOC_PREVIEW_CHARS = 4000
 CTX_DESCRIPTION_LEN   = 500
 SEARCH_RESULTS        = 7
 FLUX_STEPS            = 4
-BRIEF_HOUR            = 8   # година щоденного брифу (Київ)
+BRIEF_HOUR            = 9   # година щоденного брифу (Київ)
 
 DB_PATH         = os.environ.get("DB_PATH", "/data/jarvis.db")
 BLOCKED_DOMAINS = {"olx.ua", "olx.com.ua"}
@@ -1233,28 +1233,44 @@ async def send_daily_brief(bot) -> None:
         tasks   = get_user_tasks(chat_id)
         pending = [t["text"] for t in tasks if not t.get("done")]
 
-        news_results  = await search_web("головні новини України сьогодні")
-        weather_results = await search_web("погода Київ сьогодні")
+        news_results    = await search_web("головні новини України сьогодні")
+        weather_results = await search_web("погода Рівне Україна сьогодні")
 
-        tasks_block = (
-            "📋 *Задачі на сьогодні:*\n" + "\n".join(f"• {t}" for t in pending)
-            if pending else "📋 Задач немає."
-        )
+        tasks_block = ""
+        if pending:
+            tasks_lines = "\n".join(f"  ◦ {t}" for t in pending)
+            tasks_block = f"\n\n📋 *Задачі на сьогодні:*\n{tasks_lines}"
 
         brief = await call_ai([
             get_active_system_prompt(chat_id),
             {"role": "user", "content": (
-                f"Зроби короткий ранковий бриф у стилі J.A.R.V.I.S. для свого користувача.\n\n"
+                f"Зроби короткий ранковий бриф у стилі J.A.R.V.I.S.\n\n"
                 f"Поточний час: {now_kyiv().strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"Погода в Рівному:\n{weather_results[:500]}\n\n"
                 f"Новини:\n{news_results[:1500]}\n\n"
-                f"Погода:\n{weather_results[:500]}\n\n"
-                f"Незакриті задачі: {', '.join(pending) if pending else 'немає'}\n\n"
-                "Формат: вітання + погода (1 речення) + топ-3 новини + задачі. Стисло, по суті."
+                "Формат відповіді (суворо дотримуйся):\n"
+                "🌤 Погода: [одне речення про погоду в Рівному]\n\n"
+                "📰 Новини:\n"
+                "1️⃣ [новина 1]\n"
+                "2️⃣ [новина 2]\n"
+                "3️⃣ [новина 3]\n\n"
+                "Стиль: стриманий J.A.R.V.I.S., лаконічно, без зайвих слів."
             )},
         ])
+
+        date_str = now_kyiv().strftime("%d.%m.%Y")
+        text = (
+            f"╔══════════════════╗\n"
+            f"        🤖 J\\.A\\.R\\.V\\.I\\.S\\.\n"
+            f"     Ранковий бриф • {date_str}\n"
+            f"╚══════════════════╝\n\n"
+            f"{clean_markdown(brief)}"
+            f"{clean_markdown(tasks_block) if tasks_block else ''}"
+        )
+
         await bot.send_message(
             chat_id=chat_id,
-            text=f"🌅 *Добрий ранок, сер*\n\n{clean_markdown(brief)}\n\n{tasks_block}",
+            text=text,
             parse_mode="MarkdownV2",
         )
     except Exception as e:
