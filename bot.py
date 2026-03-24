@@ -1259,20 +1259,17 @@ async def send_daily_brief(bot) -> None:
         ])
 
         date_str = now_kyiv().strftime("%d.%m.%Y")
-        text = (
-            f"╔══════════════════╗\n"
-            f"        🤖 J\\.A\\.R\\.V\\.I\\.S\\.\n"
-            f"     Ранковий бриф • {date_str}\n"
-            f"╚══════════════════╝\n\n"
-            f"{clean_markdown(brief)}"
-            f"{clean_markdown(tasks_block) if tasks_block else ''}"
-        )
+        brief_md = clean_markdown(brief)
+        tasks_md = clean_markdown(tasks_block) if tasks_block else ""
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="MarkdownV2",
-        )
+        text = f"🤖 *J\\.A\\.R\\.V\\.I\\.S\\.* \\| {date_str}\n{'─' * 28}\n\n{brief_md}{tasks_md}"
+
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="MarkdownV2")
+        except Exception:
+            # fallback — plain text
+            plain = re.sub(r'[\\*_`\[\]()]', '', text)
+            await bot.send_message(chat_id=chat_id, text=plain)
     except Exception as e:
         log.error("send_daily_brief: %s", e)
 
