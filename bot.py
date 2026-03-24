@@ -341,8 +341,9 @@ async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> N
     try:
         result = await call_ai([{"role": "user", "content": (
             f"З цього діалогу витягни важливі факти про користувача (ім'я, вік, місто, вподобання).\n"
+            f"Також визнач загальний настрій розмови: позитивний, нейтральний або негативний.\n"
             f"Користувач: {user_text}\nБот: {reply}\n\n"
-            "Відповідай ТІЛЬКИ JSON: {\"name\": \"...\", \"facts\": [\"факт1\"]} або {}."
+            "Відповідай ТІЛЬКИ JSON: {\"name\": \"...\", \"facts\": [\"факт1\"], \"mood\": \"positive|neutral|negative\"} або {}."
         )}])
         data = _parse_json_ai(result)
         if not data:
@@ -352,6 +353,11 @@ async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> N
             mem["name"] = data["name"]
         if data.get("facts"):
             mem["facts"] = list(set(mem.get("facts", [])) | set(data["facts"]))
+        if data.get("mood"):
+            # Зберігаємо останні 5 настроїв для аналізу тренду
+            moods = mem.get("mood_history", [])
+            moods = ([data["mood"]] + moods)[:5]
+            mem["mood_history"] = moods
         update_user_memory(user_id, mem)
     except Exception as e:
         log.debug("extract_and_save_memory: %s", e)
@@ -402,6 +408,20 @@ def build_dynamic_prompt(user_id: int, emotion: str) -> dict:
         parts.append(f"Ім'я користувача: {mem['name']}. Звертайся іноді на ім'я.")
     if mem.get("topics"):
         parts.append(f"Попередні теми: {', '.join(mem['topics'][:3])}.")
+
+    # Контекст настрою між сесіями
+    mood_history = mem.get("mood_history", [])
+    if mood_history:
+        dominant = max(set(mood_history), key=mood_history.count)
+        if dominant == "negative" and mood_history[0] == "negative":
+            parts.append("Останні розмови мали негативний настрій — будь особливо уважним і підтримуючим.")
+        elif dominant == "positive":
+            parts.append("Користувач зазвичай у доброму настрої — можна бути живішим і дотепнішим.")
+
+    # Контекст останньої сесії
+    last_session = mem.get("last_session_summary")
+    if last_session:
+        parts.append(f"Контекст попередньої розмови: {last_session}")
 
     return {"role": "system", "content": " ".join(parts)}
 
@@ -507,6 +527,15 @@ async def _compress_history(user_id: int) -> None:
             log.debug("_save_topic: %s", e)
 
     asyncio.create_task(_save_topic())
+    # Зберігаємо короткий підсумок сесії в пам'ять
+    try:
+        session_summary = await call_ai([{"role": "user", "content": (
+            f"Стисни суть цього діалогу в 1-2 речення для контексту наступної розмови.\n"
+            f"Збережи головну тему і настрій. Відповідай українською.\n\n{old_text[:1500]}"
+        )}])
+        update_user_memory(user_id, {"last_session_summary": session_summary.strip()[:300]})
+    except Exception as e:
+        log.debug("session_summary: %s", e)
     chat_histories[user_id] = (
         [get_system_prompt(user_id),
          {"role": "assistant", "content": f"[Підсумок попереднього діалогу]: {summary}"}]
@@ -1275,12 +1304,60 @@ async def send_daily_brief(bot) -> None:
 
 async def _brief_scheduler(bot) -> None:
     while True:
-        now  = now_kyiv()
+        now        = now_kyiv()
         next_brief = now.replace(hour=BRIEF_HOUR, minute=0, second=0, microsecond=0)
         if now >= next_brief:
             next_brief += timedelta(days=1)
         await asyncio.sleep((next_brief - now).total_seconds())
         await send_daily_brief(bot)
+
+async def send_proactive_reminder(bot, user_id: int) -> None:
+    """Надсилає нагадування якщо є незакриті задачі і користувач давно не писав."""
+    try:
+        tasks   = get_user_tasks(user_id)
+        pending = [t["text"] for t in tasks if not t.get("done")]
+        if not pending:
+            return
+        mem  = get_user_memory(user_id)
+        name = mem.get("name", "")
+        address = f", {name}" if name else ", сер"
+        tasks_lines = "\n".join(f"  ◦ {t}" for t in pending[:5])
+        text = (
+            f"🔔 До речі{address} — у вас є незакриті задачі:\n\n"
+            f"{tasks_lines}\n\n"
+            f"Бажаєте відмітити виконані? /tasks"
+        )
+        await bot.send_message(chat_id=user_id, text=text)
+        log.info("Proactive reminder sent to user %s", user_id)
+    except Exception as e:
+        log.warning("send_proactive_reminder: %s", e)
+
+async def _proactive_scheduler(bot) -> None:
+    """Щодня о 18:00 перевіряє користувачів які не писали 2+ дні і мають незакриті задачі."""
+    CHECK_HOUR = 18
+    INACTIVE_DAYS = 2
+    while True:
+        now       = now_kyiv()
+        next_check = now.replace(hour=CHECK_HOUR, minute=0, second=0, microsecond=0)
+        if now >= next_check:
+            next_check += timedelta(days=1)
+        await asyncio.sleep((next_check - now).total_seconds())
+        try:
+            with _db() as con:
+                rows = con.execute("SELECT user_id, data FROM memory").fetchall()
+            for row in rows:
+                uid  = row["user_id"]
+                data = json.loads(row["data"])
+                last_seen_str = data.get("last_seen")
+                if not last_seen_str:
+                    continue
+                last_seen = datetime.fromisoformat(last_seen_str)
+                if last_seen.tzinfo is None:
+                    last_seen = last_seen.replace(tzinfo=TZ)
+                if (now_kyiv() - last_seen).days >= INACTIVE_DAYS:
+                    await send_proactive_reminder(bot, uid)
+        except Exception as e:
+            log.error("_proactive_scheduler: %s", e)
 
 # ── Gender detection ──────────────────────────────────────────────────────────
 
@@ -1397,6 +1474,7 @@ async def _process_message(
 
         _set_ctx(user_id, user_text, reply)
         asyncio.create_task(extract_and_save_memory(user_id, user_text, reply))
+        update_user_memory(user_id, {"last_seen": now_kyiv().isoformat()})
 
         user_msgs = [m for m in get_history(user_id) if m.get("role") == "user"]
         if len(user_msgs) % STYLE_UPDATE_INTERVAL == 0:
@@ -1934,6 +2012,7 @@ async def post_init(app) -> None:
             user_personalities[row["user_id"]] = data["mode"]
     # Запускаємо планувальник брифу
     asyncio.create_task(_brief_scheduler(app.bot))
+    asyncio.create_task(_proactive_scheduler(app.bot))
     log.info("Bot initialized, DB=%s", DB_PATH)
 
 if __name__ == "__main__":
