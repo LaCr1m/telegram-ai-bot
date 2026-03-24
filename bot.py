@@ -1688,8 +1688,12 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_brief_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🌅 Готую бриф...")
-    await send_daily_brief(ctx.bot)
-    await msg.delete()
+    try:
+        await send_daily_brief(ctx.bot)
+        await msg.delete()
+    except Exception as e:
+        log.error("handle_brief_cmd: %s", e)
+        await msg.edit_text(f"❌ Помилка брифу: {e}")
 
 async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tavily_status = "❌ Не налаштовано"
