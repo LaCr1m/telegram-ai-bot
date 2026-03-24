@@ -55,8 +55,8 @@ OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL                  = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL          = "https://api.groq.com/openai/v1/audio/transcriptions"
 GEMINI_URL         = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_PRO_MODEL          = "gemini-1.5-pro"
-GEMINI_FLASH_MODEL        = "gemini-1.5-flash"
+GEMINI_PRO_MODEL          = "gemini-2.0-flash"
+GEMINI_FLASH_MODEL        = "gemini-1.5-flash-latest"
 OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"
 OPENROUTER_MODEL_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"
 GROQ_MODEL                = "llama-3.3-70b-versatile"
@@ -355,6 +355,7 @@ chat_histories:     dict[int, list] = {}
 user_personalities: dict[int, str]  = {}
 last_context:       dict[int, dict] = {}
 _user_locks:        dict[int, asyncio.Lock] = {}
+_ai_cache:          dict[str, str] = {}  # кеш відповідей AI
 
 def _get_lock(user_id: int) -> asyncio.Lock:
     if user_id not in _user_locks:
@@ -913,23 +914,30 @@ async def _call_gemini(messages: list, model: str) -> str | None:
 async def call_ai(messages: list) -> str:
     """
     Порядок провайдерів:
-    1. Gemini 1.5 Pro
+    1. Gemini 2.0 Flash
     2. Gemini 1.5 Flash
     3. OpenRouter (llama-3.3-70b → llama-3.1-8b)
     4. Groq (llama-3.3-70b)
     """
+    # Простий кеш для коротких допоміжних запитів (intent, gender, json)
+    last_msg = messages[-1].get("content", "") if messages else ""
+    if isinstance(last_msg, str) and len(last_msg) < 300 and len(messages) == 1:
+        cache_key = last_msg[:200]
+        if cache_key in _ai_cache:
+            return _ai_cache[cache_key]
+
     result = None
 
-    # 1. Gemini Pro
+    # 1. Gemini 2.0 Flash
     result = await _call_gemini(messages, GEMINI_PRO_MODEL)
     if result:
-        log.debug("Provider: Gemini Pro")
+        log.debug("Provider: Gemini 2.0 Flash")
 
-    # 2. Gemini Flash
+    # 2. Gemini 1.5 Flash
     if result is None:
         result = await _call_gemini(messages, GEMINI_FLASH_MODEL)
         if result:
-            log.debug("Provider: Gemini Flash")
+            log.debug("Provider: Gemini 1.5 Flash")
 
     # 3. OpenRouter
     if result is None and OPENROUTER_API_KEY:
@@ -975,6 +983,15 @@ async def call_ai(messages: list) -> str:
                 result = fixed
         except Exception as e:
             log.warning("Retranslation failed: %s", e)
+
+    # Зберігаємо в кеш
+    if isinstance(last_msg, str) and len(last_msg) < 300 and len(messages) == 1:
+        _ai_cache[last_msg[:200]] = result
+        if len(_ai_cache) > 100:
+            # Очищаємо старі записи
+            oldest = list(_ai_cache.keys())[:50]
+            for k in oldest:
+                del _ai_cache[k]
 
     return result
 
