@@ -54,7 +54,7 @@ if not TELEGRAM_TOKEN:
 OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL                  = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL          = "https://api.groq.com/openai/v1/audio/transcriptions"
-GEMINI_URL                = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GEMINI_URL         = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_PRO_MODEL          = "gemini-1.5-pro"
 GEMINI_FLASH_MODEL        = "gemini-1.5-flash"
 OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"
@@ -877,24 +877,35 @@ _NON_UA_RE = re.compile(
 )
 
 async def _call_gemini(messages: list, model: str) -> str | None:
-    """Виклик Google Gemini через OpenAI-сумісний endpoint."""
+    """Виклик Google Gemini через нативний API."""
     if not GOOGLE_API_KEY:
         return None
     try:
-        headers = {
-            "Authorization": f"Bearer {GOOGLE_API_KEY}",
-            "Content-Type": "application/json",
-        }
+        # Конвертуємо OpenAI формат в Gemini формат
+        gemini_messages = []
+        system_text = ""
+        for m in messages:
+            if m["role"] == "system":
+                system_text = m["content"] if isinstance(m["content"], str) else ""
+            elif m["role"] == "user":
+                content = m["content"] if isinstance(m["content"], str) else str(m["content"])
+                gemini_messages.append({"role": "user", "parts": [{"text": content}]})
+            elif m["role"] == "assistant":
+                content = m["content"] if isinstance(m["content"], str) else str(m["content"])
+                gemini_messages.append({"role": "model", "parts": [{"text": content}]})
+
+        payload: dict = {"contents": gemini_messages}
+        if system_text:
+            payload["system_instruction"] = {"parts": [{"text": system_text}]}
+
+        url = f"{GEMINI_URL}/{model}:generateContent?key={GOOGLE_API_KEY}"
         async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                GEMINI_URL, headers=headers,
-                json={"model": model, "messages": messages},
-            )
+            r = await client.post(url, json=payload)
         if r.status_code == 429:
             log.warning("Gemini %s rate limit", model)
             return None
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         log.warning("Gemini %s failed: %s", model, e)
         return None
