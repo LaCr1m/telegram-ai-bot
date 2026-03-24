@@ -874,30 +874,41 @@ _NON_UA_RE = re.compile(
     re.IGNORECASE,
 )
 
-async def call_ai(messages: list) -> str:
+async def call_ai(messages: list, retry: int = 2) -> str:
     result = None
-    if GROQ_API_KEY:
-        try:
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
-                r.raise_for_status()
-            result = r.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            log.warning("Groq failed, trying OpenRouter: %s", e)
-    if result is None and OPENROUTER_API_KEY:
-        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-        for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
+    for attempt in range(retry + 1):
+        if GROQ_API_KEY:
             try:
+                headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
                 async with httpx.AsyncClient(timeout=60) as client:
-                    r = await client.post(OPENROUTER_URL, headers=headers, json={"model": model, "messages": messages})
-                if r.status_code in (404, 429):
+                    r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
+                if r.status_code == 429:
+                    wait = int(r.headers.get("retry-after", 5))
+                    log.warning("Groq rate limit, waiting %ds", wait)
+                    await asyncio.sleep(wait)
                     continue
                 r.raise_for_status()
                 result = r.json()["choices"][0]["message"]["content"]
                 break
             except Exception as e:
-                log.warning("OpenRouter %s failed: %s", model, e)
+                log.warning("Groq attempt %d failed: %s", attempt + 1, e)
+                if attempt < retry:
+                    await asyncio.sleep(2)
+        if result is None and OPENROUTER_API_KEY:
+            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+            for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
+                try:
+                    async with httpx.AsyncClient(timeout=60) as client:
+                        r = await client.post(OPENROUTER_URL, headers=headers, json={"model": model, "messages": messages})
+                    if r.status_code in (404, 429):
+                        continue
+                    r.raise_for_status()
+                    result = r.json()["choices"][0]["message"]["content"]
+                    break
+                except Exception as e:
+                    log.warning("OpenRouter %s failed: %s", model, e)
+        if result:
+            break
     if not result or not result.strip():
         raise RuntimeError("All AI providers failed")
     if _NON_UA_RE.search(result):
