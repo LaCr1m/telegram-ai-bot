@@ -683,14 +683,27 @@ def detect_intent_local(text: str) -> str | None:
 
 async def detect_intent_ai(text: str) -> str:
     result = await call_ai([{"role": "user", "content": (
-        f"Визнач намір повідомлення: '{text}'\n"
-        "Відповідай ТІЛЬКИ одним словом:\n"
-        "reminder|image|search|translate|summarize|generate|edit|recipe|task|chat\n"
-        "- image: якщо людина просить намалювати, згенерувати, створити або зобразити будь-яке зображення/картинку/фото\n"
-        "- reminder: ТІЛЬКИ якщо є конкретний час або дата\n"
-        "- chat: все інше"
+        f"Визнач точний намір повідомлення. Відповідай ТІЛЬКИ одним словом з переліку.\n\n"
+        f"Повідомлення: '{text}'\n\n"
+        "НАМІРИ:\n"
+        "• image — намалювати, згенерувати, створити зображення/фото/картинку/ілюстрацію, навіть з опечатками\n"
+        "• reminder — нагадати про щось у конкретний час або через певний час (ОБОВ'ЯЗКОВО має бути час/дата)\n"
+        "• search — знайти актуальну інформацію в інтернеті, новини, погоду, ціни, курси, події\n"
+        "• translate — перекласти текст з однієї мови на іншу\n"
+        "• summarize — підсумувати статтю, текст або посилання\n"
+        "• generate — написати/створити текст: резюме, лист, пост, оголошення, статтю\n"
+        "• edit — відредагувати, покращити, виправити або переписати існуючий текст\n"
+        "• recipe — знайти рецепт або що приготувати з наявних інгредієнтів\n"
+        "• task — додати, видалити, показати або відмітити задачу зі списку\n"
+        "• chat — все інше: питання, розмова, пояснення, аналіз, порада\n\n"
+        "ПРАВИЛА:\n"
+        "1. Якщо є URL — майже завжди summarize\n"
+        "2. reminder ТІЛЬКИ якщо є явний час (через 30 хв, о 15:00, завтра)\n"
+        "3. search якщо потрібна СВІЖА або ПОТОЧНА інформація\n"
+        "4. chat якщо це питання на яке можна відповісти без інтернету\n"
+        "5. Повертай ТІЛЬКИ одне слово, без пояснень"
     )}])
-    return result.strip().lower().strip("'\"")
+    return result.strip().lower().strip("'\"").split()[0]
 
 async def detect_intent(text: str) -> str:
     clean = text.split("Запит користувача:")[-1].strip() if "Запит користувача:" in text else text
@@ -1036,18 +1049,36 @@ async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> s
 
 # ── Web search ────────────────────────────────────────────────────────────────
 
-async def search_web(query: str) -> str:
+async def search_web(query: str, search_type: str = "general") -> str:
+    """
+    search_type: general | news | weather | price
+    """
     if TAVILY_API_KEY:
         try:
+            # Параметри залежно від типу пошуку
+            kwargs: dict = {"query": query, "max_results": SEARCH_RESULTS}
+            if search_type == "news":
+                kwargs["topic"] = "news"
+                kwargs["max_results"] = 5
+            elif search_type in ("weather", "price"):
+                kwargs["max_results"] = 3
+
             results = await asyncio.to_thread(
-                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query=query, max_results=SEARCH_RESULTS)
+                lambda: TavilyClient(api_key=TAVILY_API_KEY).search(**kwargs)
             )
-            items = [i for i in results.get("results", []) if not any(bd in i.get("url", "") for bd in BLOCKED_DOMAINS)]
+            items = [
+                i for i in results.get("results", [])
+                if not any(bd in i.get("url", "") for bd in BLOCKED_DOMAINS)
+            ]
             if items:
                 parts = []
                 for i in items:
                     date_str = f" ({i['published_date'][:10]})" if i.get("published_date") else ""
-                    parts.append(f"Джерело: {i.get('title','').strip()}{date_str}\n{i.get('content','')[:400].strip()}\n{i.get('url','').strip()}")
+                    parts.append(
+                        f"Джерело: {i.get('title','').strip()}{date_str}\n"
+                        f"{i.get('content','')[:400].strip()}\n"
+                        f"{i.get('url','').strip()}"
+                    )
                 return "\n\n".join(parts)
         except Exception as e:
             log.warning("Tavily error: %s", e)
@@ -1069,6 +1100,17 @@ async def search_web(query: str) -> str:
     except Exception as e:
         log.warning("DuckDuckGo error: %s", e)
     return ""
+
+def _detect_search_type(query: str) -> str:
+    """Визначає тип пошуку для оптимізації запиту."""
+    q = query.lower()
+    if any(w in q for w in ["новини","новина","подія","події","що сталось","що відбулось"]):
+        return "news"
+    if any(w in q for w in ["погода","температура","дощ","сніг","хмарно"]):
+        return "weather"
+    if any(w in q for w in ["ціна","вартість","коштує","курс","скільки"]):
+        return "price"
+    return "general"
 
 async def fetch_url_text(url: str) -> str:
     try:
