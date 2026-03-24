@@ -44,8 +44,7 @@ OPENROUTER_API_KEY = _require_env("OPENROUTER_API_KEY")
 GROQ_API_KEY       = _require_env("GROQ_API_KEY")
 TAVILY_API_KEY     = _require_env("TAVILY_API_KEY")
 CF_API_TOKEN       = _require_env("CF_API_TOKEN")
-CF_ACCOUNT_ID      = _require_env("CF_ACCOUNT_ID")
-BRIEF_CHAT_ID      = _require_env("BRIEF_CHAT_ID")   # chat_id куди слати щоденний бриф
+GOOGLE_API_KEY = _require_env("GOOGLE_API_KEY")   # chat_id куди слати щоденний бриф
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is required")
@@ -55,6 +54,9 @@ if not TELEGRAM_TOKEN:
 OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL                  = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL          = "https://api.groq.com/openai/v1/audio/transcriptions"
+GEMINI_URL                = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GEMINI_PRO_MODEL          = "gemini-1.5-pro"
+GEMINI_FLASH_MODEL        = "gemini-1.5-flash"
 OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"
 OPENROUTER_MODEL_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"
 GROQ_MODEL                = "llama-3.3-70b-versatile"
@@ -874,24 +876,51 @@ _NON_UA_RE = re.compile(
     re.IGNORECASE,
 )
 
-async def call_ai(messages: list, retry: int = 2) -> str:
+async def _call_gemini(messages: list, model: str) -> str | None:
+    """Виклик Google Gemini через OpenAI-сумісний endpoint."""
+    if not GOOGLE_API_KEY:
+        return None
+    try:
+        headers = {
+            "Authorization": f"Bearer {GOOGLE_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                GEMINI_URL, headers=headers,
+                json={"model": model, "messages": messages},
+            )
+        if r.status_code == 429:
+            log.warning("Gemini %s rate limit", model)
+            return None
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        log.warning("Gemini %s failed: %s", model, e)
+        return None
+
+async def call_ai(messages: list) -> str:
+    """
+    Порядок провайдерів:
+    1. Gemini 1.5 Pro
+    2. Gemini 1.5 Flash
+    3. OpenRouter (llama-3.3-70b → llama-3.1-8b)
+    4. Groq (llama-3.3-70b)
+    """
     result = None
-    if GROQ_API_KEY:
-        for attempt in range(retry + 1):
-            try:
-                headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-                async with httpx.AsyncClient(timeout=60) as client:
-                    r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
-                if r.status_code == 429:
-                    log.warning("Groq rate limit — switching to OpenRouter")
-                    break  # одразу на OpenRouter, не чекаємо
-                r.raise_for_status()
-                result = r.json()["choices"][0]["message"]["content"]
-                break
-            except Exception as e:
-                log.warning("Groq attempt %d failed: %s", attempt + 1, e)
-                if attempt < retry:
-                    await asyncio.sleep(1)
+
+    # 1. Gemini Pro
+    result = await _call_gemini(messages, GEMINI_PRO_MODEL)
+    if result:
+        log.debug("Provider: Gemini Pro")
+
+    # 2. Gemini Flash
+    if result is None:
+        result = await _call_gemini(messages, GEMINI_FLASH_MODEL)
+        if result:
+            log.debug("Provider: Gemini Flash")
+
+    # 3. OpenRouter
     if result is None and OPENROUTER_API_KEY:
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
@@ -902,11 +931,27 @@ async def call_ai(messages: list, retry: int = 2) -> str:
                     continue
                 r.raise_for_status()
                 result = r.json()["choices"][0]["message"]["content"]
+                log.debug("Provider: OpenRouter %s", model)
                 break
             except Exception as e:
                 log.warning("OpenRouter %s failed: %s", model, e)
+
+    # 4. Groq
+    if result is None and GROQ_API_KEY:
+        try:
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
+            if r.status_code != 429:
+                r.raise_for_status()
+                result = r.json()["choices"][0]["message"]["content"]
+                log.debug("Provider: Groq")
+        except Exception as e:
+            log.warning("Groq failed: %s", e)
+
     if not result or not result.strip():
         raise RuntimeError("All AI providers failed")
+
     if _NON_UA_RE.search(result):
         log.warning("Non-Ukrainian response, retranslating")
         try:
@@ -914,13 +959,12 @@ async def call_ai(messages: list, retry: int = 2) -> str:
                 {"role": "assistant", "content": result},
                 {"role": "user", "content": "Перефразуй відповідь виключно українською мовою."},
             ]
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": fix})
-                r.raise_for_status()
-            result = r.json()["choices"][0]["message"]["content"]
+            fixed = await _call_gemini(fix, GEMINI_FLASH_MODEL)
+            if fixed:
+                result = fixed
         except Exception as e:
             log.warning("Retranslation failed: %s", e)
+
     return result
 
 async def call_vision(messages: list) -> str:
