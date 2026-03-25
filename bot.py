@@ -91,7 +91,8 @@ def now_kyiv() -> datetime:
 # ── PostgreSQL storage ────────────────────────────────────────────────────────
 
 def _db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    con = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return con
 
 def init_db() -> None:
     with _db() as con:
@@ -1977,7 +1978,10 @@ async def handle_brief_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🌅 Готую бриф...")
     try:
         await send_daily_brief(ctx.bot)
-        await msg.delete()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
     except Exception as e:
         log.error("handle_brief_cmd: %s", e)
         await msg.edit_text(f"❌ Помилка брифу: {e}")
@@ -2197,13 +2201,13 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def post_init(app) -> None:
     init_db()
     await restore_reminders(app.bot)
-    for uid_str, data in ({} if True else {}).items():  # memory вже в DB
-        pass
     # Відновлюємо режими з DB
     with _db() as con:
-        rows = con.execute("SELECT user_id, data FROM memory").fetchall()
+        with con.cursor() as cur:
+            cur.execute("SELECT user_id, data FROM memory")
+            rows = cur.fetchall()
     for row in rows:
-        data = json.loads(row["data"])
+        data = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
         if data.get("mode"):
             user_personalities[row["user_id"]] = data["mode"]
     # Запускаємо планувальник брифу
