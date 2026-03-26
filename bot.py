@@ -50,7 +50,7 @@ TAVILY_API_KEY     = _require_env("TAVILY_API_KEY")
 CF_API_TOKEN       = _require_env("CF_API_TOKEN")
 CF_ACCOUNT_ID      = _require_env("CF_ACCOUNT_ID")       # ← ВИПРАВЛЕНО: була відсутня
 GOOGLE_API_KEY     = _require_env("GOOGLE_API_KEY")
-BRIEF_CHAT_ID      = _require_env("BRIEF_CHAT_ID")        # ← ВИПРАВЛЕНО: була відсутня
+GOOGLE_API_KEY_VISION  = _require_env("GOOGLE_API_KEY_VISION")  # другий ключ для vision
 DATABASE_URL       = _require_env("DATABASE_URL")
 
 if not TELEGRAM_TOKEN:
@@ -1044,27 +1044,22 @@ async def _call_gemini_vision(img_b64: str, caption: str, user_id: int = 0) -> s
     if system_text:
         payload["system_instruction"] = {"parts": [{"text": system_text}]}
 
-    # Пробуємо gemini-2.0-flash, потім gemini-2.0-flash-lite як fallback
+    # Чергуємо ключі: основний і vision-ключ щоб розподілити rate limit
+    vision_keys = [k for k in [GOOGLE_API_KEY, GOOGLE_API_KEY_VISION] if k]
     for model in [GEMINI_PRO_MODEL, "gemini-2.0-flash-lite"]:
-        for attempt in range(2):
-            url = f"{GEMINI_URL}/{model}:generateContent?key={GOOGLE_API_KEY}"
+        for api_key in vision_keys:
+            url = f"{GEMINI_URL}/{model}:generateContent?key={api_key}"
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(url, json=payload)
             if r.status_code == 429:
-                if attempt == 0:
-                    log.warning("Gemini %s vision rate limit, waiting 10s...", model)
-                    await asyncio.sleep(10)
-                    continue
-                log.warning("Gemini %s vision rate limit after retry, trying next model", model)
-                break
+                log.warning("Gemini %s vision rate limit (key ...%s), trying next", model, api_key[-6:])
+                continue
             if r.status_code == 200:
                 candidates = r.json().get("candidates", [])
                 if candidates:
                     return candidates[0]["content"]["parts"][0]["text"]
             log.warning("Gemini %s vision error: %s", model, r.status_code)
-            break
-
-    raise RuntimeError("All Gemini vision models failed or rate limited")
+    raise RuntimeError("All Gemini vision keys rate limited")
 
 async def transcribe_voice(audio_bytes: bytes) -> str:
     if not GROQ_API_KEY:
