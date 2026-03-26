@@ -69,7 +69,7 @@ GEMINI_FLASH_MODEL        = "gemini-2.0-flash-lite"
 OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"
 OPENROUTER_MODEL_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"
 GROQ_MODEL                = "llama-3.3-70b-versatile"
-VISION_MODEL              = "google/gemini-2.0-flash-exp:free"   # ← безкоштовна vision через OpenRouter
+VISION_MODEL              = "meta-llama/llama-3.2-11b-vision-instruct:free"  # безкоштовна vision через OpenRouter
 CF_IMAGE_URL              = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -1044,25 +1044,34 @@ async def _call_gemini_vision(img_b64: str, caption: str, user_id: int = 0) -> s
     if system_text:
         payload["system_instruction"] = {"parts": [{"text": system_text}]}
     url = f"{GEMINI_URL}/{GEMINI_PRO_MODEL}:generateContent?key={GOOGLE_API_KEY}"
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, json=payload)
-    if r.status_code == 429:
-        log.warning("Gemini vision rate limit, trying OpenRouter")
-        if OPENROUTER_API_KEY:
-            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-            messages = [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                {"type": "text", "text": caption},
-            ]}]
-            async with httpx.AsyncClient(timeout=60) as client:
-                r2 = await client.post(OPENROUTER_URL, headers=headers, json={"model": VISION_MODEL, "messages": messages})
-                r2.raise_for_status()
-            return r2.json()["choices"][0]["message"]["content"]
-    r.raise_for_status()
-    candidates = r.json().get("candidates", [])
-    if not candidates:
-        raise RuntimeError("No response from Gemini vision")
-    return candidates[0]["content"]["parts"][0]["text"]
+
+    # Два спроби з паузою при rate limit
+    for attempt in range(2):
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, json=payload)
+        if r.status_code == 429:
+            if attempt == 0:
+                log.warning("Gemini vision rate limit, waiting 5s...")
+                await asyncio.sleep(5)
+                continue
+            log.warning("Gemini vision rate limit, trying OpenRouter")
+            if OPENROUTER_API_KEY:
+                headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+                messages = [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    {"type": "text", "text": caption},
+                ]}]
+                async with httpx.AsyncClient(timeout=60) as client:
+                    r2 = await client.post(OPENROUTER_URL, headers=headers, json={"model": VISION_MODEL, "messages": messages})
+                    r2.raise_for_status()
+                return r2.json()["choices"][0]["message"]["content"]
+            raise RuntimeError("Gemini vision rate limit and no OpenRouter key")
+        r.raise_for_status()
+        candidates = r.json().get("candidates", [])
+        if not candidates:
+            raise RuntimeError("No response from Gemini vision")
+        return candidates[0]["content"]["parts"][0]["text"]
+    raise RuntimeError("Gemini vision failed after retries")
 
 async def transcribe_voice(audio_bytes: bytes) -> str:
     if not GROQ_API_KEY:
