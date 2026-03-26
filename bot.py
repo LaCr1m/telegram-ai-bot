@@ -1018,11 +1018,9 @@ async def call_ai(messages: list) -> str:
 
 async def call_vision(messages: list) -> str:
     """Vision через Gemini (безкоштовно) або OpenRouter як fallback."""
-    # Спробуємо Gemini напряму (підтримує зображення)
     result = await _call_gemini(messages, GEMINI_PRO_MODEL)
     if result:
         return result
-    # Fallback — OpenRouter з безкоштовною vision моделлю
     if OPENROUTER_API_KEY:
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         async with httpx.AsyncClient(timeout=60) as client:
@@ -1030,6 +1028,41 @@ async def call_vision(messages: list) -> str:
             r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
     raise RuntimeError("No vision provider available")
+
+async def _call_gemini_vision(img_b64: str, caption: str, user_id: int = 0) -> str:
+    """Аналіз зображення через Gemini з правильним inline_data форматом."""
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY required")
+    sys_prompt = get_active_system_prompt(user_id)
+    system_text = sys_prompt.get("content", "") if isinstance(sys_prompt, dict) else ""
+    payload = {
+        "contents": [{"role": "user", "parts": [
+            {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}},
+            {"text": caption},
+        ]}],
+    }
+    if system_text:
+        payload["system_instruction"] = {"parts": [{"text": system_text}]}
+    url = f"{GEMINI_URL}/{GEMINI_PRO_MODEL}:generateContent?key={GOOGLE_API_KEY}"
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, json=payload)
+    if r.status_code == 429:
+        log.warning("Gemini vision rate limit, trying OpenRouter")
+        if OPENROUTER_API_KEY:
+            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+            messages = [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                {"type": "text", "text": caption},
+            ]}]
+            async with httpx.AsyncClient(timeout=60) as client:
+                r2 = await client.post(OPENROUTER_URL, headers=headers, json={"model": VISION_MODEL, "messages": messages})
+                r2.raise_for_status()
+            return r2.json()["choices"][0]["message"]["content"]
+    r.raise_for_status()
+    candidates = r.json().get("candidates", [])
+    if not candidates:
+        raise RuntimeError("No response from Gemini vision")
+    return candidates[0]["content"]["parts"][0]["text"]
 
 async def transcribe_voice(audio_bytes: bytes) -> str:
     if not GROQ_API_KEY:
@@ -1174,10 +1207,7 @@ async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> s
             descs = []
             for i, frame in enumerate(frames):
                 b64  = base64.b64encode(frame).decode()
-                desc = await call_vision([sys_prompt, {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    {"type": "text", "text": f"Опиши кадр {i+1}. Коротко."},
-                ]}])
+                desc = await _call_gemini_vision(b64, f"Опиши кадр {i+1}. Коротко.", user_id)
                 descs.append(f"Кадр {i+1}: {desc}")
             results.append("🎬 Відео:\n" + "\n".join(descs))
     except Exception as e:
@@ -1442,7 +1472,7 @@ async def send_daily_brief(bot) -> None:
         pending = [t["text"] for t in tasks if not t.get("done")]
 
         news_results    = await search_web("головні новини України сьогодні", "news")
-        weather_results = await search_web("погода Рівне Україна сьогодні", "weather")
+        weather_results = await search_web("погода Київ Україна сьогодні", "weather")
 
         tasks_block = ""
         if pending:
@@ -2028,15 +2058,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         img_b64 = base64.b64encode(await file.download_as_bytearray()).decode()
         caption = update.message.caption or "Що зображено? Опиши детально українською."
 
-        # Gemini підтримує base64 images напряму
-        vision_messages = [
-            get_active_system_prompt(user_id),
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                {"type": "text", "text": caption},
-            ]}
-        ]
-        reply = await call_vision(vision_messages)
+        # Gemini vision — окремий виклик з inline_data форматом
+        reply = await _call_gemini_vision(img_b64, caption, user_id)
         last_context[user_id] = {"type": "фото", "description": reply[:CTX_DESCRIPTION_LEN]}
         await append_and_trim(user_id, "user", f"[Фото] {caption}")
         await append_and_trim(user_id, "assistant", reply)
