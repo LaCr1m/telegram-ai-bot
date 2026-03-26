@@ -13,6 +13,9 @@ from zoneinfo import ZoneInfo
 from tavily import TavilyClient
 import openpyxl
 from docx import Document as DocxDocument
+from fastapi import FastAPI  # ← для keep-alive ping
+import uvicorn               # ← для keep-alive ping
+import threading
 try:
     from pypdf import PdfReader
 except ImportError:
@@ -45,23 +48,28 @@ OPENROUTER_API_KEY = _require_env("OPENROUTER_API_KEY")
 GROQ_API_KEY       = _require_env("GROQ_API_KEY")
 TAVILY_API_KEY     = _require_env("TAVILY_API_KEY")
 CF_API_TOKEN       = _require_env("CF_API_TOKEN")
-GOOGLE_API_KEY = _require_env("GOOGLE_API_KEY")   # chat_id куди слати щоденний бриф
+CF_ACCOUNT_ID      = _require_env("CF_ACCOUNT_ID")       # ← ВИПРАВЛЕНО: була відсутня
+GOOGLE_API_KEY     = _require_env("GOOGLE_API_KEY")
+BRIEF_CHAT_ID      = _require_env("BRIEF_CHAT_ID")        # ← ВИПРАВЛЕНО: була відсутня
+DATABASE_URL       = _require_env("DATABASE_URL")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is required")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is required")
 
 # ── URLs & models ─────────────────────────────────────────────────────────────
 
 OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL                  = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_WHISPER_URL          = "https://api.groq.com/openai/v1/audio/transcriptions"
-GEMINI_URL         = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_URL                = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_PRO_MODEL          = "gemini-2.0-flash"
 GEMINI_FLASH_MODEL        = "gemini-1.5-flash"
 OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"
 OPENROUTER_MODEL_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"
 GROQ_MODEL                = "llama-3.3-70b-versatile"
-VISION_MODEL              = "openrouter/auto"
+VISION_MODEL              = "google/gemini-2.0-flash-exp:free"   # ← безкоштовна vision через OpenRouter
 CF_IMAGE_URL              = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -76,23 +84,36 @@ MAX_DOC_PREVIEW_CHARS = 4000
 CTX_DESCRIPTION_LEN   = 500
 SEARCH_RESULTS        = 7
 FLUX_STEPS            = 4
-BRIEF_HOUR            = 9   # година щоденного брифу (Київ)
-
-DATABASE_URL    = _require_env("DATABASE_URL")
-DB_PATH         = DATABASE_URL  # для сумісності з /status
-BLOCKED_DOMAINS = {"olx.ua", "olx.com.ua"}
-_HEADERS        = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-
-TZ = ZoneInfo("Europe/Kyiv")
+BRIEF_HOUR            = 9
+DB_PATH               = DATABASE_URL
+BLOCKED_DOMAINS       = {"olx.ua", "olx.com.ua"}
+_HEADERS              = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+TZ                    = ZoneInfo("Europe/Kyiv")
 
 def now_kyiv() -> datetime:
     return datetime.now(TZ)
 
+# ── Keep-alive HTTP сервер (для Render + Cron-job.org) ────────────────────────
+
+_web_app = FastAPI()
+
+@_web_app.get("/")
+async def health():
+    return {"status": "ok", "bot": "J.A.R.V.I.S.", "time": now_kyiv().isoformat()}
+
+@_web_app.get("/ping")
+async def ping():
+    return {"pong": True}
+
+def _start_web_server():
+    """Запускає FastAPI у фоновому потоці щоб Render не вбивав процес."""
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(_web_app, host="0.0.0.0", port=port, log_level="warning")
+
 # ── PostgreSQL storage ────────────────────────────────────────────────────────
 
 def _db():
-    con = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    return con
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def init_db() -> None:
     with _db() as con:
@@ -125,7 +146,7 @@ def init_db() -> None:
                 );
             """)
         con.commit()
-    log.info("DB initialized at Supabase")
+    log.info("DB initialized (Neon PostgreSQL)")
 
 # memory
 def get_user_memory(user_id: int) -> dict:
@@ -337,16 +358,6 @@ PERSONALITIES = {
     },
 }
 
-PERSONALITY_DESCRIPTIONS = {
-    "jarvis":     "стриманий ШІ Тоні Старка — спокійний, іронічний, відданий",
-    "normal":     "збалансований J.A.R.V.I.S.",
-    "funny":      "легкий гумор і сарказм",
-    "serious":    "факт → обґрунтування → висновок",
-    "business":   "суть → аргументи → дія",
-    "literary":   "художній стиль, метафори",
-    "journalist": "заголовок → лід → факти → висновок",
-}
-
 # ── Keywords ──────────────────────────────────────────────────────────────────
 
 IMAGE_KEYWORDS     = ["створи фото","згенеруй фото","намалюй","згенеруй зображення","створи зображення","зроби фото","зроби картинку","створи картинку","зроби зображення","згенеруй картинку","покажи зображення","згенер","зобрази","generate image","draw","create image","create photo","make image","generate a","генеруй зображення","генеруй картинку","згенери зображення","згенери картинку","зроби зображення у стилі","зроби картинку у стилі","намалюй у стилі","згенеруй у стилі","зображення має бути","у стилі"]
@@ -365,7 +376,6 @@ _SOCIAL_PHRASES = {
     "як ти","як твої справи","що нового","як діла","yo","hi","hello",
 }
 
-# Стікери — реакції J.A.R.V.I.S.
 STICKER_REACTIONS = [
     "Цікавий вибір, сер. Стікер отримано, проаналізовано, занесено до архіву.",
     "Зафіксовано. Мій сенсорний аналіз підказує, що це мало щось означати.",
@@ -376,18 +386,16 @@ STICKER_REACTIONS = [
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
 
-chat_histories:     dict[int, list] = {}
-user_personalities: dict[int, str]  = {}
-last_context:       dict[int, dict] = {}
+chat_histories:     dict[int, list]         = {}
+user_personalities: dict[int, str]          = {}
+last_context:       dict[int, dict]         = {}
 _user_locks:        dict[int, asyncio.Lock] = {}
-_ai_cache:          dict[str, str] = {}  # кеш відповідей AI
+_ai_cache:          dict[str, str]          = {}
 
 def _get_lock(user_id: int) -> asyncio.Lock:
     if user_id not in _user_locks:
         _user_locks[user_id] = asyncio.Lock()
     return _user_locks[user_id]
-
-# ── JSON parse helper ─────────────────────────────────────────────────────────
 
 def _parse_json_ai(text: str) -> dict:
     clean = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -412,7 +420,6 @@ async def extract_and_save_memory(user_id: int, user_text: str, reply: str) -> N
         if data.get("facts"):
             mem["facts"] = list(set(mem.get("facts", [])) | set(data["facts"]))
         if data.get("mood"):
-            # Зберігаємо останні 5 настроїв для аналізу тренду
             moods = mem.get("mood_history", [])
             moods = ([data["mood"]] + moods)[:5]
             mem["mood_history"] = moods
@@ -467,7 +474,6 @@ def build_dynamic_prompt(user_id: int, emotion: str) -> dict:
     if mem.get("topics"):
         parts.append(f"Попередні теми: {', '.join(mem['topics'][:3])}.")
 
-    # Контекст настрою між сесіями
     mood_history = mem.get("mood_history", [])
     if mood_history:
         dominant = max(set(mood_history), key=mood_history.count)
@@ -476,12 +482,10 @@ def build_dynamic_prompt(user_id: int, emotion: str) -> dict:
         elif dominant == "positive":
             parts.append("Користувач зазвичай у доброму настрої — можна бути живішим і дотепнішим.")
 
-    # Контекст останньої сесії
     last_session = mem.get("last_session_summary")
     if last_session:
         parts.append(f"Контекст попередньої розмови: {last_session}")
 
-    # Довга пам'ять — останні сесії
     sessions = get_session_log(user_id, limit=3)
     if sessions:
         log_lines = "; ".join(
@@ -554,9 +558,6 @@ def save_histories() -> None:
         if msgs:
             save_history_db(uid, msgs[-MAX_HISTORY_MESSAGES:])
 
-def restore_histories() -> None:
-    pass  # буде відновлено ліниво при першому зверненні
-
 def get_history(user_id: int) -> list:
     if user_id not in chat_histories:
         msgs = load_history_db(user_id)
@@ -594,7 +595,6 @@ async def _compress_history(user_id: int) -> None:
             log.debug("_save_topic: %s", e)
 
     asyncio.create_task(_save_topic())
-    # Зберігаємо короткий підсумок сесії в пам'ять
     try:
         session_summary = await call_ai([{"role": "user", "content": (
             f"Стисни суть цього діалогу в 1-2 речення для контексту наступної розмови.\n"
@@ -687,7 +687,6 @@ async def handle_task_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             tasks[n]["done"] = not tasks[n]["done"]
             set_user_tasks(user_id, tasks)
             await query.edit_message_reply_markup(reply_markup=_tasks_keyboard(tasks))
-
     elif data.startswith("task_del_"):
         n = int(data.split("_")[-1])
         if 0 <= n < len(tasks):
@@ -695,7 +694,6 @@ async def handle_task_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             set_user_tasks(user_id, tasks)
             text = "📋 *Твої задачі:*" if tasks else "📋 Список задач порожній."
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=_tasks_keyboard(tasks))
-
     elif data == "task_add":
         await query.message.reply_text("Напиши задачу: /tasks add текст")
 
@@ -753,22 +751,17 @@ async def detect_intent_ai(text: str) -> str:
         f"Визнач точний намір повідомлення. Відповідай ТІЛЬКИ одним словом з переліку.\n\n"
         f"Повідомлення: '{text}'\n\n"
         "НАМІРИ:\n"
-        "• image — намалювати, згенерувати, створити зображення/фото/картинку/ілюстрацію, навіть з опечатками\n"
-        "• reminder — нагадати про щось у конкретний час або через певний час (ОБОВ'ЯЗКОВО має бути час/дата)\n"
-        "• search — знайти актуальну інформацію в інтернеті, новини, погоду, ціни, курси, події\n"
-        "• translate — перекласти текст з однієї мови на іншу\n"
-        "• summarize — підсумувати статтю, текст або посилання\n"
-        "• generate — написати/створити текст: резюме, лист, пост, оголошення, статтю\n"
-        "• edit — відредагувати, покращити, виправити або переписати існуючий текст\n"
-        "• recipe — знайти рецепт або що приготувати з наявних інгредієнтів\n"
-        "• task — додати, видалити, показати або відмітити задачу зі списку\n"
-        "• chat — все інше: питання, розмова, пояснення, аналіз, порада\n\n"
-        "ПРАВИЛА:\n"
-        "1. Якщо є URL — майже завжди summarize\n"
-        "2. reminder ТІЛЬКИ якщо є явний час (через 30 хв, о 15:00, завтра)\n"
-        "3. search якщо потрібна СВІЖА або ПОТОЧНА інформація\n"
-        "4. chat якщо це питання на яке можна відповісти без інтернету\n"
-        "5. Повертай ТІЛЬКИ одне слово, без пояснень"
+        "• image — намалювати, згенерувати, створити зображення/фото/картинку\n"
+        "• reminder — нагадати про щось (ОБОВ'ЯЗКОВО має бути час/дата)\n"
+        "• search — знайти актуальну інформацію, новини, погоду, ціни\n"
+        "• translate — перекласти текст\n"
+        "• summarize — підсумувати статтю або текст\n"
+        "• generate — написати/створити текст: резюме, лист, пост\n"
+        "• edit — відредагувати або покращити існуючий текст\n"
+        "• recipe — знайти рецепт або що приготувати\n"
+        "• task — додати, видалити або показати задачу\n"
+        "• chat — все інше\n\n"
+        "Повертай ТІЛЬКИ одне слово без пояснень."
     )}])
     return result.strip().lower().strip("'\"").split()[0]
 
@@ -803,7 +796,7 @@ async def preprocess_query(user_id: int, text: str) -> str:
         expanded = (await call_ai([{"role": "user", "content": (
             f"Контекст:\n{context_text}\n\n"
             f"Розкрий предметний займенник у запиті: '{text}'\n"
-            "Поверни ТІЛЬКИ уточнений запит. Якщо займенник стосується людини або бота — поверни оригінал."
+            "Поверни ТІЛЬКИ уточнений запит."
         )}])).strip()
         if not expanded or len(expanded) < 3 or expanded.lower() in ("none", "null", "-", "—"):
             return text
@@ -903,11 +896,9 @@ _NON_UA_RE = re.compile(
 )
 
 async def _call_gemini(messages: list, model: str) -> str | None:
-    """Виклик Google Gemini через нативний API."""
     if not GOOGLE_API_KEY:
         return None
     try:
-        # Конвертуємо OpenAI формат в Gemini формат
         gemini_messages = []
         system_text = ""
         for m in messages:
@@ -920,6 +911,9 @@ async def _call_gemini(messages: list, model: str) -> str | None:
                 content = m["content"] if isinstance(m["content"], str) else str(m["content"])
                 gemini_messages.append({"role": "model", "parts": [{"text": content}]})
 
+        if not gemini_messages:
+            return None
+
         payload: dict = {"contents": gemini_messages}
         if system_text:
             payload["system_instruction"] = {"parts": [{"text": system_text}]}
@@ -931,20 +925,22 @@ async def _call_gemini(messages: list, model: str) -> str | None:
             log.warning("Gemini %s rate limit", model)
             return None
         r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        candidates = r.json().get("candidates", [])
+        if not candidates:
+            return None
+        return candidates[0]["content"]["parts"][0]["text"]
     except Exception as e:
         log.warning("Gemini %s failed: %s", model, e)
         return None
 
 async def call_ai(messages: list) -> str:
     """
-    Порядок провайдерів:
-    1. Gemini 2.0 Flash
-    2. Gemini 1.5 Flash
-    3. OpenRouter (llama-3.3-70b → llama-3.1-8b)
-    4. Groq (llama-3.3-70b)
+    Провайдери (безкоштовні):
+    1. Gemini 2.0 Flash  — найрозумніший, безкоштовний
+    2. Gemini 1.5 Flash  — швидкий fallback
+    3. Groq llama-3.3-70b — дуже швидкий, безкоштовний
+    4. OpenRouter llama-3.3-70b → llama-3.1-8b — резерв
     """
-    # Простий кеш для коротких допоміжних запитів (intent, gender, json)
     last_msg = messages[-1].get("content", "") if messages else ""
     if isinstance(last_msg, str) and len(last_msg) < 300 and len(messages) == 1:
         cache_key = last_msg[:200]
@@ -964,7 +960,22 @@ async def call_ai(messages: list) -> str:
         if result:
             log.debug("Provider: Gemini 1.5 Flash")
 
-    # 3. OpenRouter
+    # 3. Groq  ← ВИПРАВЛЕНО: Groq тепер перед OpenRouter (швидший і надійніший)
+    if result is None and GROQ_API_KEY:
+        try:
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+            # Фільтруємо системний промпт для Groq (він у messages[0])
+            groq_msgs = [m for m in messages if isinstance(m.get("content"), str)]
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": groq_msgs, "max_tokens": 2048})
+            if r.status_code not in (429, 503):
+                r.raise_for_status()
+                result = r.json()["choices"][0]["message"]["content"]
+                log.debug("Provider: Groq")
+        except Exception as e:
+            log.warning("Groq failed: %s", e)
+
+    # 4. OpenRouter
     if result is None and OPENROUTER_API_KEY:
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         for model in [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK]:
@@ -980,24 +991,11 @@ async def call_ai(messages: list) -> str:
             except Exception as e:
                 log.warning("OpenRouter %s failed: %s", model, e)
 
-    # 4. Groq
-    if result is None and GROQ_API_KEY:
-        try:
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.post(GROQ_URL, headers=headers, json={"model": GROQ_MODEL, "messages": messages})
-            if r.status_code != 429:
-                r.raise_for_status()
-                result = r.json()["choices"][0]["message"]["content"]
-                log.debug("Provider: Groq")
-        except Exception as e:
-            log.warning("Groq failed: %s", e)
-
     if not result or not result.strip():
         raise RuntimeError("All AI providers failed")
 
     if _NON_UA_RE.search(result):
-        log.warning("Non-Ukrainian response, retranslating")
+        log.warning("Non-Ukrainian response detected, retranslating")
         try:
             fix = messages + [
                 {"role": "assistant", "content": result},
@@ -1009,11 +1007,9 @@ async def call_ai(messages: list) -> str:
         except Exception as e:
             log.warning("Retranslation failed: %s", e)
 
-    # Зберігаємо в кеш
     if isinstance(last_msg, str) and len(last_msg) < 300 and len(messages) == 1:
         _ai_cache[last_msg[:200]] = result
         if len(_ai_cache) > 100:
-            # Очищаємо старі записи
             oldest = list(_ai_cache.keys())[:50]
             for k in oldest:
                 del _ai_cache[k]
@@ -1021,13 +1017,23 @@ async def call_ai(messages: list) -> str:
     return result
 
 async def call_vision(messages: list) -> str:
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(OPENROUTER_URL, headers=headers, json={"model": VISION_MODEL, "messages": messages})
-        r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    """Vision через Gemini (безкоштовно) або OpenRouter як fallback."""
+    # Спробуємо Gemini напряму (підтримує зображення)
+    result = await _call_gemini(messages, GEMINI_PRO_MODEL)
+    if result:
+        return result
+    # Fallback — OpenRouter з безкоштовною vision моделлю
+    if OPENROUTER_API_KEY:
+        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(OPENROUTER_URL, headers=headers, json={"model": VISION_MODEL, "messages": messages})
+            r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    raise RuntimeError("No vision provider available")
 
 async def transcribe_voice(audio_bytes: bytes) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY required for voice transcription")
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     files   = {"file": ("voice.ogg", audio_bytes, "audio/ogg")}
     data    = {"model": "whisper-large-v3", "language": "uk", "response_format": "text"}
@@ -1039,38 +1045,32 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
 # ── Image generation ──────────────────────────────────────────────────────────
 
 STYLE_HINTS: dict[str, str] = {
-    "mewgenics":     "mewgenics indie game pixel art style, chunky pixels, limited color palette, retro 16-bit aesthetic, cat characters",
     "ghibli":        "Studio Ghibli anime style, soft watercolor backgrounds, hand-drawn look, warm pastel colors",
     "cyberpunk":     "cyberpunk style, neon lights, dark dystopian city, rain reflections, high contrast",
-    "vaporwave":     "vaporwave aesthetic, pink and purple gradient, retro 80s, glitch effects, synthwave",
-    "comic":         "comic book style, bold outlines, halftone dots, flat colors, dynamic poses",
-    "watercolor":    "watercolor painting style, soft edges, translucent washes, paper texture",
-    "oil painting":  "oil painting style, rich textures, visible brushstrokes, classical composition",
     "pixel art":     "pixel art style, 16-bit retro, chunky pixels, limited color palette",
     "anime":         "anime style, cel shading, large expressive eyes, vibrant colors, clean lines",
+    "watercolor":    "watercolor painting style, soft edges, translucent washes, paper texture",
+    "oil painting":  "oil painting style, rich textures, visible brushstrokes, classical composition",
     "noir":          "film noir style, black and white, high contrast shadows, dramatic lighting",
     "minimalist":    "minimalist style, clean lines, flat colors, simple shapes, lots of whitespace",
-    "surrealism":    "surrealist style, dreamlike, impossible scenes, Salvador Dali inspired",
-    "low poly":      "low poly 3D style, geometric shapes, flat shading, triangulated surfaces",
     "sketch":        "pencil sketch style, hand-drawn lines, crosshatching, monochrome",
-    "ukiyo-e":       "ukiyo-e Japanese woodblock print style, bold outlines, flat colors, traditional",
-    "impressionism": "impressionist painting style, visible brushstrokes, light and color focus, Monet inspired",
+    "comic":         "comic book style, bold outlines, halftone dots, flat colors, dynamic poses",
     "pop art":       "pop art style, bold colors, Ben-Day dots, Andy Warhol inspired, high contrast",
     "sticker":       "sticker art style, thick white outline, flat colors, cute cartoon, glossy look",
-    "claymation":    "claymation style, clay texture, 3D molded look, soft rounded shapes, stop motion",
-    "concept art":   "concept art style, detailed environment, cinematic lighting, professional illustration",
 }
 
-def _enrich_prompt_with_style(prompt: str, style_hint: str) -> str:
-    pl = prompt.lower()
+def _enrich_prompt_with_style(prompt: str, original: str) -> str:
+    ol = original.lower()
     for key, description in STYLE_HINTS.items():
-        if key in pl:
+        if key in ol:
             prompt = re.sub(re.escape(key), description, prompt, flags=re.IGNORECASE)
             break
     return prompt
 
 async def _call_ai_english(instruction: str) -> str:
+    """Окремий виклик для отримання англійського промпту."""
     messages = [{"role": "user", "content": instruction}]
+    # Groq найшвидший для цього
     if GROQ_API_KEY:
         try:
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
@@ -1080,41 +1080,35 @@ async def _call_ai_english(instruction: str) -> str:
             return r.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
             log.warning("_call_ai_english Groq failed: %s", e)
-    if OPENROUTER_API_KEY:
-        try:
-            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(OPENROUTER_URL, headers=headers, json={"model": OPENROUTER_MODEL, "messages": messages})
-                r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            log.warning("_call_ai_english OpenRouter failed: %s", e)
+    if GOOGLE_API_KEY:
+        result = await _call_gemini(messages, GEMINI_FLASH_MODEL)
+        if result:
+            return result
     raise RuntimeError("_call_ai_english: all providers failed")
 
 async def _build_image_prompt(user_request: str, ctx_desc: str = "") -> str:
     if ctx_desc:
         instruction = (
             f"You are a prompt engineer for an image generation model.\n"
-            f"Base subject (keep exactly as described): {ctx_desc[:300]}\n"
-            f"Apply this modification or style: {user_request}\n\n"
-            f"Rules:\n- Write the prompt in ENGLISH only.\n"
-            f"- Translate LITERALLY. Describe only visual elements. Max 60 words.\n"
-            f"- Return ONLY the prompt, no explanations."
+            f"Base subject: {ctx_desc[:300]}\n"
+            f"Apply this modification: {user_request}\n\n"
+            f"Write the prompt in ENGLISH only. Max 60 words. Return ONLY the prompt."
         )
     else:
         instruction = (
-            f"You are a prompt engineer for an image generation model.\n"
             f"Translate this image request to ENGLISH ONLY.\n"
             f"Be specific and concrete. Max 60 words.\n"
-            f"Return ONLY the English prompt, no explanations.\n\nRequest: {user_request}"
+            f"Return ONLY the English prompt.\n\nRequest: {user_request}"
         )
     translation = await _call_ai_english(instruction)
     translation = _enrich_prompt_with_style(translation, user_request)
     translation = f"{translation}, highly detailed, sharp focus, high quality"
-    log.info("Image prompt sent to CF Flux: %s", translation)
+    log.info("Image prompt: %s", translation)
     return translation
 
 async def generate_image(prompt: str) -> bytes:
+    if not CF_API_TOKEN or not CF_ACCOUNT_ID:
+        raise RuntimeError("CF_API_TOKEN and CF_ACCOUNT_ID are required for image generation")
     url     = CF_IMAGE_URL.format(account_id=CF_ACCOUNT_ID)
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
     last_error = None
@@ -1125,10 +1119,14 @@ async def generate_image(prompt: str) -> bytes:
                 r.raise_for_status()
             if "image" in r.headers.get("content-type", ""):
                 return r.content
-            return base64.b64decode(r.json().get("result", {}).get("image", ""))
+            result = r.json().get("result", {})
+            img_b64 = result.get("image", "")
+            if img_b64:
+                return base64.b64decode(img_b64)
+            raise RuntimeError(f"No image in response: {r.text[:200]}")
         except Exception as e:
             last_error = e
-            log.warning("generate_image attempt %d failed: %s", attempt + 1, e)
+            log.warning("generate_image attempt %d: %s", attempt + 1, e)
             await asyncio.sleep(5)
     raise last_error
 
@@ -1169,7 +1167,7 @@ async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> s
         if transcript:
             results.append(f"🎤 Аудіо:\n{transcript}")
     except Exception as e:
-        log.warning("analyze_video audio failed: %s", e)
+        log.warning("analyze_video audio: %s", e)
     try:
         frames = await extract_video_frames(video_bytes)
         if frames:
@@ -1178,12 +1176,12 @@ async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> s
                 b64  = base64.b64encode(frame).decode()
                 desc = await call_vision([sys_prompt, {"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    {"type": "text", "text": f"Опиши кадр {i+1}. Коротко, 1-2 речення."},
+                    {"type": "text", "text": f"Опиши кадр {i+1}. Коротко."},
                 ]}])
                 descs.append(f"Кадр {i+1}: {desc}")
             results.append("🎬 Відео:\n" + "\n".join(descs))
     except Exception as e:
-        log.warning("analyze_video frames failed: %s", e)
+        log.warning("analyze_video frames: %s", e)
     if not results:
         return "❌ Не вдалось проаналізувати відео."
     combined = "\n\n".join(results)
@@ -1193,19 +1191,14 @@ async def analyze_video(video_bytes: bytes, caption: str, user_id: int = 0) -> s
 # ── Web search ────────────────────────────────────────────────────────────────
 
 async def search_web(query: str, search_type: str = "general") -> str:
-    """
-    search_type: general | news | weather | price
-    """
     if TAVILY_API_KEY:
         try:
-            # Параметри залежно від типу пошуку
             kwargs: dict = {"query": query, "max_results": SEARCH_RESULTS}
             if search_type == "news":
                 kwargs["topic"] = "news"
                 kwargs["max_results"] = 5
             elif search_type in ("weather", "price"):
                 kwargs["max_results"] = 3
-
             results = await asyncio.to_thread(
                 lambda: TavilyClient(api_key=TAVILY_API_KEY).search(**kwargs)
             )
@@ -1225,6 +1218,7 @@ async def search_web(query: str, search_type: str = "general") -> str:
                 return "\n\n".join(parts)
         except Exception as e:
             log.warning("Tavily error: %s", e)
+    # Fallback — DuckDuckGo
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.get("https://html.duckduckgo.com/html/", params={"q": query}, headers=_HEADERS)
@@ -1245,11 +1239,10 @@ async def search_web(query: str, search_type: str = "general") -> str:
     return ""
 
 def _detect_search_type(query: str) -> str:
-    """Визначає тип пошуку для оптимізації запиту."""
     q = query.lower()
-    if any(w in q for w in ["новини","новина","подія","події","що сталось","що відбулось"]):
+    if any(w in q for w in ["новини","новина","подія","що сталось","що відбулось"]):
         return "news"
-    if any(w in q for w in ["погода","температура","дощ","сніг","хмарно"]):
+    if any(w in q for w in ["погода","температура","дощ","сніг"]):
         return "weather"
     if any(w in q for w in ["ціна","вартість","коштує","курс","скільки"]):
         return "price"
@@ -1293,7 +1286,7 @@ def extract_txt_text(txt_bytes: bytes) -> str:
             return txt_bytes.decode(enc).strip()
         except Exception:
             continue
-    return "Помилка читання TXT: невідоме кодування."
+    return "Помилка читання TXT."
 
 def extract_word_text(docx_bytes: bytes) -> str:
     try:
@@ -1327,7 +1320,7 @@ async def do_summarize(text: str) -> str:
         prompt = (
             f"Підсумуй статтю українською.\n{'Додатково: ' + extra if extra else ''}\n\n"
             f"Стаття ({url}):\n{content}\n\n"
-            "Формат (Markdown):\n## 📌 Головна думка\n...\n\n## 🔹 Ключові тези\n- теза 1"
+            "Формат:\n## 📌 Головна думка\n...\n\n## 🔹 Ключові тези\n- теза 1"
         )
     else:
         prompt = f"Стислий підсумок українською.\n\nТекст: {text}\n\nФормат:\n## 📌 Головна думка\n...\n\n## 🔹 Тези\n- теза 1"
@@ -1441,6 +1434,7 @@ async def restore_reminders(bot) -> None:
 
 async def send_daily_brief(bot) -> None:
     if not BRIEF_CHAT_ID:
+        log.warning("BRIEF_CHAT_ID not set, skipping brief")
         return
     try:
         chat_id = int(BRIEF_CHAT_ID)
@@ -1448,7 +1442,7 @@ async def send_daily_brief(bot) -> None:
         pending = [t["text"] for t in tasks if not t.get("done")]
 
         news_results    = await search_web("головні новини України сьогодні", "news")
-        weather_results = await search_web("погода Рівне Україна сьогодні", "weather")
+        weather_results = await search_web("погода Київ Україна сьогодні", "weather")
 
         tasks_block = ""
         if pending:
@@ -1460,28 +1454,23 @@ async def send_daily_brief(bot) -> None:
             {"role": "user", "content": (
                 f"Зроби короткий ранковий бриф у стилі J.A.R.V.I.S.\n\n"
                 f"Поточний час: {now_kyiv().strftime('%d.%m.%Y %H:%M')}\n\n"
-                f"Погода в Рівному:\n{weather_results[:500]}\n\n"
+                f"Погода:\n{weather_results[:500]}\n\n"
                 f"Новини:\n{news_results[:1500]}\n\n"
-                "Формат відповіді (суворо дотримуйся):\n"
-                "🌤 Погода: [одне речення про погоду в Рівному]\n\n"
-                "📰 Новини:\n"
-                "1️⃣ [новина 1]\n"
-                "2️⃣ [новина 2]\n"
-                "3️⃣ [новина 3]\n\n"
-                "Стиль: стриманий J.A.R.V.I.S., лаконічно, без зайвих слів."
+                "Формат:\n"
+                "🌤 Погода: [одне речення]\n\n"
+                "📰 Новини:\n1️⃣ [новина 1]\n2️⃣ [новина 2]\n3️⃣ [новина 3]\n\n"
+                "Стиль: стриманий J.A.R.V.I.S., лаконічно."
             )},
         ])
 
         date_str = now_kyiv().strftime("%d.%m.%Y")
         brief_md = clean_markdown(brief)
         tasks_md = clean_markdown(tasks_block) if tasks_block else ""
-
-        text = f"🤖 *J\\.A\\.R\\.V\\.I\\.S\\.* \\| {date_str}\n{'─' * 28}\n\n{brief_md}{tasks_md}"
+        text     = f"🤖 *J\\.A\\.R\\.V\\.I\\.S\\.* \\| {date_str}\n{'─' * 28}\n\n{brief_md}{tasks_md}"
 
         try:
             await bot.send_message(chat_id=chat_id, text=text, parse_mode="MarkdownV2")
         except Exception:
-            # fallback — plain text
             plain = re.sub(r'[\\*_`\[\]()]', '', text)
             await bot.send_message(chat_id=chat_id, text=plain)
     except Exception as e:
@@ -1495,54 +1484,6 @@ async def _brief_scheduler(bot) -> None:
             next_brief += timedelta(days=1)
         await asyncio.sleep((next_brief - now).total_seconds())
         await send_daily_brief(bot)
-
-async def send_proactive_reminder(bot, user_id: int) -> None:
-    """Надсилає нагадування якщо є незакриті задачі і користувач давно не писав."""
-    try:
-        tasks   = get_user_tasks(user_id)
-        pending = [t["text"] for t in tasks if not t.get("done")]
-        if not pending:
-            return
-        mem  = get_user_memory(user_id)
-        name = mem.get("name", "")
-        address = f", {name}" if name else ", сер"
-        tasks_lines = "\n".join(f"  ◦ {t}" for t in pending[:5])
-        text = (
-            f"🔔 До речі{address} — у вас є незакриті задачі:\n\n"
-            f"{tasks_lines}\n\n"
-            f"Бажаєте відмітити виконані? /tasks"
-        )
-        await bot.send_message(chat_id=user_id, text=text)
-        log.info("Proactive reminder sent to user %s", user_id)
-    except Exception as e:
-        log.warning("send_proactive_reminder: %s", e)
-
-async def _proactive_scheduler(bot) -> None:
-    """Щодня о 18:00 перевіряє користувачів які не писали 2+ дні і мають незакриті задачі."""
-    CHECK_HOUR = 18
-    INACTIVE_DAYS = 2
-    while True:
-        now       = now_kyiv()
-        next_check = now.replace(hour=CHECK_HOUR, minute=0, second=0, microsecond=0)
-        if now >= next_check:
-            next_check += timedelta(days=1)
-        await asyncio.sleep((next_check - now).total_seconds())
-        try:
-            with _db() as con:
-                rows = con.execute("SELECT user_id, data FROM memory").fetchall()
-            for row in rows:
-                uid  = row["user_id"]
-                data = json.loads(row["data"])
-                last_seen_str = data.get("last_seen")
-                if not last_seen_str:
-                    continue
-                last_seen = datetime.fromisoformat(last_seen_str)
-                if last_seen.tzinfo is None:
-                    last_seen = last_seen.replace(tzinfo=TZ)
-                if (now_kyiv() - last_seen).days >= INACTIVE_DAYS:
-                    await send_proactive_reminder(bot, uid)
-        except Exception as e:
-            log.error("_proactive_scheduler: %s", e)
 
 # ── Gender detection ──────────────────────────────────────────────────────────
 
@@ -1579,7 +1520,7 @@ async def _send_or_edit(msg, text: str, parse_mode: str | None = "MarkdownV2", *
                 else:
                     await msg.reply_text(plain, **kwargs)
             except Exception as e:
-                log.error("_send_or_edit fallback failed: %s", e)
+                log.error("_send_or_edit failed: %s", e)
 
 async def _send_chunk(update: Update, chunk: str, voice_msg=None):
     try:
@@ -1686,7 +1627,7 @@ async def _do_generate_image(update: Update, text: str, msg, user_id: int = 0):
         await msg.delete()
     except Exception as e:
         log.error("_do_generate_image: %s", e)
-        await msg.edit_text("Помилка генерації. Спробуй ще раз.")
+        await msg.edit_text("❌ Помилка генерації зображення. Перевір налаштування Cloudflare.")
 
 async def _do_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     now    = now_kyiv()
@@ -1750,23 +1691,16 @@ async def _dispatch_intent(
                 if results else
                 f"Запит: '{enriched}'\n\nВідповідай з власних знань українською."
             )
-            reply = await call_ai([get_active_system_prompt(user_id), {"role": "user", "content": (
-                content + "\n\nФорматуй відповідь так:\n"
-                "- Якщо є заголовок — виділи його **жирним**\n"
-                "- Використовуй емодзі на початку кожного смислового блоку\n"
-                "- Джерела вказуй в кінці курсивом\n"
-                "- Розділяй блоки порожнім рядком\n"
-                "- Не використовуй таблиці і горизонтальні лінії"
-            )}])
+            reply = await call_ai([get_active_system_prompt(user_id), {"role": "user", "content": content}])
             await append_and_trim(user_id, "user", user_text)
             await append_and_trim(user_id, "assistant", reply)
             _set_ctx(user_id, user_text, reply)
-            date_str  = now_kyiv().strftime("%d.%m.%Y")
-            header    = clean_markdown(f"🤖 *J.A.R.V.I.S.* | {date_str}\n{'─' * 28}\n\n")
+            date_str = now_kyiv().strftime("%d.%m.%Y")
+            header   = clean_markdown(f"🤖 *J.A.R.V.I.S.* | {date_str}\n{'─' * 28}\n\n")
             await _send_or_edit(msg, header + clean_markdown(f"{prefix}{reply}"), disable_web_page_preview=True)
         except Exception as e:
             log.error("search dispatch: %s", e, exc_info=True)
-            await msg.edit_text(f"{prefix}Помилка пошуку: {e}")
+            await msg.edit_text(f"{prefix}❌ Помилка пошуку.")
         return True
 
     INTENT_MAP = {
@@ -1804,7 +1738,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Список задач 📋\n• Аналізую фото та відео 🎬\n"
         "• Генерую зображення 🎨\n• Голосові повідомлення 🎤\n"
         "• Шукаю в інтернеті 🔍\n• Читаю PDF, Excel, Word 📄\n"
-        "• Нагадування 🔔\n• Щоденний бриф о 8:00 🌅\n\n"
+        "• Нагадування 🔔\n• Щоденний бриф вранці 🌅\n\n"
         "Чим можу допомогти, сер?\n/help — команди"
     )
 
@@ -1847,7 +1781,6 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{p['emoji']} Режим: {p['name']}")
         return
 
-    # Inline-кнопки для вибору режиму
     buttons = []
     for key, p in PERSONALITIES.items():
         mark = " ✅" if key == current else ""
@@ -1855,26 +1788,19 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{p['emoji']} {p['name']}{mark}",
             callback_data=f"mode_{key}",
         )])
-    await update.message.reply_text(
-        "🎭 Обери режим:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    await update.message.reply_text("🎭 Обери режим:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def handle_mode_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
     mode    = query.data.replace("mode_", "")
     await query.answer()
-
     if mode not in PERSONALITIES:
         return
-
     user_personalities[user_id] = mode
     update_user_memory(user_id, {"mode": mode})
     chat_histories[user_id] = [get_system_prompt(user_id)]
     p = PERSONALITIES[mode]
-
-    # Оновлюємо кнопки — відмічаємо активний
     buttons = []
     for key, pers in PERSONALITIES.items():
         mark = " ✅" if key == mode else ""
@@ -1928,7 +1854,7 @@ async def handle_image_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.delete()
     except Exception as e:
         log.error("handle_image_cmd: %s", e)
-        await msg.edit_text("Помилка генерації. Спробуй ще раз.")
+        await msg.edit_text("❌ Помилка генерації зображення.")
 
 async def handle_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or len(ctx.args) < 2:
@@ -1972,7 +1898,7 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_or_edit(msg, f"🌐 {query}\n\n{clean_markdown(reply)}")
     except Exception as e:
         log.error("handle_search: %s", e)
-        await msg.edit_text("Помилка пошуку. Спробуй ще раз.")
+        await msg.edit_text("❌ Помилка пошуку. Спробуй ще раз.")
 
 async def handle_brief_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🌅 Готую бриф...")
@@ -1987,20 +1913,22 @@ async def handle_brief_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Помилка брифу: {e}")
 
 async def handle_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tavily_status = "❌ Не налаштовано"
-    if TAVILY_API_KEY:
-        try:
-            await asyncio.to_thread(lambda: TavilyClient(api_key=TAVILY_API_KEY).search(query="test", max_results=1))
-            tavily_status = "🟢 Працює"
-        except Exception as e:
-            tavily_status = f"🔴 {str(e)[:50]}"
+    providers = []
+    if GOOGLE_API_KEY:  providers.append("✅ Gemini")
+    if GROQ_API_KEY:    providers.append("✅ Groq")
+    if OPENROUTER_API_KEY: providers.append("✅ OpenRouter")
+
+    tavily_ok = "✅ Tavily" if TAVILY_API_KEY else "❌ Tavily (немає ключа)"
+    cf_ok     = "✅ Cloudflare Images" if (CF_API_TOKEN and CF_ACCOUNT_ID) else "❌ Cloudflare (немає ключів)"
+
     await update.message.reply_text(
-        f"📊 Статус:\n"
-        f"• AI: Gemini Pro → Gemini Flash → OpenRouter → Groq\n"
-        f"• Tavily: {tavily_status}\n"
-        f"• Нагадувань: {len(load_reminders())}\n"
-        f"• Активних сесій: {len(chat_histories)}\n"
-        f"• DB: Supabase PostgreSQL"
+        f"📊 Статус J.A.R.V.I.S.:\n\n"
+        f"🤖 AI провайдери: {', '.join(providers)}\n"
+        f"🔍 Пошук: {tavily_ok}\n"
+        f"🎨 Зображення: {cf_ok}\n"
+        f"🔔 Нагадувань: {len(load_reminders())}\n"
+        f"💬 Активних сесій: {len(chat_histories)}\n"
+        f"🗄 DB: Neon PostgreSQL"
     )
 
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2099,17 +2027,23 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         file    = await ctx.bot.get_file(photo.file_id)
         img_b64 = base64.b64encode(await file.download_as_bytearray()).decode()
         caption = update.message.caption or "Що зображено? Опиши детально українською."
-        reply   = await call_vision([get_active_system_prompt(user_id), {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-            {"type": "text", "text": caption},
-        ]}])
+
+        # Gemini підтримує base64 images напряму
+        vision_messages = [
+            get_active_system_prompt(user_id),
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                {"type": "text", "text": caption},
+            ]}
+        ]
+        reply = await call_vision(vision_messages)
         last_context[user_id] = {"type": "фото", "description": reply[:CTX_DESCRIPTION_LEN]}
         await append_and_trim(user_id, "user", f"[Фото] {caption}")
         await append_and_trim(user_id, "assistant", reply)
         await _send_or_edit(msg, clean_markdown(reply))
     except Exception as e:
         log.error("handle_photo: %s", e)
-        await msg.edit_text("Помилка аналізу зображення. Спробуй ще раз.")
+        await msg.edit_text("❌ Помилка аналізу зображення. Спробуй ще раз.")
 
 async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg     = await update.message.reply_text("🎬 Аналізую відео...")
@@ -2128,14 +2062,14 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_or_edit(msg, clean_markdown(result))
     except Exception as e:
         log.error("handle_video: %s", e)
-        await msg.edit_text("Помилка аналізу відео. Спробуй ще раз.")
+        await msg.edit_text("❌ Помилка аналізу відео.")
 
 async def handle_sticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     import random
-    user_id = update.message.from_user.id
+    user_id  = update.message.from_user.id
     reaction = random.choice(STICKER_REACTIONS)
-    mem  = get_user_memory(user_id)
-    name = mem.get("name")
+    mem      = get_user_memory(user_id)
+    name     = mem.get("name")
     if name:
         reaction = reaction.replace("сер", name)
     await update.message.reply_text(reaction)
@@ -2172,7 +2106,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_or_edit(msg, f"📄 {doc.file_name}\n\n{clean_markdown(reply)}")
     except Exception as e:
         log.error("handle_document: %s", e)
-        await msg.edit_text("Помилка обробки документу. Спробуй ще раз.")
+        await msg.edit_text("❌ Помилка обробки документу.")
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🎤 Розпізнаю...")
@@ -2194,7 +2128,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _process_message(update, ctx, user_id, text, voice_msg=msg)
     except Exception as e:
         log.error("handle_voice: %s", e)
-        await msg.edit_text("Помилка голосового. Спробуй ще раз.")
+        await msg.edit_text("❌ Помилка голосового. Спробуй ще раз.")
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
@@ -2202,23 +2136,29 @@ async def post_init(app) -> None:
     init_db()
     await restore_reminders(app.bot)
     # Відновлюємо режими з DB
-    with _db() as con:
-        with con.cursor() as cur:
-            cur.execute("SELECT user_id, data FROM memory")
-            rows = cur.fetchall()
-    for row in rows:
-        data = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
-        if data.get("mode"):
-            user_personalities[row["user_id"]] = data["mode"]
-    # Запускаємо планувальник брифу
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT user_id, data FROM memory")
+                rows = cur.fetchall()
+        for row in rows:
+            data = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
+            if data.get("mode"):
+                user_personalities[row["user_id"]] = data["mode"]
+    except Exception as e:
+        log.warning("post_init restore modes: %s", e)
+
     asyncio.create_task(_brief_scheduler(app.bot))
-    asyncio.create_task(_proactive_scheduler(app.bot))
-    log.info("Bot initialized, DB=%s", DB_PATH)
+    log.info("J.A.R.V.I.S. initialized. DB=Neon PostgreSQL, keep-alive server=active")
 
 if __name__ == "__main__":
+    # Запускаємо HTTP сервер у фоні (для Render keep-alive)
+    web_thread = threading.Thread(target=_start_web_server, daemon=True)
+    web_thread.start()
+    log.info("Keep-alive HTTP server started")
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
-    # Commands
     app.add_handler(CommandHandler("start",     start))
     app.add_handler(CommandHandler("help",      help_cmd))
     app.add_handler(CommandHandler("mode",      mode_cmd))
@@ -2237,15 +2177,13 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("tasks",     handle_tasks_cmd))
     app.add_handler(CommandHandler("brief",     handle_brief_cmd))
 
-    # Callbacks
     app.add_handler(CallbackQueryHandler(handle_mode_callback, pattern="^mode_"))
     app.add_handler(CallbackQueryHandler(handle_task_callback, pattern="^task_"))
 
-    # Media
-    app.add_handler(MessageHandler(filters.PHOTO,                        handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE,                        handle_voice))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE,   handle_video))
-    app.add_handler(MessageHandler(filters.Sticker.ALL,                  handle_sticker))
+    app.add_handler(MessageHandler(filters.PHOTO,                      handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE,                      handle_voice))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
+    app.add_handler(MessageHandler(filters.Sticker.ALL,                handle_sticker))
     app.add_handler(MessageHandler(
         filters.Document.PDF |
         filters.Document.MimeType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") |
@@ -2257,5 +2195,5 @@ if __name__ == "__main__":
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    log.info("Bot started")
+    log.info("Bot polling started")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
