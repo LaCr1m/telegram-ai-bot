@@ -1442,7 +1442,7 @@ async def send_daily_brief(bot) -> None:
         pending = [t["text"] for t in tasks if not t.get("done")]
 
         news_results    = await search_web("головні новини України сьогодні", "news")
-        weather_results = await search_web("погода Київ Україна сьогодні", "weather")
+        weather_results = await search_web("погода Рівне Україна сьогодні", "weather")
 
         tasks_block = ""
         if pending:
