@@ -990,10 +990,31 @@ async def call_ai(messages: list) -> str:
 
     return result
 
+async def _call_cf_vision(img_b64: str, caption: str) -> str:
+    """Аналіз зображення через Cloudflare Workers AI (llava)."""
+    if not CF_API_TOKEN or not CF_ACCOUNT_ID:
+        raise RuntimeError("CF credentials missing")
+    url     = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/llava-1.5-7b-hf"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "image": list(base64.b64decode(img_b64)),
+        "prompt": caption,
+        "max_tokens": 512,
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, headers=headers, json=payload)
+    r.raise_for_status()
+    result = r.json().get("result", {})
+    desc   = result.get("description") or result.get("response") or ""
+    if not desc:
+        raise RuntimeError(f"CF vision empty response: {r.text[:200]}")
+    return desc
+
 async def _call_gemini_vision(img_b64: str, caption: str, user_id: int = 0) -> str:
     """
-    Аналіз зображення через Gemini Vision.
-    Використовує обидва ключі (основний + vision) та дві моделі як fallback.
+    Аналіз зображення:
+    1. Gemini Vision (vision ключ + основний ключ, 2 моделі)
+    2. Cloudflare Workers AI llava (fallback)
     """
     sys_prompt  = get_active_system_prompt(user_id)
     system_text = sys_prompt.get("content", "") if isinstance(sys_prompt, dict) else ""
@@ -1007,7 +1028,6 @@ async def _call_gemini_vision(img_b64: str, caption: str, user_id: int = 0) -> s
     if system_text:
         payload["system_instruction"] = {"parts": [{"text": system_text}]}
 
-    # Всі комбінації ключ × модель
     vision_keys = [k for k in [GOOGLE_API_KEY_VISION, GOOGLE_API_KEY] if k]
     models      = [GEMINI_PRO_MODEL, GEMINI_FLASH_MODEL]
 
@@ -1029,7 +1049,20 @@ async def _call_gemini_vision(img_b64: str, caption: str, user_id: int = 0) -> s
                 log.warning("Vision error model=%s: %s", model, e)
                 continue
 
-    raise RuntimeError("All Gemini vision combinations failed (rate limit or error)")
+    # Fallback — Cloudflare Workers AI
+    log.warning("All Gemini vision failed, trying Cloudflare llava")
+    try:
+        desc = await _call_cf_vision(img_b64, caption)
+        # Перекладаємо відповідь українською через call_ai
+        translated = await call_ai([{"role": "user", "content": (
+            f"Опис зображення (перефразуй українською у стилі J.A.R.V.I.S., стисло):\n{desc}"
+        )}])
+        log.info("Vision OK: Cloudflare llava")
+        return translated
+    except Exception as e:
+        log.error("Cloudflare vision failed: %s", e)
+
+    raise RuntimeError("All vision providers failed")
 
 async def transcribe_voice(audio_bytes: bytes) -> str:
     if not GROQ_API_KEY:
