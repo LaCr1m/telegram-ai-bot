@@ -290,7 +290,9 @@ _JARVIS_CORE = (
     "2. Легка британська іронія — тонко, без грубого сарказму.\n"
     "3. Лаконічний — говориш рівно стільки, скільки потрібно.\n"
     "4. Можеш м'яко заперечити, але без зарозумілості.\n"
-    "5. Беззаперечно відданий користувачу.\n\n"
+    "5. Беззаперечно відданий користувачу.\n"
+    "6. НІКОЛИ не вітайся повторно якщо розмова вже триває — відповідай одразу по суті.\n"
+    "7. НІКОЛИ не питай 'чим можу допомогти' якщо користувач вже щось сказав.\n\n"
     "Стиль: елегантний, точний, трохи офіційний але не сухий.\n"
     "Звертання: 'сер' або на ім'я якщо відоме.\n"
     "НІКОЛИ: не захоплюєшся надмірно, не скаржишся, не перетягуєш увагу на себе.\n"
@@ -1605,6 +1607,16 @@ async def _process_message(
             dynamic_prompt = build_dynamic_prompt(user_id, emotion)
         except Exception:
             dynamic_prompt = get_system_prompt(user_id)
+
+        # Не повторювати привітання якщо вже є контекст розмови
+        history_msgs = [m for m in get_history(user_id) if m.get("role") != "system"]
+        if len(history_msgs) > 2:
+            dynamic_prompt = build_dynamic_prompt(user_id, emotion)
+        else:
+            try:
+                dynamic_prompt = build_dynamic_prompt(user_id, emotion)
+            except Exception:
+                dynamic_prompt = get_system_prompt(user_id)
 
         history  = get_history(user_id)
         messages = [dynamic_prompt] + [m for m in history if m.get("role") != "system"]
