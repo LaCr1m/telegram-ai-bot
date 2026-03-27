@@ -994,14 +994,12 @@ async def _call_cf_vision(img_b64: str, caption: str) -> str:
     """Аналіз зображення через Cloudflare Workers AI (llava)."""
     if not CF_API_TOKEN or not CF_ACCOUNT_ID:
         raise RuntimeError("CF credentials missing")
-    url     = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/llava-1.5-7b-hf"
+    url     = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/unum/uform-gen2-qwen-500m"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
-    # llava очікує масив uint8 значень
-    img_bytes = list(base64.b64decode(img_b64))
+    # uform-gen2 очікує base64 рядок і текстовий запит
     payload = {
-        "image": img_bytes,
-        "prompt": f"Describe this image in detail: {caption}",
-        "max_tokens": 512,
+        "image": img_b64,
+        "query": caption,
     }
     async with httpx.AsyncClient(timeout=90) as client:
         r = await client.post(url, headers=headers, json=payload)
