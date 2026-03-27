@@ -996,18 +996,22 @@ async def _call_cf_vision(img_b64: str, caption: str) -> str:
         raise RuntimeError("CF credentials missing")
     url     = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/llava-1.5-7b-hf"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
+    # llava очікує масив uint8 значень
+    img_bytes = list(base64.b64decode(img_b64))
     payload = {
-        "image": list(base64.b64decode(img_b64)),
-        "prompt": caption,
+        "image": img_bytes,
+        "prompt": f"Describe this image in detail: {caption}",
         "max_tokens": 512,
     }
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         r = await client.post(url, headers=headers, json=payload)
-    r.raise_for_status()
-    result = r.json().get("result", {})
+    if r.status_code != 200:
+        raise RuntimeError(f"CF vision HTTP {r.status_code}: {r.text[:300]}")
+    data   = r.json()
+    result = data.get("result", {})
     desc   = result.get("description") or result.get("response") or ""
     if not desc:
-        raise RuntimeError(f"CF vision empty response: {r.text[:200]}")
+        raise RuntimeError(f"CF vision empty: {data}")
     return desc
 
 async def _call_gemini_vision(img_b64: str, caption: str, user_id: int = 0) -> str:
