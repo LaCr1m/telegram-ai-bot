@@ -50,7 +50,7 @@ TAVILY_API_KEY         = _require_env("TAVILY_API_KEY")
 CF_API_TOKEN           = _require_env("CF_API_TOKEN")
 CF_ACCOUNT_ID          = _require_env("CF_ACCOUNT_ID")
 GOOGLE_API_KEY         = _require_env("GOOGLE_API_KEY")
-GOOGLE_API_KEY_VISION  = _require_env("GOOGLE_API_KEY_VISION")  # окремий акаунт для vision
+GOOGLE_API_KEY_VISION  = _require_env("GOOGLE_API_KEY_VISION")
 BRIEF_CHAT_ID          = _require_env("BRIEF_CHAT_ID")
 DATABASE_URL           = _require_env("DATABASE_URL")
 
@@ -112,7 +112,13 @@ def _start_web_server():
 # ── PostgreSQL storage ────────────────────────────────────────────────────────
 
 def _db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    con = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+        connect_timeout=10,
+    )
+    con.autocommit = False
+    return con
 
 def init_db() -> None:
     with _db() as con:
@@ -1490,12 +1496,18 @@ async def send_daily_brief(bot) -> None:
 
 async def _brief_scheduler(bot) -> None:
     while True:
-        now        = now_kyiv()
-        next_brief = now.replace(hour=BRIEF_HOUR, minute=0, second=0, microsecond=0)
-        if now >= next_brief:
-            next_brief += timedelta(days=1)
-        await asyncio.sleep((next_brief - now).total_seconds())
-        await send_daily_brief(bot)
+        try:
+            now        = now_kyiv()
+            next_brief = now.replace(hour=BRIEF_HOUR, minute=0, second=0, microsecond=0)
+            if now >= next_brief:
+                next_brief += timedelta(days=1)
+            await asyncio.sleep((next_brief - now).total_seconds())
+            await send_daily_brief(bot)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error("_brief_scheduler error: %s", e)
+            await asyncio.sleep(60)
 
 # ── Gender detection ──────────────────────────────────────────────────────────
 
@@ -2139,7 +2151,8 @@ async def post_init(app) -> None:
                 user_personalities[row["user_id"]] = data["mode"]
     except Exception as e:
         log.warning("post_init restore modes: %s", e)
-    asyncio.create_task(_brief_scheduler(app.bot))
+    # Зберігаємо посилання на task щоб уникнути garbage collection
+    app._brief_task = asyncio.create_task(_brief_scheduler(app.bot))
     log.info("J.A.R.V.I.S. initialized. DB=Neon PostgreSQL, keep-alive=active")
 
 if __name__ == "__main__":
