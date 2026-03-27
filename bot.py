@@ -996,9 +996,9 @@ async def _call_cf_vision(img_b64: str, caption: str) -> str:
         raise RuntimeError("CF credentials missing")
     url     = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/unum/uform-gen2-qwen-500m"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
-    # uform-gen2 очікує base64 рядок і текстовий запит
+    # uform-gen2 очікує масив uint8
     payload = {
-        "image": img_b64,
+        "image": list(base64.b64decode(img_b64)),
         "query": caption,
     }
     async with httpx.AsyncClient(timeout=90) as client:
@@ -1007,7 +1007,7 @@ async def _call_cf_vision(img_b64: str, caption: str) -> str:
         raise RuntimeError(f"CF vision HTTP {r.status_code}: {r.text[:300]}")
     data   = r.json()
     result = data.get("result", {})
-    desc   = result.get("description") or result.get("response") or ""
+    desc   = result.get("description") or result.get("response") or result.get("answer") or ""
     if not desc:
         raise RuntimeError(f"CF vision empty: {data}")
     return desc
